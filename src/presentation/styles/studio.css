@@ -201,9 +201,13 @@ a {
 
 .studio-workspace {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
+}
+
+.workspace-notices {
+  min-width: 0;
 }
 
 .update-banner {
@@ -230,28 +234,19 @@ a {
 .studio-page .update-reload-button:hover { background: var(--action-hover); }
 
 .engine-alert-popup {
-  position: fixed;
-  top: calc(12px + env(safe-area-inset-top));
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 40;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
-  width: min(560px, calc(100vw - 24px));
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--offline) 55%, var(--line));
-  border-radius: 11px;
-  background: var(--control);
+  padding: 8px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--offline) 42%, var(--line));
+  background: color-mix(in srgb, var(--offline) 10%, var(--control));
   color: var(--text);
-  box-shadow: 0 12px 34px var(--modal-shadow);
 }
 
 .engine-alert-dot {
   width: 8px;
   height: 8px;
   flex: 0 0 8px;
-  margin-top: 5px;
   border-radius: 50%;
   background: var(--offline);
 }
@@ -259,20 +254,23 @@ a {
 .engine-alert-body {
   flex: 1 1 auto;
   min-width: 0;
-  display: grid;
-  gap: 2px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
 }
 
 .engine-alert-body strong {
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.3;
   color: var(--text);
+  white-space: nowrap;
 }
 
 .engine-alert-body span {
   color: var(--muted);
   font-size: 12px;
-  line-height: 1.4;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
@@ -1092,10 +1090,6 @@ a {
     font-weight: 620;
   }
 
-  .engine-alert-popup {
-    top: calc(60px + env(safe-area-inset-top));
-  }
-
   .studio-workspace {
     display: flex;
     flex-direction: column;
@@ -1103,6 +1097,13 @@ a {
     min-height: 0;
     overflow: hidden;
   }
+
+  .engine-alert-popup {
+    align-items: flex-start;
+    padding: 9px 14px;
+  }
+
+  .engine-alert-dot { margin-top: 5px; }
 
   .studio-grid {
     order: 1;

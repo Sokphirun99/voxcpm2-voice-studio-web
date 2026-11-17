@@ -219,9 +219,11 @@ function StudioWorkspace({ state, ctrl, voiceActions }) {
   const { engineMeta, refreshEngine } = state;
   return (
     <main className="studio-workspace">
-      <EngineAlertBanner visible={engineMeta.showAlert} reason={engineMeta.reason} checking={engineMeta.checking}
-        onRetry={refreshEngine} onDismiss={engineMeta.dismissAlert} />
-      <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />
+      <div className="workspace-notices">
+        <EngineAlertBanner visible={engineMeta.showAlert} reason={engineMeta.reason} checking={engineMeta.checking}
+          onRetry={refreshEngine} onDismiss={engineMeta.dismissAlert} />
+        <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />
+      </div>
       <Toolbar busy={synthesis.busy} generateDisabled={generateDisabled}
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={synthesis.cancel} />
       <StudioSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions} />
