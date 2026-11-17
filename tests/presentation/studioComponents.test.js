@@ -117,6 +117,24 @@ test('VoiceControls displays locked dropdown label, uploaded filename, anchor wa
       })
     );
     assert.ok(generatedHtml.includes('id="exact-voice-match"'));
+    assert.ok(generatedHtml.includes('id="master-audio"'));
+    assert.match(generatedHtml, /id="master-audio"[^>]*checked=""/);
+
+    const { ScriptEditor } = await vite.ssrLoadModule('/src/presentation/components/ScriptEditor.jsx');
+    const numericScriptHtml = renderToStaticMarkup(
+      React.createElement(ScriptEditor, {
+        scriptInput: { current: null }, script: 'តម្លៃ 1500៛', count: 10, isOverLimit: false,
+        onReplaceScript() {}, onScriptChange() {}, onScriptKey() {},
+      })
+    );
+    const plainScriptHtml = renderToStaticMarkup(
+      React.createElement(ScriptEditor, {
+        scriptInput: { current: null }, script: 'សួស្តី', count: 2, isOverLimit: false,
+        onReplaceScript() {}, onScriptChange() {}, onScriptKey() {},
+      })
+    );
+    assert.ok(numericScriptHtml.includes('id="format-khmer-numbers"'));
+    assert.equal(plainScriptHtml.includes('id="format-khmer-numbers"'), false);
   });
 });
 

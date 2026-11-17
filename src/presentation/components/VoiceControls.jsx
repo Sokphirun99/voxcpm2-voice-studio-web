@@ -183,7 +183,29 @@ function InferenceSliders({ guidance, steps, onChange }) {
 }
 
 /**
- * Renders collapsible guidance, diffusion steps (4–20), seed, and reference denoising controls.
+ * Renders reference denoising and loudness mastering checkboxes inside Advanced settings.
+ * @param {{ options: object, onChange: (key: string, value: unknown) => void }} props - Toggle props.
+ * @returns {React.ReactElement} Checkbox toggles.
+ */
+function AdvancedToggles({ options, onChange }) {
+  return (
+    <>
+      <label className="locked-checkbox advanced-checkbox">
+        <input type="checkbox" id="master-audio" checked={options.masterAudio !== false}
+          onChange={event => onChange('masterAudio', event.currentTarget.checked)} />
+        <span>Master loudness for video (-16 LUFS)</span>
+      </label>
+      <label className="locked-checkbox advanced-checkbox">
+        <input type="checkbox" id="denoise-reference" checked={Boolean(options.denoiseReference)}
+          onChange={event => onChange('denoiseReference', event.currentTarget.checked)} />
+        <span>Clean background noise on voice sample</span>
+      </label>
+    </>
+  );
+}
+
+/**
+ * Renders collapsible guidance, diffusion steps (4–20), seed, mastering, and reference denoising controls.
  * @param {{ options: object, lastSeed: number|null, onChange: (key: string, value: unknown) => void }} props - Advanced props.
  * @returns {React.ReactElement} Collapsible advanced panel.
  */
@@ -202,11 +224,7 @@ function AdvancedSection({ options, lastSeed, onChange }) {
         <input id="seed" name="seed" type="number" min="0" max={MAX_SEED} step="1" placeholder="Auto"
           value={options.seed} onChange={event => onChange('seed', event.target.value)}
           onInvalid={() => { if (!advanced) flushSync(() => setAdvanced(true)); }} />
-        <label className="locked-checkbox advanced-checkbox">
-          <input type="checkbox" id="denoise-reference" checked={Boolean(options.denoiseReference)}
-            onChange={event => onChange('denoiseReference', event.currentTarget.checked)} />
-          <span>Clean background noise on voice sample</span>
-        </label>
+        <AdvancedToggles options={options} onChange={onChange} />
       </div>
     </div>
   );

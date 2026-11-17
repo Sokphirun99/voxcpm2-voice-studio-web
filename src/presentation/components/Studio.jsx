@@ -18,7 +18,7 @@ import { Toolbar } from './Toolbar.jsx';
 import { VoiceControls } from './VoiceControls.jsx';
 import { VoiceLibrary } from './VoiceLibrary.jsx';
 
-const INITIAL_OPTIONS = { guidance: 2, steps: DEFAULT_STEPS, seed: '', denoiseReference: false };
+const INITIAL_OPTIONS = { guidance: 2, steps: DEFAULT_STEPS, seed: '', denoiseReference: false, masterAudio: true };
 
 /**
  * Detects Apple platforms using User-Agent Client Hints with a userAgent fallback.
@@ -92,6 +92,7 @@ function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, a
     steps: options.steps,
     seed,
     denoiseReference: options.denoiseReference,
+    masterAudio: options.masterAudio !== false,
   };
 }
 

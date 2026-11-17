@@ -41,9 +41,14 @@ function formatProgressMessage({ completed, total }) {
  * @param {number|null} seed - Returned seed.
  * @returns {string} Status line text.
  */
-function formatSuccessStatus(character, seed) {
+function formatSuccessStatus(character, recording) {
   const identity = character ? `${character.name} (${character.id})` : 'Voice';
-  return seed != null ? `Audio ready · ${identity} · Seed ${seed}` : `Audio ready · ${identity}`;
+  const parts = ['Audio ready'];
+  if (recording?.fromCache) parts.push('cached');
+  else if (recording?.mastered) parts.push('-16 LUFS mastered');
+  parts.push(identity);
+  if (recording?.seed != null) parts.push(`Seed ${recording.seed}`);
+  return parts.join(' · ');
 }
 
 /**
@@ -61,7 +66,7 @@ async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onRe
   setRecording(result.recording);
   if (result.recording.seed != null) setLastSeed(result.recording.seed);
   const customMessage = await onCompleted?.(result);
-  setStatus({ message: customMessage || formatSuccessStatus(request.character, result.recording.seed), error: false });
+  setStatus({ message: customMessage || formatSuccessStatus(request.character, result.recording), error: false });
 }
 
 /**

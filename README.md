@@ -63,11 +63,11 @@ docker compose -f web/compose.prod.yaml up --build -d
 
 `web/src/` follows Clean Architecture (`Presentation → Domain → Data`):
 
-- `src/domain/` — Pure entities, validation rules, typed errors, port contracts (`ports.js`), and application use cases (`useCases.js`) with zero React/DOM/network/storage imports.
-- `src/data/` — Port implementations (`gradioSpeechGateway.js`, `httpAudioRepository.js`, `httpVoiceRepository.js`, `indexedDbAudioRepository.js`, `localVoiceRepository.js`, `webAudioDecoder.js`, `consoleLogger.js`).
+- `src/domain/` — Pure entities, Khmer Unicode/numeral normalization (`khmerText.js`), PCM edge trimming/fades (`wavCodec.js`), validation rules, typed errors, port contracts (`ports.js`), and application use cases (`useCases.js`) with zero React/DOM/network/storage imports.
+- `src/data/` — Port implementations (`gradioSpeechGateway.js`, `httpAudioMaster.js`, `httpSynthesisCache.js`, `httpAudioRepository.js`, `httpVoiceRepository.js`, `indexedDbAudioRepository.js`, `localVoiceRepository.js`, `webAudioDecoder.js`, `consoleLogger.js`).
 - `src/presentation/` — React DI context (`StudioContext.jsx`), hooks, components, and styles consuming only `domain/` and injected services.
 - `src/main.jsx` — Composition root wiring Data adapters into Domain use cases and mounting the Presentation UI.
-- `server/` — Persistent `/api/v1` backend storage service running in the `storage` Docker container backed by the named volume `voxcpm_voice_studio_data:/data` (`catalog.json` + `/data/anchors/*.audio`). Existing browser IndexedDB locks and custom characters migrate automatically on load so character voices stay fixed across browser clears and container rebuilds.
+- `server/` — Persistent `/api/v1` backend storage, FFmpeg EBU R128 `-16 LUFS` mastering (`POST /api/v1/audio/master`), and bounded LRU synthesis cache (`GET/PUT /api/v1/cache/:key`) running in the `storage` Docker container backed by `voxcpm_voice_studio_data:/data` (`catalog.json`, `/data/anchors/*.audio`, `/data/cache/*.wav`). Existing browser IndexedDB locks and custom characters migrate automatically on load so character voices stay fixed across browser clears and container rebuilds.
 
 ## Development and tests
 

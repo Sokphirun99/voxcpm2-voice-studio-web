@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDockerVoiceAnchorRepository } from '../../src/data/httpAudioRepository.js';
+import { createHttpAudioMaster } from '../../src/data/httpAudioMaster.js';
+import { createHttpSynthesisCache } from '../../src/data/httpSynthesisCache.js';
 import { createHttpVoiceRepository } from '../../src/data/httpVoiceRepository.js';
 import { StorageError } from '../../src/domain/errors.js';
 
@@ -185,4 +187,77 @@ test('createDockerVoiceAnchorRepository normalizes legacy octet-stream MIME and 
   assert.deepEqual(uploadedMimeTypes, ['audio/wav', 'audio/wav']);
   assert.equal(retryAttempt['char-nisa'].blob.type, 'audio/wav');
   assert.equal(storage.getItem('voxcpm.dockerAnchorsMigrated.v2'), '1');
+});
+
+test('createHttpAudioMaster masters via HTTP and degrades safely to local smoothing when offline/503', async () => {
+  const input = new Blob(['RIFFinput'], { type: 'audio/wav' });
+  const masteredOut = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x01]);
+  const onlineMaster = createHttpAudioMaster({
+    fetchImpl: async url => {
+      assert.equal(url, '/api/v1/audio/master');
+      return new Response(masteredOut, { status: 200, headers: { 'Content-Type': 'audio/wav' } });
+    },
+  });
+  const okRes = await onlineMaster.masterWav(input);
+  assert.equal(okRes.mastered, true);
+  assert.equal(okRes.blob.size, 5);
+
+  const fallbackMaster = createHttpAudioMaster({
+    fetchImpl: async () => new Response('missing', { status: 503 }),
+    logger: { debug() {}, warn() {} },
+  });
+  const degraded = await fallbackMaster.masterWav(input);
+  assert.equal(degraded.mastered, false);
+  assert.equal(degraded.blob.size, 9);
+
+  const abortedMaster = createHttpAudioMaster({
+    fetchImpl: async () => { throw Object.assign(new Error('Aborted'), { name: 'AbortError' }); },
+  });
+  await assert.rejects(() => abortedMaster.masterWav(input), err => err.name === 'AbortError');
+});
+
+test('createHttpSynthesisCache computes unique keys and handles cache hits, misses, and offline safely', async () => {
+  const wav = new Blob(['RIFFcached'], { type: 'audio/wav' });
+  const stored = new Map();
+  const cache = createHttpSynthesisCache({
+    logger: { debug() {} },
+    fetchImpl: async (url, init = {}) => {
+      const key = url.split('/')[4];
+      if (url.endsWith('/audio')) {
+        return stored.has(key)
+          ? new Response(stored.get(key).bytes, { status: 200, headers: { 'Content-Type': 'audio/wav' } })
+          : new Response('miss', { status: 404 });
+      }
+      if (init.method === 'PUT') {
+        const meta = JSON.parse(init.body.get('metadata'));
+        stored.set(key, { bytes: new Uint8Array(await init.body.get('audio').arrayBuffer()), meta });
+        return new Response(JSON.stringify({ data: { entry: { key, ...meta } }, error: null, meta: {} }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (!stored.has(key)) {
+        return new Response(JSON.stringify({ data: null, error: { code: 'CACHE_MISS', message: 'miss' } }), {
+          status: 404, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ data: { hit: true, entry: { key, ...stored.get(key).meta, audioUrl: `/api/v1/cache/${key}/audio` } }, error: null, meta: {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+
+  const kA = await cache.computeKey({ text: 'សួស្តី', characterId: 'char-malis', guidance: 2, steps: 10, seed: 1, masterAudio: true });
+  const kB = await cache.computeKey({ text: 'សួស្តី', characterId: 'char-malis', guidance: 2, steps: 10, seed: 2, masterAudio: true });
+  assert.match(kA, /^[a-f0-9]{64}$/);
+  assert.notEqual(kA, kB);
+
+  assert.equal(await cache.getCachedAudio(kA), null);
+  await cache.putCachedAudio(kA, wav, { characterId: 'char-malis', seed: 1 });
+  const hit = await cache.getCachedAudio(kA);
+  assert.equal(hit.seed, 1);
+  assert.equal(hit.blob.size, 10);
+
+  const offlineCache = createHttpSynthesisCache({ fetchImpl: async () => { throw new TypeError('offline'); }, logger: { debug() {} } });
+  assert.equal(await offlineCache.getCachedAudio(kA), null);
+  await offlineCache.putCachedAudio(kA, wav, {});
 });

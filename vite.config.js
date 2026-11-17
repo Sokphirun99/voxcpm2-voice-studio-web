@@ -10,7 +10,7 @@ const DEV_PORT = 5173;
 const PROXY_TIMEOUT_MS = 600000;
 const POLL_INTERVAL_MS = 250;
 const ALLOWED_GRADIO_PATH = /^\/gradio_api\/(info|upload|call\/generate(\/[a-f0-9]+)?|file=\/.+\.wav)$/;
-const ALLOWED_STORAGE_PATH = /^\/api\/v1\/(health|characters(\/[^/]+)?|anchors(\/[^/]+(\/audio)?)?)$/;
+const ALLOWED_STORAGE_PATH = /^\/api\/v1\/(health|characters(\/[^/]+)?|anchors(\/[^/]+(\/audio)?)?|audio\/master|cache\/[a-f0-9]{64}(\/audio)?)$/;
 
 /**
  * Attaches proxy error handling returning HTTP 502 JSON when an upstream service is unreachable.

@@ -8,7 +8,9 @@ import '@fontsource-variable/noto-sans-khmer';
 import './presentation/styles/studio.css';
 import { createConsoleLogger } from './data/consoleLogger.js';
 import { createGradioSpeechGateway } from './data/gradioSpeechGateway.js';
+import { createHttpAudioMaster } from './data/httpAudioMaster.js';
 import { createDockerVoiceAnchorRepository } from './data/httpAudioRepository.js';
+import { createHttpSynthesisCache } from './data/httpSynthesisCache.js';
 import { createHttpVoiceRepository } from './data/httpVoiceRepository.js';
 import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepository.js';
 import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
@@ -34,6 +36,8 @@ import { Studio } from './presentation/components/Studio.jsx';
 function createStudioServices() {
   const logger = createConsoleLogger();
   const speechGateway = createGradioSpeechGateway({ logger });
+  const audioMaster = createHttpAudioMaster({ logger });
+  const synthesisCache = createHttpSynthesisCache({ logger });
   const localVoices = createLocalVoiceRepository({ logger });
   const remoteVoices = createHttpVoiceRepository({ logger });
   const localAnchors = createIndexedDbVoiceAnchorRepository({ logger });
@@ -44,7 +48,7 @@ function createStudioServices() {
     speechGateway,
     audioDecoder,
     logger,
-    synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway }),
+    synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, audioMaster, synthesisCache }),
     lockReferenceAudio: createLockReferenceAudioUseCase(),
     voiceLibrary: createVoiceLibraryUseCases({ voiceRepository: localVoices, remoteRepository: remoteVoices }),
     voiceAnchors: createVoiceAnchorUseCases({ anchorRepository }),

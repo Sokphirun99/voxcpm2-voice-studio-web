@@ -338,6 +338,7 @@ a {
 .studio-page .subtle-button:disabled { opacity: 0.45; }
 
 .studio-page #khmer-example { color: var(--accent); }
+.editor-heading-actions { display: flex; align-items: center; gap: 6px; }
 
 .studio-page #script {
   display: block;
