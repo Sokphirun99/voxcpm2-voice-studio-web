@@ -1,51 +1,128 @@
 /**
- * @fileoverview Lightweight inline SVG icon component replacing icon fonts.
+ * @fileoverview Lightweight inline SVG icon component powered by Iconoir (MIT License, 24x24 viewBox).
  */
 
 import React from 'react';
 
+const STROKE_STYLE = {
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.75,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+};
+
 const ICON_PATHS = {
+  // Iconoir: voice
   waveform: (
-    <path d="M3 10v4m3.5-7v10M10 4v16m3.5-13v10m3.5-8v6M20 10v4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    <g {...STROKE_STYLE}>
+      <path d="M12 4L12 20" />
+      <path d="M8 9L8 15" />
+      <path d="M20 10L20 14" />
+      <path d="M4 10L4 14" />
+      <path d="M16 7L16 17" />
+    </g>
   ),
+  // Iconoir: edit-pencil
   square_pencil: (
-    <path d="M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6M18.5 3.5a2.1 2.1 0 0 1 3 3L12 16l-4 1 1-4 9.5-9.5Z"
-      fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    <path
+      d="M14.3632 5.65156L15.8431 4.17157C16.6242 3.39052 17.8905 3.39052 18.6716 4.17157L20.0858 5.58579C20.8668 6.36683 20.8668 7.63316 20.0858 8.41421L18.6058 9.8942M14.3632 5.65156L4.74749 15.2672C4.41542 15.5993 4.21079 16.0376 4.16947 16.5054L3.92738 19.2459C3.87261 19.8659 4.39148 20.3848 5.0115 20.33L7.75191 20.0879C8.21972 20.0466 8.65806 19.8419 8.99013 19.5099L18.6058 9.8942M14.3632 5.65156L18.6058 9.8942"
+      {...STROKE_STYLE}
+    />
   ),
+  // Iconoir: list
   list_bullet: (
-    <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    <g {...STROKE_STYLE}>
+      <path d="M8 6L20 6" />
+      <path d="M4 6.01L4.01 5.99889" />
+      <path d="M4 12.01L4.01 11.9989" />
+      <path d="M4 18.01L4.01 17.9989" />
+      <path d="M8 12L20 12" />
+      <path d="M8 18L20 18" />
+    </g>
   ),
+  // Iconoir: sparks (solid)
   sparkles: (
-    <path d="m12 3 1.9 4.7L18.6 9.6l-4.7 1.9L12 16.2l-1.9-4.7-4.7-1.9 4.7-1.9L12 3Zm6.5 11.5.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1ZM5.5 15l.7 1.7 1.7.7-1.7.7-.7 1.7-.7-1.7-1.7-.7 1.7-.7.7-1.7Z"
-      fill="currentColor" />
+    <g fill="currentColor" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
+      <path d="M8 15C12.8747 15 15 12.949 15 8C15 12.949 17.1104 15 22 15C17.1104 15 15 17.1104 15 22C15 17.1104 12.8747 15 8 15Z" />
+      <path d="M2 6.5C5.13376 6.5 6.5 5.18153 6.5 2C6.5 5.18153 7.85669 6.5 11 6.5C7.85669 6.5 6.5 7.85669 6.5 11C6.5 7.85669 5.13376 6.5 2 6.5Z" />
+    </g>
   ),
+  // Iconoir: align-left
   text_quote: (
-    <path d="M4 6h16M4 12h10M10 18h10M4 18h3" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    <g {...STROKE_STYLE}>
+      <path d="M3 10L17 10" />
+      <path d="M3 6H21" />
+      <path d="M3 18L17 18" />
+      <path d="M3 14H21" />
+    </g>
   ),
+  // Iconoir: user
   person: (
-    <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 8a7 7 0 0 1 14 0" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+    <g {...STROKE_STYLE}>
+      <path d="M5 20V19C5 15.134 8.13401 12 12 12C15.866 12 19 15.134 19 19V20" />
+      <path d="M12 12C14.2091 12 16 10.2091 16 8C16 5.79086 14.2091 4 12 4C9.79086 4 8 5.79086 8 8C8 10.2091 9.79086 12 12 12Z" />
+    </g>
   ),
-  chevron_down: (
-    <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+  // Iconoir: nav-arrow-down
+  chevron_down: <path d="M6 9L12 15L18 9" {...STROKE_STYLE} />,
+  // Iconoir: play (solid)
+  play_fill: (
+    <path
+      d="M6.90588 4.53682C6.50592 4.2998 6 4.58808 6 5.05299V18.947C6 19.4119 6.50592 19.7002 6.90588 19.4632L18.629 12.5162C19.0211 12.2838 19.0211 11.7162 18.629 11.4838L6.90588 4.53682Z"
+      fill="currentColor"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
   ),
-  play_fill: <path d="M7 5.5v13l11-6.5-11-6.5Z" fill="currentColor" />,
-  pause_fill: <path d="M6.5 5.5h3.5v13H6.5zm7.5 0h3.5v13H14z" fill="currentColor" />,
-  stop_fill: <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />,
+  // Iconoir: pause (solid)
+  pause_fill: (
+    <g fill="currentColor" stroke="currentColor" strokeWidth="1.5">
+      <path d="M6 18.4V5.6C6 5.26863 6.26863 5 6.6 5H9.4C9.73137 5 10 5.26863 10 5.6V18.4C10 18.7314 9.73137 19 9.4 19H6.6C6.26863 19 6 18.7314 6 18.4Z" />
+      <path d="M14 18.4V5.6C14 5.26863 14.2686 5 14.6 5H17.4C17.7314 5 18 5.26863 18 5.6V18.4C18 18.7314 17.7314 19 17.4 19H14.6C14.2686 19 14 18.7314 14 18.4Z" />
+    </g>
+  ),
+  // Iconoir: square (stop control)
+  stop_fill: (
+    <path
+      d="M18 5.6V18.4C18 18.7314 17.7314 19 17.4 19H6.6C6.26863 19 6 18.7314 6 18.4V5.6C6 5.26863 6.26863 5 6.6 5H17.4C17.7314 5 18 5.26863 18 5.6Z"
+      fill="currentColor"
+    />
+  ),
+  // Iconoir: download
   arrow_down_to_line: (
-    <path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    <g {...STROKE_STYLE}>
+      <path d="M6 20L18 20" />
+      <path d="M12 4V16M12 16L15.5 12.5M12 16L8.5 12.5" />
+    </g>
   ),
-  xmark: <path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />,
+  // Iconoir: xmark
+  xmark: (
+    <path
+      d="M6.75827 17.2426L12.0009 12M17.2435 6.75736L12.0009 12M12.0009 12L6.75827 6.75736M12.0009 12L17.2435 17.2426"
+      {...STROKE_STYLE}
+    />
+  ),
+  // Iconoir: lock
   lock: (
-    <path d="M7 11V8a5 5 0 0 1 10 0v3M6 11h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z"
-      fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinejoin="round" />
+    <path
+      d="M16 12H17.4C17.7314 12 18 12.2686 18 12.6V19.4C18 19.7314 17.7314 20 17.4 20H6.6C6.26863 20 6 19.7314 6 19.4V12.6C6 12.2686 6.26863 12 6.6 12H8M16 12V8C16 6.66667 15.2 4 12 4C8.8 4 8 6.66667 8 8V12M16 12H8"
+      {...STROKE_STYLE}
+    />
   ),
+  // Iconoir: upload
   upload: (
-    <path d="M12 15V4m0 0-4.5 4.5M12 4l4.5 4.5M5 19h14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    <g {...STROKE_STYLE}>
+      <path d="M6 20L18 20" />
+      <path d="M12 16V4M12 4L15.5 7.5M12 4L8.5 7.5" />
+    </g>
   ),
 };
 
 /**
- * Renders a crisp decorative inline SVG icon.
+ * Renders a crisp decorative inline Iconoir SVG icon.
  * Inputs: `{ name, className }`.
  * Outputs: `<svg>` element with `aria-hidden="true"`.
  * Side effects: none.
