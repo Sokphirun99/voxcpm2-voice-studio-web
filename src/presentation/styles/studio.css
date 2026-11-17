@@ -251,6 +251,74 @@ a {
 
 .studio-page .update-reload-button:hover { background: var(--action-hover); }
 
+.engine-alert-popup {
+  position: fixed;
+  top: calc(12px + env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(560px, calc(100vw - 24px));
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--offline) 55%, var(--line));
+  border-radius: 11px;
+  background: var(--control);
+  color: var(--text);
+  box-shadow: 0 12px 34px var(--modal-shadow);
+}
+
+.engine-alert-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--offline);
+}
+
+.engine-alert-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.engine-alert-body strong {
+  font-size: 13px;
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.engine-alert-body span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.engine-alert-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.studio-page .engine-retry-button {
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.studio-page .engine-dismiss-button {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+}
+
 .studio-toolbar {
   justify-content: space-between;
   gap: 12px;
@@ -1060,6 +1128,10 @@ a {
   #engine-label {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .engine-alert-popup {
+    top: calc(60px + env(safe-area-inset-top));
   }
 
   .studio-workspace {

@@ -170,6 +170,43 @@ test('checkAvailability returns true only when /generate endpoint is registered'
   assert.equal(await offlineGateway.checkAvailability(), false);
 });
 
+test('checkHealth surfaces specific offline reasons on proxy, endpoint, timeout, and network failures', async () => {
+  const ready = await createGradioSpeechGateway({
+    fetchImpl: async () => new Response(JSON.stringify({ named_endpoints: { '/generate': {} } }), { status: 200 }),
+  }).checkHealth();
+  assert.deepEqual(ready, { available: true, reason: null });
+
+  const badGateway = await createGradioSpeechGateway({
+    fetchImpl: async () => new Response('Bad Gateway', { status: 502 }),
+  }).checkHealth();
+  assert.equal(badGateway.available, false);
+  assert.match(badGateway.reason, /502.*app\.py/i);
+
+  const missingGenerate = await createGradioSpeechGateway({
+    fetchImpl: async () => new Response(JSON.stringify({ named_endpoints: {} }), { status: 200 }),
+  }).checkHealth();
+  assert.equal(missingGenerate.available, false);
+  assert.match(missingGenerate.reason, /\/generate/);
+
+  const timedOut = await createGradioSpeechGateway({
+    fetchImpl: async () => {
+      const err = new Error('timed out');
+      err.name = 'TimeoutError';
+      throw err;
+    },
+  }).checkHealth();
+  assert.equal(timedOut.available, false);
+  assert.match(timedOut.reason, /did not respond within 4s/i);
+
+  const netErr = await createGradioSpeechGateway({
+    fetchImpl: async () => {
+      throw new Error('Failed to fetch');
+    },
+  }).checkHealth();
+  assert.equal(netErr.available, false);
+  assert.match(netErr.reason, /Failed to fetch/);
+});
+
 test('uploadReferenceAudio posts multipart files and returns Gradio FileData', async () => {
   const gateway = createGradioSpeechGateway({
     fetchImpl: async (url, init) => {

@@ -636,3 +636,88 @@ test('mounted AudioPlayer unlocks Play from WAV/WebAudio duration across Take 1 
     await vite.close();
   }
 });
+
+test('mounted Studio pops up top offline banner with root cause and hides automatically when online', async () => {
+  const dom = installTestDom();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const { createSynthesizeSpeechUseCase } = await import('../../src/domain/useCases.js');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+
+    let health = { available: false, reason: 'VoxCPM2 server on port 8808 is unreachable (HTTP 502).' };
+    const speechGateway = {
+      checkHealth: async () => health,
+      checkAvailability: async () => health.available,
+      uploadReferenceAudio: async () => ({}),
+      synthesize: async () => ({ blob: new Blob(['RIFF']), seed: 1 }),
+    };
+    const services = {
+      speechGateway,
+      audioDecoder: { decodePeaks: async () => [0.2] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 1 }),
+      lockReferenceAudio: { execute: async f => ({ blob: f, fileName: f.name }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    assert.equal(container.querySelector('#engine').getAttribute('data-state'), 'offline');
+    assert.ok(container.querySelector('#engine-offline-banner'));
+    assert.match(container.querySelector('#engine-offline-reason').textContent, /HTTP 502/);
+
+    // Dismiss hides banner while engine dot remains offline
+    await act(async () => {
+      container.querySelector('#dismiss-engine-alert').dispatchEvent({ type: 'click', bubbles: true });
+    });
+    assert.equal(container.querySelector('#engine-offline-banner'), null);
+    assert.equal(container.querySelector('#engine').getAttribute('data-state'), 'offline');
+
+    // Fresh mount recovering online via Retry removes offline banner completely
+    const recoveryRootContainer = dom.doc.createElement('div');
+    dom.doc.body.appendChild(recoveryRootContainer);
+    const recoveryRoot = createRoot(recoveryRootContainer);
+    try {
+      await act(async () => {
+        recoveryRoot.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+        await new Promise(r => setTimeout(r, 20));
+      });
+      assert.ok(recoveryRootContainer.querySelector('#engine-offline-banner'));
+      health = { available: true, reason: null };
+      await act(async () => {
+        recoveryRootContainer.querySelector('#retry-engine-check').dispatchEvent({ type: 'click', bubbles: true });
+        await new Promise(r => setTimeout(r, 20));
+      });
+      assert.equal(recoveryRootContainer.querySelector('#engine').getAttribute('data-state'), 'ready');
+      assert.equal(recoveryRootContainer.querySelector('#engine-offline-banner'), null);
+    } finally {
+      await act(async () => { recoveryRoot.unmount(); });
+    }
+  } finally {
+    if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});

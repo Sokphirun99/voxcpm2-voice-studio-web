@@ -707,3 +707,31 @@ test('UpdateBanner SSR renders accessible prompt only when update is available',
     assert.ok(visibleHtml.includes('Reload now'));
   });
 });
+
+test('EngineAlertBanner SSR renders top offline alert only when engine is down', async () => {
+  await withViteSsr(async vite => {
+    const { EngineAlertBanner } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+    const onlineHtml = renderToStaticMarkup(
+      React.createElement(EngineAlertBanner, {
+        visible: false, reason: null, checking: false, onRetry() {}, onDismiss() {},
+      })
+    );
+    assert.equal(onlineHtml, '');
+
+    const offlineHtml = renderToStaticMarkup(
+      React.createElement(EngineAlertBanner, {
+        visible: true,
+        reason: 'VoxCPM2 server on port 8808 is unreachable (HTTP 502).',
+        checking: false,
+        onRetry() {},
+        onDismiss() {},
+      })
+    );
+    assert.ok(offlineHtml.includes('id="engine-offline-banner"'));
+    assert.ok(offlineHtml.includes('role="alert"'));
+    assert.ok(offlineHtml.includes('VoxCPM2 offline'));
+    assert.ok(offlineHtml.includes('VoxCPM2 server on port 8808 is unreachable (HTTP 502).'));
+    assert.ok(offlineHtml.includes('id="retry-engine-check"'));
+    assert.ok(offlineHtml.includes('id="dismiss-engine-alert"'));
+  });
+});

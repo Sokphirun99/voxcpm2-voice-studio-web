@@ -13,6 +13,7 @@ import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
+import { Icon } from './Icon.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { Toolbar } from './Toolbar.jsx';
@@ -185,14 +186,41 @@ export function UpdateBanner({ visible, onReload }) {
 }
 
 /**
+ * Renders a top popup alert exclusively when VoxCPM2 goes offline so online state remains silent.
+ * @param {{ visible: boolean, reason: string|null, checking?: boolean, onRetry: () => void, onDismiss: () => void }} props - Alert props.
+ * @returns {React.ReactElement|null} Top alert banner or null when online.
+ */
+export function EngineAlertBanner({ visible, reason, checking = false, onRetry, onDismiss }) {
+  if (!visible) return null;
+  return (
+    <div className="engine-alert-popup" id="engine-offline-banner" role="alert">
+      <span className="engine-alert-dot" aria-hidden="true" />
+      <div className="engine-alert-body">
+        <strong>VoxCPM2 offline</strong>
+        <span id="engine-offline-reason">{reason || 'Cannot reach VoxCPM2 engine on port 8808.'}</span>
+      </div>
+      <div className="engine-alert-actions">
+        <button type="button" className="button subtle-button engine-retry-button" id="retry-engine-check"
+          disabled={checking} onClick={onRetry}>{checking ? 'Checking…' : 'Retry'}</button>
+        <button type="button" className="button subtle-button engine-dismiss-button" id="dismiss-engine-alert"
+          aria-label="Dismiss offline message" onClick={onDismiss}><Icon name="xmark" /></button>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Renders the main workspace pane containing toolbar, script/voice form, and playback dock.
  * @param {object} props - Workspace props.
  * @returns {React.ReactElement} Main workspace element.
  */
 function StudioWorkspace({ state, ctrl, voiceActions }) {
   const { synthesis, activeCharacter, activeAnchor, actions, generateDisabled, versionCheck } = ctrl;
+  const { engineMeta, refreshEngine } = state;
   return (
     <main className="studio-workspace">
+      <EngineAlertBanner visible={engineMeta.showAlert} reason={engineMeta.reason} checking={engineMeta.checking}
+        onRetry={refreshEngine} onDismiss={engineMeta.dismissAlert} />
       <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />
       <Toolbar busy={synthesis.busy} generateDisabled={generateDisabled}
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={synthesis.cancel} />
@@ -239,14 +267,14 @@ function useStudioState() {
   const [options, setOptions] = useState(INITIAL_OPTIONS);
   const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
   const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
-  const [engine, refreshEngine] = useEngineStatus();
+  const [engine, refreshEngine, engineMeta] = useEngineStatus();
   const library = useVoiceLibrary();
   const anchorApi = useVoiceAnchors();
   const charactersRef = useRef(library.allVoices);
   charactersRef.current = library.allVoices;
   return {
     scriptRef, transcriptRef, script, setScript, options, setOptions, selectedCharacterId,
-    setSelectedCharacterId, libraryModal, setLibraryModal, engine, refreshEngine, library, anchorApi, charactersRef,
+    setSelectedCharacterId, libraryModal, setLibraryModal, engine, refreshEngine, engineMeta, library, anchorApi, charactersRef,
   };
 }
 

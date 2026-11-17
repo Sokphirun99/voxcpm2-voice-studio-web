@@ -11,6 +11,7 @@
 /**
  * @typedef {object} SpeechGatewayPort
  * @property {() => Promise<boolean>} checkAvailability
+ * @property {() => Promise<{ available: boolean, reason: string|null }>} [checkHealth]
  * @property {(params: { blob: Blob, fileName: string, mimeType?: string, signal?: AbortSignal }) => Promise<object>} uploadReferenceAudio
  * @property {(params: { text: string, instruction: string, referenceFile?: object|null, usePromptText?: boolean, promptText?: string, guidance: number, steps: number, seed: number, denoiseReference?: boolean, signal?: AbortSignal }) => Promise<{ blob: Blob, seed: number|null }>} synthesize
  */

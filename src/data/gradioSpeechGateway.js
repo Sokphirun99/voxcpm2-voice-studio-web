@@ -324,10 +324,59 @@ async function fetchGeneratedBlob(fetchImpl, filePath, signal) {
   return blob.type && blob.type.toLowerCase().startsWith('audio/') ? blob : new Blob([blob], { type: 'audio/wav' });
 }
 
+const HEALTH_STATUS_MESSAGES = {
+  404: 'VoxCPM2 /gradio_api/info route returned HTTP 404.',
+  502: 'VoxCPM2 server on port 8808 is unreachable (HTTP 502). Check that app.py is running.',
+  503: 'VoxCPM2 server is temporarily unavailable (HTTP 503).',
+  504: 'VoxCPM2 health check timed out via proxy (HTTP 504).',
+};
+
+/**
+ * Maps an unsuccessful `/gradio_api/info` HTTP status to a clear diagnostic message.
+ * @param {number} status - HTTP status code.
+ * @returns {string} Concise failure description.
+ */
+function formatHttpHealthError(status) {
+  return HEALTH_STATUS_MESSAGES[status] || `VoxCPM2 health check failed (HTTP ${status}).`;
+}
+
+/**
+ * Formats network/timeout exceptions raised while probing VoxCPM2 availability.
+ * @param {unknown} error - Thrown error or abort reason.
+ * @returns {string} Concise user-facing failure reason.
+ */
+function formatNetworkHealthError(error) {
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+    return 'VoxCPM2 did not respond within 4s (server stopped or overloaded).';
+  }
+  const detail = sanitizeErrorDetail(error?.message);
+  return detail
+    ? `Cannot reach VoxCPM2 engine (${detail}). Check that app.py is running.`
+    : 'Cannot reach VoxCPM2 engine. Check that app.py is running.';
+}
+
+/**
+ * Probes `/gradio_api/info` and returns availability together with a concise offline reason.
+ * @param {{ fetchImpl: typeof fetch, logger?: import('../domain/ports.js').LoggerPort }} deps - Gateway deps.
+ * @returns {Promise<{ available: boolean, reason: string|null }>} Health check result.
+ */
+async function probeEngineHealth({ fetchImpl, logger }) {
+  try {
+    const response = await fetchImpl(INFO_ENDPOINT, { cache: 'no-store', signal: AbortSignal.timeout(ENGINE_CHECK_TIMEOUT_MS) });
+    if (!response.ok) return { available: false, reason: formatHttpHealthError(response.status) };
+    const info = await response.json();
+    if (info?.named_endpoints?.['/generate']) return { available: true, reason: null };
+    return { available: false, reason: 'VoxCPM2 responded without the /generate speech endpoint.' };
+  } catch (error) {
+    logger?.debug('gradioSpeechGateway.checkAvailability', 'Engine readiness check failed', { reason: error?.message || 'offline' });
+    return { available: false, reason: formatNetworkHealthError(error) };
+  }
+}
+
 /**
  * Creates a Gradio 6 SpeechGatewayPort adapter.
  * Inputs: `{ fetchImpl, origin, logger }`.
- * Outputs: SpeechGatewayPort `{ checkAvailability, uploadReferenceAudio, synthesize }`.
+ * Outputs: SpeechGatewayPort `{ checkAvailability, checkHealth, uploadReferenceAudio, synthesize }`.
  * Side effects: performs HTTP/SSE requests to `/gradio_api/*`.
  * Failure modes: throws SynthesisCancelledError or SynthesisError on failure; `checkAvailability` returns `false`.
  * @param {{ fetchImpl?: typeof fetch, origin?: string, logger?: import('../domain/ports.js').LoggerPort }} [deps] - Injected HTTP & logging deps.
@@ -338,17 +387,12 @@ export function createGradioSpeechGateway({
   origin = globalThis.window?.location?.origin || 'http://127.0.0.1',
   logger,
 } = {}) {
+  const checkHealth = () => probeEngineHealth({ fetchImpl, logger });
   return {
+    checkHealth,
     async checkAvailability() {
-      try {
-        const response = await fetchImpl(INFO_ENDPOINT, { cache: 'no-store', signal: AbortSignal.timeout(ENGINE_CHECK_TIMEOUT_MS) });
-        if (!response.ok) return false;
-        const info = await response.json();
-        return Boolean(info.named_endpoints?.['/generate']);
-      } catch (error) {
-        logger?.debug('gradioSpeechGateway.checkAvailability', 'Engine readiness check failed', { reason: error?.message || 'offline' });
-        return false;
-      }
+      const result = await checkHealth();
+      return result.available;
     },
 
     async uploadReferenceAudio({ blob, fileName, mimeType = 'audio/wav', signal }) {

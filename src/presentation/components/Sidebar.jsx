@@ -32,7 +32,8 @@ export function Sidebar({ engine, onFocusScript, onOpenLibrary }) {
           <Icon name="list_bullet" />Character library
         </button>
       </nav>
-      <div className="engine" id="engine" data-state={engine} role="status">
+      <div className="engine" id="engine" data-state={engine} role="status"
+        aria-label={ENGINE_LABELS[engine]} title={ENGINE_LABELS[engine]}>
         <span className="engine-dot" aria-hidden="true" />
         <span id="engine-label">{ENGINE_LABELS[engine]}</span>
       </div>
