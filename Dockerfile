@@ -9,6 +9,15 @@ COPY src/ ./src/
 EXPOSE 5173
 CMD ["npm", "run", "dev"]
 
+FROM node:22-bookworm-slim AS storage
+WORKDIR /app
+COPY package.json ./
+COPY src/domain/ ./src/domain/
+COPY server/ ./server/
+ENV PORT=8090 DATA_DIR=/data
+EXPOSE 8090
+CMD ["node", "server/index.js"]
+
 FROM base AS build
 COPY vite.config.js index.html ./
 COPY src/ ./src/

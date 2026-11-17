@@ -59,14 +59,15 @@ the Vite dev server:
 docker compose -f web/compose.prod.yaml up --build -d
 ~~~
 
-## Architecture
+## Architecture & Docker Backend Storage
 
 `web/src/` follows Clean Architecture (`Presentation → Domain → Data`):
 
 - `src/domain/` — Pure entities, validation rules, typed errors, port contracts (`ports.js`), and application use cases (`useCases.js`) with zero React/DOM/network/storage imports.
-- `src/data/` — Port implementations (`gradioSpeechGateway.js`, `localVoiceRepository.js`, `indexedDbAudioRepository.js`, `webAudioDecoder.js`, `consoleLogger.js`).
+- `src/data/` — Port implementations (`gradioSpeechGateway.js`, `httpAudioRepository.js`, `httpVoiceRepository.js`, `indexedDbAudioRepository.js`, `localVoiceRepository.js`, `webAudioDecoder.js`, `consoleLogger.js`).
 - `src/presentation/` — React DI context (`StudioContext.jsx`), hooks, components, and styles consuming only `domain/` and injected services.
 - `src/main.jsx` — Composition root wiring Data adapters into Domain use cases and mounting the Presentation UI.
+- `server/` — Persistent `/api/v1` backend storage service running in the `storage` Docker container backed by the named volume `voxcpm_voice_studio_data:/data` (`catalog.json` + `/data/anchors/*.audio`). Existing browser IndexedDB locks and custom characters migrate automatically on load so character voices stay fixed across browser clears and container rebuilds.
 
 ## Development and tests
 
@@ -74,6 +75,7 @@ From `web/`:
 
 ~~~sh
 npm test
+npm run storage   # start persistent backend storage API on :8090
 npm run dev
 npm run build
 ~~~

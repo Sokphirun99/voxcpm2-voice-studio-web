@@ -1,10 +1,28 @@
 name: voxcpm-voice-studio
 
 services:
+  storage:
+    build:
+      context: .
+      target: storage
+    environment:
+      PORT: "8090"
+      DATA_DIR: /data
+    volumes:
+      - voice_studio_data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/api/v1/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   studio:
     build:
       context: .
       target: dev
+    depends_on:
+      storage:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${VOICE_STUDIO_PORT:-8087}:5173"
     volumes:
@@ -13,9 +31,14 @@ services:
       - ./src:/app/src:ro
     environment:
       GRADIO_URL: ${GRADIO_URL:-http://host.docker.internal:8808}
+      STORAGE_URL: ${STORAGE_URL:-http://storage:8090}
       VITE_USE_POLLING: ${VITE_USE_POLLING:-true}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 5s
       timeout: 3s
       retries: 5
+
+volumes:
+  voice_studio_data:
+    name: voxcpm_voice_studio_data
