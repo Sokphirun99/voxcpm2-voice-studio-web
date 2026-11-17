@@ -201,14 +201,16 @@ function PlaybackControls({ media, recording, activeCharacter, activeAnchor, onT
         <Icon name={media.playing ? 'pause_fill' : 'play_fill'} />
       </button>
       <AudioTrackBar media={media} onSeek={onSeek} />
-      <button type="button" className={pin.isLocked ? 'button lock-button is-locked' : 'button lock-button'}
-        id="lock-voice" disabled={pin.disabled} aria-pressed={pin.isLocked} onClick={onPinTake} title={pin.title}>
-        <Icon name="lock" /><span>{pin.label}</span>
-      </button>
-      <a className="button download-button" id="download" href={media.url || undefined}
-        download={downloadName} aria-disabled={media.url ? undefined : true}>
-        <Icon name="arrow_down_to_line" /><span>Download WAV</span>
-      </a>
+      <div className="player-actions">
+        <button type="button" className={pin.isLocked ? 'button lock-button is-locked' : 'button lock-button'}
+          id="lock-voice" disabled={pin.disabled} aria-pressed={pin.isLocked} onClick={onPinTake} title={pin.title}>
+          <Icon name="lock" /><span>{pin.label}</span>
+        </button>
+        <a className="button download-button" id="download" href={media.url || undefined}
+          download={downloadName} aria-disabled={media.url ? undefined : true}>
+          <Icon name="arrow_down_to_line" /><span>Download WAV</span>
+        </a>
+      </div>
     </div>
   );
 }

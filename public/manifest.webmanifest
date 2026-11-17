@@ -1,0 +1,17 @@
+{
+  "name": "Voice Studio · VoxCPM2",
+  "short_name": "Voice Studio",
+  "description": "Khmer and multilingual character Text-to-Speech Voice Studio",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#22252d",
+  "theme_color": "#272b35",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

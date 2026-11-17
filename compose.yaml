@@ -28,6 +28,7 @@ services:
     volumes:
       - ./index.html:/app/index.html:ro
       - ./vite.config.js:/app/vite.config.js:ro
+      - ./public:/app/public:ro
       - ./src:/app/src:ro
     environment:
       GRADIO_URL: ${GRADIO_URL:-http://host.docker.internal:8808}

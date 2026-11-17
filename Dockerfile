@@ -5,6 +5,7 @@ RUN npm ci --no-audit --no-fund
 
 FROM base AS dev
 COPY vite.config.js index.html ./
+COPY public/ ./public/
 COPY src/ ./src/
 EXPOSE 5173
 CMD ["npm", "run", "dev"]
@@ -21,6 +22,7 @@ CMD ["node", "server/index.js"]
 
 FROM base AS build
 COPY vite.config.js index.html ./
+COPY public/ ./public/
 COPY src/ ./src/
 RUN npm run build
 
