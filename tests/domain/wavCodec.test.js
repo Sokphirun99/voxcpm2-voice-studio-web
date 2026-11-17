@@ -6,7 +6,9 @@ import {
   ensureAudioWavBlob,
   inspectWavBuffer,
   readWavDurationSeconds,
+  smoothAndTrimWavBlob,
   tryReadWavDurationSeconds,
+  trySmoothWavBlob,
 } from '../../src/domain/wavCodec.js';
 
 function makeTestWavBlob({ sampleRate = 48000, numChannels = 1, bitsPerSample = 16, samples = [100, -100, 200, -200] } = {}) {
@@ -72,4 +74,32 @@ test('ensureAudioWavBlob and tryReadWavDurationSeconds normalize octet-stream si
   assert.equal(tryReadWavDurationSeconds(await singleCombined.arrayBuffer()), 1);
   assert.equal(tryReadWavDurationSeconds(new ArrayBuffer(8)), 0);
   assert.equal(tryReadWavDurationSeconds(new TextEncoder().encode('RIFF____WAVEfmt ').buffer), 0);
+});
+
+test('smoothAndTrimWavBlob trims excessive edge silence and fades edges while preserving stub safety', async () => {
+  // 500ms zeros + 200ms active speech (48kHz * 0.2 = 9600 frames) + 500ms zeros = 1.2s raw
+  const samples = [
+    ...new Array(24000).fill(0),
+    ...new Array(9600).fill(4000),
+    ...new Array(24000).fill(0),
+  ];
+  const rawBlob = makeTestWavBlob({ sampleRate: 48000, samples });
+  const smoothed = await smoothAndTrimWavBlob(rawBlob);
+  const info = inspectWavBuffer(await smoothed.arrayBuffer());
+  const trimmedDuration = readWavDurationSeconds(await smoothed.arrayBuffer());
+
+  // 45ms head + 200ms active + 80ms tail = ~325ms instead of 1200ms
+  assert.ok(trimmedDuration >= 0.31 && trimmedDuration <= 0.34, `Expected ~0.325s, got ${trimmedDuration}`);
+  const firstSample = new DataView(await smoothed.arrayBuffer()).getInt16(info.dataOffset, true);
+  assert.equal(firstSample, 0);
+
+  // Silent-only clip stays intact and trySmoothWavBlob safely skips short non-WAV test blobs
+  const silentOnly = makeTestWavBlob({ sampleRate: 48000, samples: new Array(24000).fill(0) });
+  const keptSilent = await smoothAndTrimWavBlob(silentOnly);
+  assert.equal(readWavDurationSeconds(await keptSilent.arrayBuffer()), 0.5);
+
+  const stubBlob = new Blob(['RIFFstub'], { type: 'application/octet-stream' });
+  const safeStub = await trySmoothWavBlob(stubBlob);
+  assert.equal(safeStub.type, 'audio/wav');
+  assert.equal(safeStub.size, 8);
 });

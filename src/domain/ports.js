@@ -35,6 +35,18 @@
  */
 
 /**
+ * @typedef {object} AudioMasterPort
+ * @property {(blob: Blob, options?: { signal?: AbortSignal }) => Promise<{ blob: Blob, mastered: boolean }>} masterWav
+ */
+
+/**
+ * @typedef {object} SynthesisCachePort
+ * @property {(spec: object) => Promise<string>} computeKey
+ * @property {(key: string, options?: { signal?: AbortSignal }) => Promise<{ blob: Blob, seed: number|null }|null>} getCachedAudio
+ * @property {(key: string, blob: Blob, meta?: object) => Promise<void>} putCachedAudio
+ */
+
+/**
  * Validates that a required dependency port exposes every expected method.
  * Inputs: port object, port name, required method names.
  * Outputs: validated port reference.

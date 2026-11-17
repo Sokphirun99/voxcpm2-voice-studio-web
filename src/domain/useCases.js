@@ -8,7 +8,7 @@ import { assertPort } from './ports.js';
 import { validateGenerationInput } from './presets.js';
 import { segmentSingleSpeakerScript } from './scriptSegmentation.js';
 import { createSavedVoiceEntry } from './voiceLibrary.js';
-import { concatenateWavBlobs } from './wavCodec.js';
+import { concatenateWavBlobs, trySmoothWavBlob } from './wavCodec.js';
 
 const SINGLE_VOICE_PAUSE_MS = 160;
 const EXPIRED_REF_PATTERN = /expired on the server/i;
@@ -141,42 +141,94 @@ async function runChunkedSynthesis(params) {
 }
 
 /**
- * Executes single-character synthesis validation, chunking, and voice anchoring.
- * @param {import('./ports.js').SpeechGatewayPort} speechGateway - Speech gateway port.
- * @param {(() => number)|undefined} seedGenerator - Optional deterministic seed generator.
+ * Builds the recording response for a deterministic synthesis cache hit.
+ * @param {object} spec - Cached hit, payload, character, chunks, and flags.
+ * @returns {object} Synthesis use-case result shape.
+ */
+function buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio }) {
+  const seed = hit.seed ?? payload.seed;
+  return {
+    recording: {
+      id: `take-${Date.now()}-${seed ?? 'cached'}`,
+      characterId: character.id,
+      characterName: character.name,
+      transcript: payload.text,
+      blob: hit.blob,
+      seed,
+      anchorBlob: hit.blob,
+      anchorTranscript: chunks[0],
+      uploadedFileData: cachedUpload || null,
+      fromCache: true,
+      mastered: Boolean(masterAudio),
+    },
+    uploadedFileData: cachedUpload || null,
+  };
+}
+
+/**
+ * Looks up a deterministic cached synthesis clip if a `SynthesisCachePort` is injected.
+ * @param {{ synthesisCache: object|null, cacheSpec: object, signal?: AbortSignal }} params - Lookup inputs.
+ * @returns {Promise<{ cacheKey: string|null, hit: object|null }>} Computed cache key and matched clip.
+ */
+async function tryLookupSynthesisCache({ synthesisCache, cacheSpec, signal }) {
+  if (!synthesisCache) return { cacheKey: null, hit: null };
+  const cacheKey = await synthesisCache.computeKey(cacheSpec);
+  const hit = await synthesisCache.getCachedAudio(cacheKey, { signal });
+  return { cacheKey, hit };
+}
+
+/**
+ * Applies server loudness mastering when enabled, falling back cleanly to local PCM smoothing.
+ * @param {{ blob: Blob, anchorBlob?: Blob, masterAudio: boolean, audioMaster: object|null, signal?: AbortSignal }} params - Mastering inputs.
+ * @returns {Promise<{ blob: Blob, anchorBlob?: Blob, mastered: boolean }>} Final WAV Blobs and mastered flag.
+ */
+async function applySynthesisMastering({ blob, anchorBlob, masterAudio, audioMaster, signal }) {
+  const cleanAnchor = anchorBlob ? await trySmoothWavBlob(anchorBlob) : anchorBlob;
+  if (masterAudio && audioMaster) {
+    const mastered = await audioMaster.masterWav(blob, { signal });
+    return { blob: mastered.blob, anchorBlob: cleanAnchor, mastered: mastered.mastered };
+  }
+  return { blob: await trySmoothWavBlob(blob), anchorBlob: cleanAnchor, mastered: false };
+}
+
+/**
+ * Executes single-character synthesis validation, cache lookup, chunking, mastering, and voice anchoring.
+ * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, seedGenerator?: () => number }} deps - Use-case ports.
  * @param {object} params - Synthesis command parameters.
  * @returns {Promise<object>} Recording metadata and uploaded FileData cache.
  */
-async function executeSpeechSynthesis(speechGateway, seedGenerator, params) {
-  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, denoiseReference = false, signal, onProgress, onReferenceUploaded } = params || {};
+async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, seedGenerator }, params) {
+  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, denoiseReference = false, masterAudio = true, signal, onProgress, onReferenceUploaded } = params || {};
   const payload = validateGenerationInput(
     { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed },
     seedGenerator
   );
   const chunks = segmentSingleSpeakerScript(payload.text);
+  const cacheSpec = { ...payload, characterId: character.id, anchor, denoiseReference: Boolean(denoiseReference), masterAudio: Boolean(masterAudio) };
+  const { cacheKey, hit } = await tryLookupSynthesisCache({ synthesisCache, cacheSpec, signal });
+  if (hit) return buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio });
   const { fileData: initialRef, wasCached } = await resolveInitialReference({ speechGateway, anchor, cachedUpload, signal, onReferenceUploaded });
-  const combined = await runChunkedSynthesis({
-    speechGateway, payload: { ...payload, characterId: character.id }, chunks, anchor,
-    initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onReferenceUploaded,
-  });
+  const combined = await runChunkedSynthesis({ speechGateway, payload: { ...payload, characterId: character.id }, chunks, anchor, initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onReferenceUploaded });
+  const polished = await applySynthesisMastering({ blob: combined.blob, anchorBlob: combined.anchorBlob, masterAudio: Boolean(masterAudio), audioMaster, signal });
+  if (synthesisCache && cacheKey) await synthesisCache.putCachedAudio(cacheKey, polished.blob, { characterId: character.id, seed: combined.seed });
   return {
-    recording: { id: `take-${Date.now()}-${combined.seed ?? 'rand'}`, characterId: character.id, characterName: character.name, transcript: payload.text, ...combined },
+    recording: { id: `take-${Date.now()}-${combined.seed ?? 'rand'}`, characterId: character.id, characterName: character.name, transcript: payload.text, ...combined, ...polished, fromCache: false },
     uploadedFileData: combined.uploadedFileData,
   };
 }
 
 /**
  * Creates the single-character speech synthesis use case.
- * Inputs: `{ speechGateway, seedGenerator }`.
+ * Inputs: `{ speechGateway, audioMaster, synthesisCache, seedGenerator }`.
  * Outputs: `{ execute(command) }` use-case object.
- * Side effects: delegates network IO exclusively to injected `speechGateway`.
+ * Side effects: delegates synthesis, mastering, and caching exclusively to injected ports.
  * Failure modes: throws ValidationError, SynthesisCancelledError, or SynthesisError.
- * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, seedGenerator?: () => number }} deps - Injected ports.
+ * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, seedGenerator?: () => number }} deps - Injected ports.
  * @returns {{ execute: (params: object) => Promise<object> }} Synthesis use case.
  */
-export function createSynthesizeSpeechUseCase({ speechGateway, seedGenerator }) {
+export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = null, synthesisCache = null, seedGenerator }) {
   assertPort(speechGateway, 'speechGateway', ['uploadReferenceAudio', 'synthesize']);
-  return { execute: params => executeSpeechSynthesis(speechGateway, seedGenerator, params) };
+  return { execute: params => executeSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, seedGenerator }, params) };
 }
 
 /**

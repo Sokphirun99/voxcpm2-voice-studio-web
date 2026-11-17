@@ -359,3 +359,47 @@ test('voiceAnchor use cases normalize padded IDs and ignore blank IDs without st
   await anchors.unpinCharacter(' char-nisa ');
   assert.deepEqual(calls, ['save:char-nisa', 'loadAll', 'save:char-nisa', 'delete:char-nisa']);
 });
+
+test('synthesizeSpeech integrates audioMaster and synthesisCache cleanly without breaking disabled fallback', async () => {
+  let gatewayCalls = 0;
+  let masterCalls = 0;
+  const cacheStore = new Map();
+  const rawBlob = makePcmWavBlob(new Array(2400).fill(500));
+  const masteredBlob = makePcmWavBlob(new Array(2400).fill(1500));
+
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: {
+      async uploadReferenceAudio() { throw new Error('Should not upload'); },
+      async synthesize({ seed }) { gatewayCalls += 1; return { blob: rawBlob, seed }; },
+    },
+    audioMaster: {
+      async masterWav() { masterCalls += 1; return { blob: masteredBlob, mastered: true }; },
+    },
+    synthesisCache: {
+      computeKey: async spec => `${spec.characterId}:${spec.text}:${spec.seed}:${spec.masterAudio}`,
+      getCachedAudio: async key => cacheStore.get(key) || null,
+      putCachedAudio: async (key, blob, meta) => { cacheStore.set(key, { blob, seed: meta.seed }); },
+    },
+    seedGenerator: () => 42,
+  });
+
+  const first = await useCase.execute({ script: 'សួស្តី', character: CHAR_NISA, guidance: 2, steps: 10, seed: '42', masterAudio: true });
+  assert.equal(gatewayCalls, 1);
+  assert.equal(masterCalls, 1);
+  assert.equal(first.recording.fromCache, false);
+  assert.equal(first.recording.mastered, true);
+  assert.equal(first.recording.blob, masteredBlob);
+
+  // Exact same inputs must hit cache without hitting gateway or audioMaster again
+  const second = await useCase.execute({ script: 'សួស្តី', character: CHAR_NISA, guidance: 2, steps: 10, seed: '42', masterAudio: true });
+  assert.equal(gatewayCalls, 1);
+  assert.equal(masterCalls, 1);
+  assert.equal(second.recording.fromCache, true);
+  assert.equal(second.recording.blob, masteredBlob);
+
+  // Disabling masterAudio creates distinct cache entry and skips audioMaster
+  const unmastered = await useCase.execute({ script: 'សួស្តី', character: CHAR_NISA, guidance: 2, steps: 10, seed: '42', masterAudio: false });
+  assert.equal(gatewayCalls, 2);
+  assert.equal(masterCalls, 1);
+  assert.equal(unmastered.recording.mastered, false);
+});

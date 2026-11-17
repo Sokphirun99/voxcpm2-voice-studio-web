@@ -9,6 +9,13 @@ const PCM_AUDIO_FORMAT = 1;
 const CHUNK_HEADER_BYTES = 8;
 const FIRST_SUBCHUNK_OFFSET = 12;
 const MS_PER_SECOND = 1000;
+const PCM_BITS_16 = 16;
+const SILENCE_AMP_THRESHOLD = 128;
+const MIN_TRIM_DURATION_MS = 250;
+const TRIM_HEAD_PAD_MS = 45;
+const TRIM_TAIL_PAD_MS = 80;
+const MIN_FADE_DURATION_MS = 50;
+const EDGE_FADE_MS = 5;
 
 /**
  * Reads a 4-character ASCII tag from a DataView.
@@ -208,7 +215,123 @@ function hasMatchingWaveFormat(base, current) {
 }
 
 /**
- * Decodes an array of WAV Blobs into validated PCM slices.
+ * Returns true if every channel sample in a 16-bit PCM frame falls within the silence threshold.
+ * @param {DataView} view - PCM DataView.
+ * @param {number} frameOffset - Frame byte offset.
+ * @param {number} channels - Channel count.
+ * @returns {boolean} True when silent.
+ */
+function isSilentPcm16Frame(view, frameOffset, channels) {
+  for (let ch = 0; ch < channels; ch++) {
+    if (Math.abs(view.getInt16(frameOffset + ch * 2, true)) > SILENCE_AMP_THRESHOLD) return false;
+  }
+  return true;
+}
+
+/**
+ * Finds padded active frame bounds (`[startFrame, endFrame)`) when segment exceeds minimum trim length.
+ * @param {ArrayBuffer} buffer - WAV ArrayBuffer.
+ * @param {object} info - Parsed WAV format metadata.
+ * @returns {{ startFrame: number, endFrame: number }} Slice bounds in frames.
+ */
+function resolveTrimFrameRange(buffer, info) {
+  const totalFrames = Math.floor(info.dataSize / info.blockAlign);
+  const minTrimFrames = Math.round((info.sampleRate * MIN_TRIM_DURATION_MS) / MS_PER_SECOND);
+  if (totalFrames < minTrimFrames) return { startFrame: 0, endFrame: totalFrames };
+  const view = new DataView(buffer, info.dataOffset, totalFrames * info.blockAlign);
+  let first = -1;
+  for (let f = 0; f < totalFrames; f++) {
+    if (!isSilentPcm16Frame(view, f * info.blockAlign, info.numChannels)) { first = f; break; }
+  }
+  if (first === -1) return { startFrame: 0, endFrame: totalFrames };
+  let last = first;
+  for (let f = totalFrames - 1; f > first; f--) {
+    if (!isSilentPcm16Frame(view, f * info.blockAlign, info.numChannels)) { last = f; break; }
+  }
+  const headPad = Math.round((info.sampleRate * TRIM_HEAD_PAD_MS) / MS_PER_SECOND);
+  const tailPad = Math.round((info.sampleRate * TRIM_TAIL_PAD_MS) / MS_PER_SECOND);
+  return { startFrame: Math.max(0, first - headPad), endFrame: Math.min(totalFrames, last + 1 + tailPad) };
+}
+
+/**
+ * Scales start and end edge frames smoothly in a freshly allocated 16-bit PCM byte array.
+ * @param {Uint8Array} pcmBytes - Copied 16-bit PCM buffer.
+ * @param {object} info - WAV format metadata.
+ */
+function applyMicroFadeInPlace(pcmBytes, info) {
+  const frameCount = Math.floor(pcmBytes.byteLength / info.blockAlign);
+  const minFadeFrames = Math.round((info.sampleRate * MIN_FADE_DURATION_MS) / MS_PER_SECOND);
+  const fadeFrames = Math.min(Math.round((info.sampleRate * EDGE_FADE_MS) / MS_PER_SECOND), Math.floor(frameCount / 2));
+  if (frameCount < minFadeFrames || fadeFrames <= 0) return;
+  const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  for (let i = 0; i < fadeFrames; i++) {
+    const startGain = (i + 1) / fadeFrames;
+    const endGain = (fadeFrames - i) / fadeFrames;
+    const tailFrame = frameCount - fadeFrames + i;
+    for (let ch = 0; ch < info.numChannels; ch++) {
+      const headOff = i * info.blockAlign + ch * 2;
+      const tailOff = tailFrame * info.blockAlign + ch * 2;
+      view.setInt16(headOff, Math.round(view.getInt16(headOff, true) * startGain), true);
+      view.setInt16(tailOff, Math.round(view.getInt16(tailOff, true) * endGain), true);
+    }
+  }
+}
+
+/**
+ * Extracts a trimmed, micro-faded PCM segment from a validated WAV buffer when 16-bit PCM constraints apply.
+ * @param {ArrayBuffer} buffer - Raw WAV buffer.
+ * @param {object} info - Parsed WAV format metadata.
+ * @returns {Uint8Array} Clean PCM byte slice.
+ */
+function prepareCleanPcmSlice(buffer, info) {
+  if (info.bitsPerSample !== PCM_BITS_16 || info.blockAlign !== info.numChannels * 2) {
+    return new Uint8Array(buffer, info.dataOffset, info.dataSize);
+  }
+  const { startFrame, endFrame } = resolveTrimFrameRange(buffer, info);
+  const byteStart = info.dataOffset + startFrame * info.blockAlign;
+  const byteEnd = info.dataOffset + endFrame * info.blockAlign;
+  const pcmCopy = new Uint8Array(buffer.slice(byteStart, byteEnd));
+  applyMicroFadeInPlace(pcmCopy, info);
+  return pcmCopy;
+}
+
+/**
+ * Trims excessive leading/trailing silence and adds 5ms edge micro-fades on a single WAV Blob.
+ * Inputs: WAV `Blob`.
+ * Outputs: cleaned `Blob` with `audio/wav` MIME type.
+ * Side effects: reads binary bytes from input `Blob`.
+ * Failure modes: throws SynthesisError if WAV headers are invalid.
+ * @param {Blob} blob - Source WAV Blob.
+ * @returns {Promise<Blob>} Trimmed and smoothed WAV Blob.
+ */
+export async function smoothAndTrimWavBlob(blob) {
+  const normalized = ensureAudioWavBlob(blob);
+  const buffer = await normalized.arrayBuffer();
+  const info = inspectWavBuffer(buffer);
+  const pcm = prepareCleanPcmSlice(buffer, info);
+  return new Blob([buildWaveHeader({ ...info, dataLength: pcm.byteLength }), pcm], { type: 'audio/wav' });
+}
+
+/**
+ * Safely trims silence and smooths edges on valid 16-bit PCM WAV Blobs while leaving minimal test/non-PCM Blobs intact.
+ * Inputs: WAV `Blob`.
+ * Outputs: smoothed `audio/wav` `Blob` or MIME-normalized original when PCM header is absent.
+ * Side effects: reads binary bytes from input `Blob`.
+ * Failure modes: throws TypeError only if `blob` is not a Blob-like object.
+ * @param {Blob} blob - Candidate WAV Blob.
+ * @returns {Promise<Blob>} Normalized/smoothed WAV Blob.
+ */
+export async function trySmoothWavBlob(blob) {
+  const normalized = ensureAudioWavBlob(blob);
+  const buffer = await normalized.arrayBuffer();
+  const { metadata } = parseWavHeaderMetadata(buffer);
+  if (!metadata || metadata.bitsPerSample !== PCM_BITS_16) return normalized;
+  const pcm = prepareCleanPcmSlice(buffer, metadata);
+  return new Blob([buildWaveHeader({ ...metadata, dataLength: pcm.byteLength }), pcm], { type: 'audio/wav' });
+}
+
+/**
+ * Decodes an array of WAV Blobs into trimmed, micro-faded PCM slices.
  * @param {Blob[]} blobs - Input WAV Blobs.
  * @returns {Promise<Array<{ info: object, pcm: Uint8Array }>>} Decoded PCM slices.
  */
@@ -217,7 +340,7 @@ function decodeWavSegments(blobs) {
     blobs.map(async blob => {
       const buffer = await blob.arrayBuffer();
       const info = inspectWavBuffer(buffer);
-      return { info, pcm: new Uint8Array(buffer, info.dataOffset, info.dataSize) };
+      return { info, pcm: prepareCleanPcmSlice(buffer, info) };
     })
   );
 }

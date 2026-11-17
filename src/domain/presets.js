@@ -3,6 +3,7 @@
  */
 
 import { ValidationError } from './errors.js';
+import { normalizeKhmerUnicode } from './khmerText.js';
 
 export const MAX_SCRIPT_LENGTH = 2000;
 export const MAX_DESCRIPTION_LENGTH = 300;
@@ -115,7 +116,7 @@ function resolveExactCloneOptions({ hasLockedAudio, exactClone, promptText }) {
  * @returns {string} Trimmed script text.
  */
 function validateScriptText(rawScript) {
-  const text = typeof rawScript === 'string' ? rawScript.trim() : '';
+  const text = normalizeKhmerUnicode(rawScript);
   if (!text) throw new ValidationError('Enter text to generate speech.', 'script', 'EMPTY_SCRIPT');
   if (countGraphemes(text) > MAX_SCRIPT_LENGTH) {
     throw new ValidationError(`Keep your script under ${MAX_SCRIPT_LENGTH.toLocaleString()} characters.`, 'script', 'SCRIPT_TOO_LONG');
