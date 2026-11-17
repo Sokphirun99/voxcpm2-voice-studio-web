@@ -24,7 +24,7 @@ services:
       storage:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${VOICE_STUDIO_PORT:-8087}:5173"
+      - "${VOICE_STUDIO_BIND:-0.0.0.0}:${VOICE_STUDIO_PORT:-8087}:5173"
     volumes:
       - ./index.html:/app/index.html:ro
       - ./vite.config.js:/app/vite.config.js:ro

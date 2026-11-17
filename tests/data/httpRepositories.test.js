@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDockerVoiceAnchorRepository } from '../../src/data/httpAudioRepository.js';
 import { createHttpAudioMaster } from '../../src/data/httpAudioMaster.js';
-import { createHttpSynthesisCache } from '../../src/data/httpSynthesisCache.js';
+import { createHttpSynthesisCache, pureSha256Hex } from '../../src/data/httpSynthesisCache.js';
 import { createHttpVoiceRepository } from '../../src/data/httpVoiceRepository.js';
 import { StorageError } from '../../src/domain/errors.js';
 
@@ -260,4 +260,11 @@ test('createHttpSynthesisCache computes unique keys and handles cache hits, miss
   const offlineCache = createHttpSynthesisCache({ fetchImpl: async () => { throw new TypeError('offline'); }, logger: { debug() {} } });
   assert.equal(await offlineCache.getCachedAudio(kA), null);
   await offlineCache.putCachedAudio(kA, wav, {});
+
+  // Verify pure-JS SHA-256 fallback (for non-HTTPS LAN IPs like phones on Wi-Fi) matches SubtleCrypto exactly
+  for (const textSample of ['', 'hello', 'សួស្តីអ្នកទាំងអស់គ្នា']) {
+    const bytes = new TextEncoder().encode(textSample);
+    const expected = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
+    assert.equal(pureSha256Hex(bytes), expected);
+  }
 });

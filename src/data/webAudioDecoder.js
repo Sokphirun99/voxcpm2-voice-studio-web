@@ -13,7 +13,7 @@ import { computePeaksFromSamples } from '../domain/audioValidation.js';
  * @param {{ AudioContextClass?: typeof AudioContext }} [deps] - Optional AudioContext constructor.
  * @returns {import('../domain/ports.js').AudioDecoderPort} Audio decoder adapter.
  */
-export function createWebAudioDecoder({ AudioContextClass = globalThis.AudioContext } = {}) {
+export function createWebAudioDecoder({ AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext } = {}) {
   /**
    * Decodes waveform peaks and duration from an audio Blob in a single pass.
    * @param {Blob} blob - Audio Blob to decode.
