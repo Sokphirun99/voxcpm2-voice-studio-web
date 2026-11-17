@@ -212,10 +212,13 @@ function ScriptStyleControl({ options, isExactClone, onChange }) {
   return (
     <div className="style-control-block">
       <label className="field-label" htmlFor="style-mode">Script format &amp; style</label>
-      <select id="style-mode" name="styleMode" value={styleMode} disabled={isExactClone}
-        onChange={event => onChange('styleMode', event.target.value)}>
-        {STYLE_PRESET_OPTIONS.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
-      </select>
+      <div className="select-field select-field--plain">
+        <select id="style-mode" name="styleMode" value={styleMode} disabled={isExactClone}
+          onChange={event => onChange('styleMode', event.target.value)}>
+          {STYLE_PRESET_OPTIONS.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+        </select>
+        <Icon name="chevron_down" className="select-chevron" />
+      </div>
       {styleMode === STYLE_MODES.CUSTOM && !isExactClone && (
         <input id="custom-style" name="customStyle" type="text" maxLength={MAX_DESCRIPTION_LENGTH}
           placeholder="e.g. Clear Khmer news anchor, calm steady pace"

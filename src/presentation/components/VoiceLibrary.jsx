@@ -70,11 +70,14 @@ function VoiceIdentityFields({ name, setName, category, setCategory }) {
       </label>
       <label>
         <span>Category</span>
-        <select id="save-voice-category" value={category} onChange={event => setCategory(event.target.value)}>
-          <option value="female">Female</option>
-          <option value="male">Male</option>
-          <option value="character">Character</option>
-        </select>
+        <div className="select-field select-field--plain">
+          <select id="save-voice-category" value={category} onChange={event => setCategory(event.target.value)}>
+            <option value="female">Female</option>
+            <option value="male">Male</option>
+            <option value="character">Character</option>
+          </select>
+          <Icon name="chevron_down" className="select-chevron" />
+        </div>
       </label>
     </div>
   );
@@ -180,8 +183,10 @@ function SaveVoiceForm({ onSave, onCancel }) {
   };
   return (
     <form className="library-save-form" onSubmit={handleSubmit}>
-      <SaveVoiceFields name={name} setName={setName} category={category} setCategory={setCategory}
-        description={description} setDescription={setDescription} audioFile={audioFile} setAudioFile={setAudioFile} />
+      <div className="library-save-fields">
+        <SaveVoiceFields name={name} setName={setName} category={category} setCategory={setCategory}
+          description={description} setDescription={setDescription} audioFile={audioFile} setAudioFile={setAudioFile} />
+      </div>
       <SaveFormActions error={error} submitting={submitting} onCancel={onCancel} />
     </form>
   );
@@ -193,11 +198,13 @@ function SaveVoiceForm({ onSave, onCancel }) {
  * @returns {React.ReactElement} Dialog header.
  */
 function LibraryHeader({ showSaveForm, onOpenSave, onCloseClick }) {
+  const title = showSaveForm ? 'New character' : 'Character library';
+  const subtitle = showSaveForm ? 'Describe a voice or attach a 5–15s audio sample.' : 'Pick a character or create your own.';
   return (
     <div className="library-header">
       <div>
-        <h2 id="library-title">Character library</h2>
-        <p id="library-description">Pick a character or create your own.</p>
+        <h2 id="library-title">{title}</h2>
+        <p id="library-description">{subtitle}</p>
       </div>
       <div className="library-header-actions">
         {!showSaveForm && (
@@ -219,9 +226,12 @@ function LibrarySelectField({ label, id, name, value, options, onChange }) {
   return (
     <label>
       <span>{label}</span>
-      <select id={id} name={name} value={value} onChange={onChange}>
-        {options.map(([optValue, optLabel]) => <option key={optValue} value={optValue}>{optLabel}</option>)}
-      </select>
+      <div className="select-field select-field--plain">
+        <select id={id} name={name} value={value} onChange={onChange}>
+          {options.map(([optValue, optLabel]) => <option key={optValue} value={optValue}>{optLabel}</option>)}
+        </select>
+        <Icon name="chevron_down" className="select-chevron" />
+      </div>
     </label>
   );
 }
@@ -328,6 +338,22 @@ function applyLibraryFilterChange(event, updateFilter, scroller) {
 }
 
 /**
+ * Renders searchable character filters, count status, and scrollable rows inside the Character Library dialog.
+ * @param {object} props - Library filters, list refs, anchors, busy state, and row callbacks.
+ * @returns {React.ReactElement} Browse view fragment.
+ */
+function LibraryBrowseSection({ filters, scroller, matches, warning, storageStats, anchors, busy, updateFilter, onSelectVoice, onDeleteCharacter, onUnpinAnchor }) {
+  return (
+    <>
+      <LibraryFilters filters={filters} onFilterChange={event => applyLibraryFilterChange(event, updateFilter, scroller)} />
+      <p className="library-count" id="library-status" role="status">{formatLibraryStatus(matches.length, warning, storageStats)}</p>
+      <LibraryResultsList scroller={scroller} matches={matches} anchors={anchors} busy={busy}
+        onSelectVoice={onSelectVoice} onDeleteCharacter={onDeleteCharacter} onUnpinAnchor={onUnpinAnchor} />
+    </>
+  );
+}
+
+/**
  * Modal dialog presenting single-speaker Characters, lock status, and custom character creation.
  * Inputs: `{ open, openSaveForm, library, anchors, onSelectVoice, onCreateCharacter, onDeleteCharacter, onUnpinAnchor, onClose }`.
  * Outputs: `<dialog className="voice-library">` element.
@@ -339,7 +365,7 @@ function applyLibraryFilterChange(event, updateFilter, scroller) {
 export function VoiceLibrary({ open, openSaveForm, busy, library, anchors, onSelectVoice, onCreateCharacter, onDeleteCharacter, onUnpinAnchor, onClose }) {
   const dialog = useRef(null);
   const scroller = useRef(null);
-  const [showSaveForm, setShowSaveForm] = useState(false);
+  const [showSaveForm, setShowSaveForm] = useState(Boolean(openSaveForm));
   const { matches, warning, storageStats, refreshStats, filters, updateFilter } = library;
   useLibraryDialogSync(dialog, open, openSaveForm, setShowSaveForm);
   useEffect(() => { if (open) refreshStats?.(); }, [open, refreshStats]);
@@ -348,11 +374,13 @@ export function VoiceLibrary({ open, openSaveForm, busy, library, anchors, onSel
     <dialog className="voice-library" id="voice-library" aria-labelledby="library-title"
       aria-describedby="library-description" ref={dialog} onClose={onClose}>
       <LibraryHeader showSaveForm={showSaveForm} onOpenSave={() => setShowSaveForm(true)} onCloseClick={() => dialog.current?.close()} />
-      {showSaveForm && <SaveVoiceForm onSave={handleSaveCharacter} onCancel={() => setShowSaveForm(false)} />}
-      <LibraryFilters filters={filters} onFilterChange={event => applyLibraryFilterChange(event, updateFilter, scroller)} />
-      <p className="library-count" id="library-status" role="status">{formatLibraryStatus(matches.length, warning, storageStats)}</p>
-      <LibraryResultsList scroller={scroller} matches={matches} anchors={anchors} busy={busy}
-        onSelectVoice={onSelectVoice} onDeleteCharacter={onDeleteCharacter} onUnpinAnchor={onUnpinAnchor} />
+      {showSaveForm ? (
+        <SaveVoiceForm onSave={handleSaveCharacter} onCancel={() => setShowSaveForm(false)} />
+      ) : (
+        <LibraryBrowseSection filters={filters} scroller={scroller} matches={matches} warning={warning}
+          storageStats={storageStats} anchors={anchors} busy={busy} updateFilter={updateFilter}
+          onSelectVoice={onSelectVoice} onDeleteCharacter={onDeleteCharacter} onUnpinAnchor={onUnpinAnchor} />
+      )}
     </dialog>
   );
 }

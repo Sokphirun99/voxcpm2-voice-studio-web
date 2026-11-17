@@ -247,6 +247,48 @@ test('VoiceLibrary disables mutations when busy and renders Create character mod
     assert.ok(html.includes('Voice locked'));
     assert.match(html, /class="button subtle-button library-unpin"[^>]*disabled=""/);
     assert.match(html, /class="button subtle-button library-delete"[^>]*disabled=""/);
+
+    const createModeHtml = renderToStaticMarkup(
+      React.createElement(VoiceLibrary, {
+        open: false,
+        openSaveForm: true,
+        busy: false,
+        library: {
+          matches: [customChar],
+          warning: null,
+          filters: { search: '', source: '', category: '' },
+          updateFilter() {},
+        },
+        anchors: {},
+        onSelectVoice() {},
+        onCreateCharacter: async () => {},
+        onDeleteCharacter() {},
+        onUnpinAnchor() {},
+        onClose() {},
+      })
+    );
+    assert.ok(createModeHtml.includes('id="save-voice-name"'));
+    assert.ok(createModeHtml.includes('id="save-voice-category"'));
+    assert.ok(createModeHtml.includes('id="confirm-save-voice"'));
+    assert.equal(createModeHtml.includes('id="library-results"'), false);
+
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { AudioPlayer } = await vite.ssrLoadModule('/src/presentation/components/AudioPlayer.jsx');
+    const idlePlayerHtml = renderToStaticMarkup(
+      React.createElement(
+        StudioProvider,
+        { services: createStubServices() },
+        React.createElement(AudioPlayer, {
+          recording: null,
+          activeCharacter: customChar,
+          activeAnchor: null,
+          status: { message: 'No audio generated yet.', error: false },
+          onPinTake() {},
+          onPlaybackError() {},
+        })
+      )
+    );
+    assert.ok(idlePlayerHtml.includes('data-has-audio="false"'));
   });
 });
 

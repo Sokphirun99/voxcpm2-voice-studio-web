@@ -323,7 +323,7 @@ export function AudioPlayer({ recording, activeCharacter, activeAnchor, status, 
   };
 
   return (
-    <section className="playback" aria-labelledby="playback-title">
+    <section className="playback" data-has-audio={media.url ? 'true' : 'false'} aria-labelledby="playback-title">
       <PlaybackInfo status={status} />
       <PlaybackControls media={media} recording={recording} activeCharacter={activeCharacter}
         activeAnchor={activeAnchor} onSeek={handleSeek} onPinTake={onPinTake}
