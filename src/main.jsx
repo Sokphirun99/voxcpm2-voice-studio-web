@@ -1,0 +1,65 @@
+/**
+ * @fileoverview Entry point and composition root wiring Data adapters -> Domain use cases -> Presentation UI.
+ */
+
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import '@fontsource-variable/noto-sans-khmer';
+import './presentation/styles/studio.css';
+import { createConsoleLogger } from './data/consoleLogger.js';
+import { createGradioSpeechGateway } from './data/gradioSpeechGateway.js';
+import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepository.js';
+import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
+import { createWebAudioDecoder } from './data/webAudioDecoder.js';
+import {
+  createLockReferenceAudioUseCase,
+  createSynthesizeSpeechUseCase,
+  createVoiceAnchorUseCases,
+  createVoiceLibraryUseCases,
+} from './domain/useCases.js';
+import { StudioProvider } from './presentation/StudioContext.jsx';
+import { ErrorBoundary } from './presentation/components/ErrorBoundary.jsx';
+import { Studio } from './presentation/components/Studio.jsx';
+
+/**
+ * Instantiates concrete Data adapters and injects them into Domain use cases.
+ * Inputs: none.
+ * Outputs: service bundle passed to `<StudioProvider>`.
+ * Side effects: none until services are invoked by UI hooks.
+ * Failure modes: throws if port contract assertions fail during startup.
+ * @returns {object} Wired application service container.
+ */
+function createStudioServices() {
+  const logger = createConsoleLogger();
+  const speechGateway = createGradioSpeechGateway({ logger });
+  const voiceRepository = createLocalVoiceRepository({ logger });
+  const anchorRepository = createIndexedDbVoiceAnchorRepository({ logger });
+  const audioDecoder = createWebAudioDecoder();
+
+  return {
+    speechGateway,
+    audioDecoder,
+    logger,
+    synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway }),
+    lockReferenceAudio: createLockReferenceAudioUseCase(),
+    voiceLibrary: createVoiceLibraryUseCases({ voiceRepository }),
+    voiceAnchors: createVoiceAnchorUseCases({ anchorRepository }),
+  };
+}
+
+const rootElement = document.getElementById('app');
+if (!rootElement) {
+  throw new Error('Could not find #app root container.');
+}
+
+const services = createStudioServices();
+
+createRoot(rootElement).render(
+  <div className="studio-page">
+    <StudioProvider services={services}>
+      <ErrorBoundary logger={services.logger}>
+        <Studio />
+      </ErrorBoundary>
+    </StudioProvider>
+  </div>
+);
