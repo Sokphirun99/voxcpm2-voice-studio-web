@@ -53,7 +53,8 @@ docker compose -f web/compose.yaml down
 ## Production nginx container
 
 To build and serve the minified static production bundle via nginx instead of
-the Vite dev server:
+the Vite dev server (with `no-store` HTML/manifest headers and `/version.json`
+auto-refresh polling):
 
 ~~~sh
 docker compose -f web/compose.prod.yaml up --build -d
@@ -64,7 +65,7 @@ docker compose -f web/compose.prod.yaml up --build -d
 `web/src/` follows Clean Architecture (`Presentation → Domain → Data`):
 
 - `src/domain/` — Pure entities, Khmer Unicode/numeral normalization (`khmerText.js`), PCM edge trimming/fades (`wavCodec.js`), validation rules, typed errors, port contracts (`ports.js`), and application use cases (`useCases.js`) with zero React/DOM/network/storage imports.
-- `src/data/` — Port implementations (`gradioSpeechGateway.js`, `httpAudioMaster.js`, `httpSynthesisCache.js`, `httpAudioRepository.js`, `httpVoiceRepository.js`, `indexedDbAudioRepository.js`, `localVoiceRepository.js`, `webAudioDecoder.js`, `consoleLogger.js`).
+- `src/data/` — Port implementations (`gradioSpeechGateway.js`, `httpAudioMaster.js`, `httpSynthesisCache.js`, `httpVersionChecker.js`, `httpAudioRepository.js`, `httpVoiceRepository.js`, `indexedDbAudioRepository.js`, `localVoiceRepository.js`, `webAudioDecoder.js`, `consoleLogger.js`).
 - `src/presentation/` — React DI context (`StudioContext.jsx`), hooks, components, and styles consuming only `domain/` and injected services.
 - `src/main.jsx` — Composition root wiring Data adapters into Domain use cases and mounting the Presentation UI.
 - `server/` — Persistent `/api/v1` backend storage, FFmpeg EBU R128 `-16 LUFS` mastering (`POST /api/v1/audio/master`), and bounded LRU synthesis cache (`GET/PUT /api/v1/cache/:key`) running in the `storage` Docker container backed by `voxcpm_voice_studio_data:/data` (`catalog.json`, `/data/anchors/*.audio`, `/data/cache/*.wav`). Existing browser IndexedDB locks and custom characters migrate automatically on load so character voices stay fixed across browser clears and container rebuilds.

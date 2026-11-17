@@ -614,3 +614,93 @@ test('createVoiceAnchorStore preserves microtask-interleaved edits and rolls bac
     assert.equal(store.state.anchors[CHAR_NISA.id].promptText, 'step2');
   });
 });
+
+function createMemoryStorage() {
+  const entries = new Map();
+  return {
+    getItem: key => entries.get(key) ?? null,
+    setItem: (key, value) => entries.set(key, String(value)),
+  };
+}
+
+test('claimSafeAutoReload and applyVersionCheckResult prevent loops and fall back to banner when busy', async () => {
+  await withViteSsr(async vite => {
+    const { claimSafeAutoReload, applyVersionCheckResult } = await vite.ssrLoadModule(
+      '/src/presentation/hooks/useAppVersionCheck.js'
+    );
+    const storage = createMemoryStorage();
+    let reloads = 0;
+    let bannerVisible = false;
+    const setUpdateAvailable = next => {
+      bannerVisible = next;
+    };
+    const onReload = () => {
+      reloads += 1;
+    };
+
+    // Ignore non-update checks
+    assert.equal(
+      applyVersionCheckResult({
+        result: { hasUpdate: false, remoteBuildId: 'b1' },
+        canAutoReload: true, storage, onReload, setUpdateAvailable,
+      }),
+      false
+    );
+    assert.equal(reloads, 0);
+    assert.equal(bannerVisible, false);
+
+    // Busy editor/generator defers reload and surfaces non-destructive banner
+    assert.equal(
+      applyVersionCheckResult({
+        result: { hasUpdate: true, remoteBuildId: 'b2' },
+        canAutoReload: false, storage, onReload, setUpdateAvailable,
+      }),
+      false
+    );
+    assert.equal(reloads, 0);
+    assert.equal(bannerVisible, true);
+
+    // Idle workspace auto-reloads once per remote build ID
+    bannerVisible = false;
+    assert.equal(
+      applyVersionCheckResult({
+        result: { hasUpdate: true, remoteBuildId: 'b2' },
+        canAutoReload: true, storage, onReload, setUpdateAvailable,
+      }),
+      true
+    );
+    assert.equal(reloads, 1);
+    assert.equal(bannerVisible, false);
+
+    // Second idle check for same remote build ID refuses loop and falls back to banner
+    assert.equal(claimSafeAutoReload(storage, 'b2'), false);
+    assert.equal(
+      applyVersionCheckResult({
+        result: { hasUpdate: true, remoteBuildId: 'b2' },
+        canAutoReload: true, storage, onReload, setUpdateAvailable,
+      }),
+      false
+    );
+    assert.equal(reloads, 1);
+    assert.equal(bannerVisible, true);
+  });
+});
+
+test('UpdateBanner SSR renders accessible prompt only when update is available', async () => {
+  await withViteSsr(async vite => {
+    const { UpdateBanner } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+    const hiddenHtml = renderToStaticMarkup(
+      React.createElement(UpdateBanner, { visible: false, onReload() {} })
+    );
+    assert.equal(hiddenHtml, '');
+
+    const visibleHtml = renderToStaticMarkup(
+      React.createElement(UpdateBanner, { visible: true, onReload() {} })
+    );
+    assert.ok(visibleHtml.includes('id="app-update-banner"'));
+    assert.ok(visibleHtml.includes('role="status"'));
+    assert.ok(visibleHtml.includes('id="reload-app-button"'));
+    assert.ok(visibleHtml.includes('A new Voice Studio update is ready.'));
+    assert.ok(visibleHtml.includes('Reload now'));
+  });
+});

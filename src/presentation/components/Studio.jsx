@@ -6,6 +6,7 @@ import React, { useMemo, useRef, useState } from 'react';
 import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, countGraphemes } from '../../domain/presets.js';
 import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
 import { useStudioServices } from '../StudioContext.jsx';
+import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
 import { resolveEffectiveSeed, useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
@@ -171,15 +172,28 @@ function StudioSpeechForm({ state, ctrl, voiceActions }) {
   );
 }
 
+export function UpdateBanner({ visible, onReload }) {
+  if (!visible) return null;
+  return (
+    <div className="update-banner" id="app-update-banner" role="status">
+      <span>A new Voice Studio update is ready.</span>
+      <button type="button" className="button update-reload-button" id="reload-app-button" onClick={onReload}>
+        Reload now
+      </button>
+    </div>
+  );
+}
+
 /**
  * Renders the main workspace pane containing toolbar, script/voice form, and playback dock.
  * @param {object} props - Workspace props.
  * @returns {React.ReactElement} Main workspace element.
  */
 function StudioWorkspace({ state, ctrl, voiceActions }) {
-  const { synthesis, activeCharacter, activeAnchor, actions, generateDisabled } = ctrl;
+  const { synthesis, activeCharacter, activeAnchor, actions, generateDisabled, versionCheck } = ctrl;
   return (
     <main className="studio-workspace">
+      <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />
       <Toolbar busy={synthesis.busy} generateDisabled={generateDisabled}
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={synthesis.cancel} />
       <StudioSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions} />
@@ -257,7 +271,10 @@ function useStudioController(state) {
   const count = countGraphemes(state.script);
   const isOverLimit = count > MAX_SCRIPT_LENGTH;
   const generateDisabled = synthesis.busy || !state.anchorApi.isLoaded || !state.script.trim() || isOverLimit;
-  return { logger, synthesis, activeCharacter, activeAnchor, actions, count, isOverLimit, generateDisabled };
+  const versionCheck = useAppVersionCheck({
+    canAutoReload: !synthesis.busy && !state.script.trim() && !state.libraryModal.open,
+  });
+  return { logger, synthesis, activeCharacter, activeAnchor, actions, count, isOverLimit, generateDisabled, versionCheck };
 }
 
 /**

@@ -9,8 +9,30 @@ const STORAGE_TARGET = process.env.STORAGE_URL || 'http://127.0.0.1:8090';
 const DEV_PORT = 5173;
 const PROXY_TIMEOUT_MS = 600000;
 const POLL_INTERVAL_MS = 250;
+const BUILD_ID = process.env.APP_BUILD_ID || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const ALLOWED_GRADIO_PATH = /^\/gradio_api\/(info|upload|call\/generate(\/[a-f0-9]+)?|file=\/.+\.wav)$/;
 const ALLOWED_STORAGE_PATH = /^\/api\/v1\/(health|characters(\/[^/]+)?|anchors(\/[^/]+(\/audio)?)?|audio\/master|cache\/[a-f0-9]{64}(\/audio)?)$/;
+
+/**
+ * Emits `/version.json` in dev middleware and production bundles so clients detect fresh builds safely.
+ * @param {string} buildId - Unique identifier for the current Vite build/dev instance.
+ * @returns {import('vite').Plugin} Vite plugin descriptor.
+ */
+function versionManifestPlugin(buildId) {
+  const payload = JSON.stringify({ buildId });
+  return {
+    name: 'voice-studio-version-manifest',
+    configureServer(server) {
+      server.middlewares.use('/version.json', (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(payload);
+      });
+    },
+    generateBundle() {
+      this.emitFile({ type: 'asset', fileName: 'version.json', source: payload });
+    },
+  };
+}
 
 /**
  * Attaches proxy error handling returning HTTP 502 JSON when an upstream service is unreachable.
@@ -31,6 +53,10 @@ function configureProxyError(proxy, fallbackMessage) {
 }
 
 export default defineConfig({
+  define: {
+    __APP_BUILD_ID__: JSON.stringify(BUILD_ID),
+  },
+  plugins: [versionManifestPlugin(BUILD_ID)],
   server: {
     host: '0.0.0.0',
     port: DEV_PORT,

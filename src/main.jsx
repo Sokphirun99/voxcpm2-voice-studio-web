@@ -11,6 +11,7 @@ import { createGradioSpeechGateway } from './data/gradioSpeechGateway.js';
 import { createHttpAudioMaster } from './data/httpAudioMaster.js';
 import { createDockerVoiceAnchorRepository } from './data/httpAudioRepository.js';
 import { createHttpSynthesisCache } from './data/httpSynthesisCache.js';
+import { createHttpVersionChecker } from './data/httpVersionChecker.js';
 import { createHttpVoiceRepository } from './data/httpVoiceRepository.js';
 import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepository.js';
 import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
@@ -43,10 +44,12 @@ function createStudioServices() {
   const localAnchors = createIndexedDbVoiceAnchorRepository({ logger });
   const anchorRepository = createDockerVoiceAnchorRepository({ localRepository: localAnchors, logger });
   const audioDecoder = createWebAudioDecoder();
+  const versionChecker = createHttpVersionChecker({ logger });
 
   return {
     speechGateway,
     audioDecoder,
+    versionChecker,
     logger,
     synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, audioMaster, synthesisCache }),
     lockReferenceAudio: createLockReferenceAudioUseCase(),

@@ -222,6 +222,29 @@ a {
   min-height: 0;
 }
 
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--accent);
+  background: var(--accent-wash);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 560;
+}
+
+.studio-page .update-reload-button {
+  min-height: 28px;
+  padding: 4px 10px;
+  color: var(--action-text);
+  background: var(--action);
+  font-size: 12px;
+}
+
+.studio-page .update-reload-button:hover { background: var(--action-hover); }
+
 .studio-toolbar {
   justify-content: space-between;
   gap: 12px;
