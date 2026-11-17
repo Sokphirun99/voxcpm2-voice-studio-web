@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {
   MAX_REFERENCE_AUDIO_BYTES,
   computePeaksFromSamples,
+  formatByteSize,
+  formatElapsedTime,
+  formatGenerationMetrics,
   formatTime,
   hasValidAudioMagicBytes,
   readPlaybackDuration,
@@ -55,4 +58,22 @@ test('readPlaybackSeconds and readPlaybackDuration guard null currentTarget and 
   assert.equal(readPlaybackDuration({ currentTarget: null }), 0);
   assert.equal(readPlaybackDuration({ currentTarget: { duration: Number.POSITIVE_INFINITY } }), 0);
   assert.equal(readPlaybackDuration({ currentTarget: { duration: 4.2 } }), 4.2);
+});
+
+test('formatByteSize, formatElapsedTime, and formatGenerationMetrics format synthesis metrics concisely', () => {
+  assert.equal(formatByteSize(-1), '0 B');
+  assert.equal(formatByteSize(512), '512 B');
+  assert.equal(formatByteSize(404480), '395 KB');
+  assert.equal(formatByteSize(5.2 * 1024 * 1024), '5.2 MB');
+  assert.equal(formatByteSize(2.5 * 1024 * 1024 * 1024), '2.5 GB');
+
+  assert.equal(formatElapsedTime(-10), '');
+  assert.equal(formatElapsedTime(18), '18ms');
+  assert.equal(formatElapsedTime(2840), '2.8s');
+
+  assert.equal(
+    formatGenerationMetrics({ elapsedMs: 2800, sizeBytes: 404480, audioDurationSeconds: 4.2 }),
+    '2.8s (1.5×) · 395 KB'
+  );
+  assert.equal(formatGenerationMetrics({ elapsedMs: 12, sizeBytes: 102400, audioDurationSeconds: 2.0 }), '12ms · 100 KB');
 });

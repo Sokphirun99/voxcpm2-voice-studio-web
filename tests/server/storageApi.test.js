@@ -307,3 +307,23 @@ test('storage API skips noisy INFO logs on 200 /api/v1/health while keeping real
     assert.equal(events.filter(e => e.level === 'error').length, 1);
   }, { maxRequests: 2 }, { logger: captureLogger });
 });
+
+test('storage API reports accurate /api/v1/stats capacity and container memory usage', async () => {
+  const wavBytes = createValidWavBytes([10, -10, 20, -20]);
+  await withStorageHandler(async ({ handler }) => {
+    const f = new FormData();
+    f.set('metadata', JSON.stringify({ characterId: 'char-nisa', seed: 123 }));
+    f.set('audio', new File([wavBytes], 'cached.wav', { type: 'audio/wav' }));
+    assert.equal((await invokeApp(handler, { method: 'PUT', urlPath: `/api/v1/cache/${'d'.repeat(64)}`, body: f })).status, 200);
+
+    const statsRes = await invokeApp(handler, { urlPath: '/api/v1/stats' });
+    assert.equal(statsRes.status, 200);
+    const { storage, container } = statsRes.json().data;
+    assert.equal(storage.cacheEntriesCount, 1);
+    assert.equal(storage.maxCacheEntries, 5);
+    assert.equal(storage.cacheBytes, wavBytes.byteLength);
+    assert.equal(storage.usedBytes, wavBytes.byteLength);
+    assert.equal(typeof container.rssBytes, 'number');
+    assert.ok(container.rssBytes > 0);
+  }, { maxRequests: 50 }, { maxCacheEntries: 5 });
+});

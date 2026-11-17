@@ -66,10 +66,22 @@ export function createHttpVoiceRepository({ baseUrl = '/api/v1', fetchImpl = glo
     await requestStorageJson({ fetchImpl, url, options: { method: 'DELETE' } });
   }
 
+  async function fetchStats() {
+    const url = buildStorageApiUrl(baseUrl, '/stats');
+    try {
+      const { data } = await requestStorageJson({ fetchImpl, url, unavailableOn404: true });
+      return data || null;
+    } catch (error) {
+      if (!(error instanceof StorageUnavailableError)) logger?.debug?.('httpVoiceRepository.fetchStats', error?.message);
+      return null;
+    }
+  }
+
   return {
     loadRemoteEntries,
     upsertRemoteEntry,
     deleteRemoteEntry,
+    fetchStats,
     async syncWithLocal(localEntries) {
       try {
         const remoteEntries = await loadRemoteEntries();

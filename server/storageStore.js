@@ -3,7 +3,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, statfs, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   ALLOWED_AUDIO_MIME_TYPES,
@@ -457,6 +457,58 @@ async function readCacheAudioRecord(ctx, rawKey) {
   }
 }
 
+function sumActiveSizeBytes(records) {
+  return records.reduce((total, row) => total + (Number.isFinite(row?.sizeBytes) ? row.sizeBytes : 0), 0);
+}
+
+/**
+ * Reads filesystem capacity metrics for `rootDir`, returning nulls if uninitialized.
+ * @param {string} rootDir - Storage data directory.
+ * @returns {Promise<{ volumeFreeBytes: number|null, volumeTotalBytes: number|null }>} Filesystem byte metrics.
+ */
+async function readVolumeCapacity(rootDir) {
+  if (typeof statfs !== 'function') return { volumeFreeBytes: null, volumeTotalBytes: null };
+  try {
+    const info = await statfs(rootDir);
+    const bsize = Number(info.bsize) || 0;
+    return {
+      volumeFreeBytes: bsize * Number(info.bavail || 0),
+      volumeTotalBytes: bsize * Number(info.blocks || 0),
+    };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { volumeFreeBytes: null, volumeTotalBytes: null };
+    throw new StorageError('Could not inspect storage filesystem capacity.', error);
+  }
+}
+
+/**
+ * Computes active catalog, anchor/cache disk consumption, and filesystem headroom.
+ * @param {object} ctx - Store internals.
+ * @returns {Promise<object>} Storage usage statistics.
+ */
+async function readStoreStats(ctx) {
+  const [catalog, cacheIndex, capacity] = await Promise.all([
+    loadCatalog(ctx.catalogPath),
+    loadCacheIndex(ctx.cacheIndexPath),
+    readVolumeCapacity(ctx.rootDir),
+  ]);
+  const characters = Object.values(catalog.characters || {}).filter(item => item && !item.deleted_at);
+  const anchors = Object.values(catalog.anchors || {}).filter(item => item && !item.deleted_at);
+  const cacheItems = Object.values(cacheIndex.entries || {});
+  const anchorBytes = sumActiveSizeBytes(anchors);
+  const cacheBytes = sumActiveSizeBytes(cacheItems);
+  return {
+    charactersCount: characters.length,
+    anchorsCount: anchors.length,
+    anchorBytes,
+    cacheEntriesCount: cacheItems.length,
+    maxCacheEntries: ctx.maxCacheEntries,
+    cacheBytes,
+    usedBytes: anchorBytes + cacheBytes,
+    ...capacity,
+  };
+}
+
 /**
  * Creates a disk-backed persistent store for Voice Studio characters and original WAV voice anchors.
  * Inputs: `{ dataDir, maxCacheEntries }`.
@@ -501,5 +553,6 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     getCacheEntry: async rawKey => (await readCacheAudioRecord(ctx, rawKey))?.meta || null,
     getCacheAudio: rawKey => readCacheAudioRecord(ctx, rawKey),
     putCacheEntry: input => saveCacheRecord(ctx, input),
+    getStats: () => readStoreStats(ctx),
   };
 }

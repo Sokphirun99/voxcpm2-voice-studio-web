@@ -737,3 +737,20 @@ test('EngineAlertBanner SSR renders top offline alert only when engine is down',
     assert.ok(offlineHtml.includes('id="dismiss-engine-alert"'));
   });
 });
+
+test('formatLibraryStatus formats concise storage capacity summary alongside character count', async () => {
+  await withViteSsr(async vite => {
+    const { formatLibraryStatus } = await vite.ssrLoadModule('/src/presentation/components/VoiceLibrary.jsx');
+    assert.equal(formatLibraryStatus(12, null, null), '12 characters');
+    const summary = formatLibraryStatus(12, null, {
+      storage: {
+        usedBytes: 4.8 * 1024 * 1024,
+        cacheEntriesCount: 12,
+        maxCacheEntries: 100,
+        volumeFreeBytes: 84.2 * 1024 * 1024 * 1024,
+      },
+      container: { rssBytes: 62 * 1024 * 1024 },
+    });
+    assert.equal(summary, '12 characters · Storage 4.8 MB · 12/100 cached · 84.2 GB free · 62.0 MB RAM');
+  });
+});

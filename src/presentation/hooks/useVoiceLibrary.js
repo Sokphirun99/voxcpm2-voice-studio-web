@@ -2,7 +2,7 @@
  * @fileoverview Presentation hook managing Voice Library filtering and persistence via injected use cases.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { BUILT_IN_VOICES, filterLibraryVoices } from '../../domain/voiceLibrary.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
@@ -48,6 +48,14 @@ export function useVoiceLibrary() {
   const { voiceLibrary, logger } = useStudioServices();
   const [stored, setStored] = useState(() => voiceLibrary.loadSaved());
   const [filters, setFilters] = useState({ search: '', source: '', category: '' });
+  const [storageStats, setStorageStats] = useState(null);
+
+  const refreshStats = useCallback(() => {
+    if (typeof voiceLibrary.loadStorageStats !== 'function') return;
+    void voiceLibrary.loadStorageStats()
+      .then(stats => { if (stats) setStorageStats(stats); })
+      .catch(error => logger?.debug?.('useVoiceLibrary.refreshStats', error?.message || 'Stats skipped'));
+  }, [voiceLibrary, logger]);
 
   useEffect(() => {
     if (typeof voiceLibrary.syncSavedFromRemote !== 'function') return undefined;
@@ -65,5 +73,5 @@ export function useVoiceLibrary() {
   const matches = useMemo(() => filterLibraryVoices(allVoices, filters), [allVoices, filters]);
   const actions = useMemo(() => createVoiceLibraryActions(voiceLibrary, setStored), [voiceLibrary]);
   const updateFilter = (name, value) => setFilters(previous => ({ ...previous, [name]: value }));
-  return { allVoices, matches, warning: stored.warning, filters, updateFilter, ...actions };
+  return { allVoices, matches, warning: stored.warning, storageStats, refreshStats, filters, updateFilter, ...actions };
 }

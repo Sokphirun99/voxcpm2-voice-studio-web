@@ -8,7 +8,7 @@ import { assertPort } from './ports.js';
 import { validateGenerationInput } from './presets.js';
 import { segmentSingleSpeakerScript } from './scriptSegmentation.js';
 import { createSavedVoiceEntry } from './voiceLibrary.js';
-import { concatenateWavBlobs, trySmoothWavBlob } from './wavCodec.js';
+import { concatenateWavBlobs, tryReadWavDurationSeconds, trySmoothWavBlob } from './wavCodec.js';
 
 const SINGLE_VOICE_PAUSE_MS = 160;
 const EXPIRED_REF_PATTERN = /expired on the server/i;
@@ -191,6 +191,32 @@ async function applySynthesisMastering({ blob, anchorBlob, masterAudio, audioMas
   return { blob: await trySmoothWavBlob(blob), anchorBlob: cleanAnchor, mastered: false };
 }
 
+async function readRecordingDurationSeconds(blob) {
+  if (!blob || typeof blob.arrayBuffer !== 'function') return 0;
+  return tryReadWavDurationSeconds(await blob.arrayBuffer());
+}
+
+/**
+ * Attaches generation timing, payload byte size, and PCM duration metrics to a synthesis result.
+ * @param {object} result - Raw synthesis output `{ recording, uploadedFileData }`.
+ * @param {number} startedAt - Synthesis start timestamp in ms.
+ * @returns {Promise<object>} Enriched synthesis output.
+ */
+async function attachRecordingMetrics(result, startedAt) {
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const blob = result.recording?.blob;
+  const duration = await readRecordingDurationSeconds(blob);
+  return {
+    ...result,
+    recording: {
+      ...result.recording,
+      elapsedMs,
+      sizeBytes: Number.isFinite(blob?.size) ? blob.size : 0,
+      audioDurationSeconds: duration > 0 ? duration : null,
+    },
+  };
+}
+
 /**
  * Executes single-character synthesis validation, cache lookup, chunking, mastering, and voice anchoring.
  * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, seedGenerator?: () => number }} deps - Use-case ports.
@@ -203,18 +229,19 @@ async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synth
     { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed },
     seedGenerator
   );
+  const startedAt = Date.now();
   const chunks = segmentSingleSpeakerScript(payload.text);
   const cacheSpec = { ...payload, characterId: character.id, anchor, denoiseReference: Boolean(denoiseReference), masterAudio: Boolean(masterAudio) };
   const { cacheKey, hit } = await tryLookupSynthesisCache({ synthesisCache, cacheSpec, signal });
-  if (hit) return buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio });
+  if (hit) return attachRecordingMetrics(buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio }), startedAt);
   const { fileData: initialRef, wasCached } = await resolveInitialReference({ speechGateway, anchor, cachedUpload, signal, onReferenceUploaded });
   const combined = await runChunkedSynthesis({ speechGateway, payload: { ...payload, characterId: character.id }, chunks, anchor, initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onReferenceUploaded });
   const polished = await applySynthesisMastering({ blob: combined.blob, anchorBlob: combined.anchorBlob, masterAudio: Boolean(masterAudio), audioMaster, signal });
   if (synthesisCache && cacheKey) await synthesisCache.putCachedAudio(cacheKey, polished.blob, { characterId: character.id, seed: combined.seed });
-  return {
+  return attachRecordingMetrics({
     recording: { id: `take-${Date.now()}-${combined.seed ?? 'rand'}`, characterId: character.id, characterName: character.name, transcript: payload.text, ...combined, ...polished, fromCache: false },
     uploadedFileData: combined.uploadedFileData,
-  };
+  }, startedAt);
 }
 
 /**
@@ -318,6 +345,7 @@ export function createVoiceLibraryUseCases({ voiceRepository, remoteRepository =
     syncSavedFromRemote: () => syncCustomCharactersFromRemote(voiceRepository, remoteRepository),
     persistCustomRemote: entry => (remoteRepository ? remoteRepository.upsertRemoteEntry(entry) : Promise.resolve(entry)),
     deleteCustomRemote: id => (remoteRepository ? remoteRepository.deleteRemoteEntry(id) : Promise.resolve()),
+    loadStorageStats: () => (typeof remoteRepository?.fetchStats === 'function' ? remoteRepository.fetchStats() : Promise.resolve(null)),
   };
 }
 

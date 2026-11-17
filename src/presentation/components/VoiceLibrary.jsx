@@ -3,6 +3,7 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
+import { formatByteSize } from '../../domain/audioValidation.js';
 import { MAX_DESCRIPTION_LENGTH } from '../../domain/presets.js';
 import { MAX_VOICE_NAME_LENGTH } from '../../domain/voiceLibrary.js';
 import { Icon } from './Icon.jsx';
@@ -246,15 +247,37 @@ function LibraryFilters({ filters, onFilterChange }) {
   );
 }
 
+function formatStorageSummary(storageStats) {
+  const st = storageStats?.storage;
+  if (!st) return '';
+  const parts = [`Storage ${formatByteSize(st.usedBytes || 0)}`];
+  if (Number.isFinite(st.cacheEntriesCount) && Number.isFinite(st.maxCacheEntries)) {
+    parts.push(`${st.cacheEntriesCount}/${st.maxCacheEntries} cached`);
+  }
+  if (Number.isFinite(st.volumeFreeBytes) && st.volumeFreeBytes > 0) {
+    parts.push(`${formatByteSize(st.volumeFreeBytes)} free`);
+  }
+  if (Number.isFinite(storageStats?.container?.rssBytes) && storageStats.container.rssBytes > 0) {
+    parts.push(`${formatByteSize(storageStats.container.rssBytes)} RAM`);
+  }
+  return parts.join(' · ');
+}
+
 /**
- * Computes human-readable library count text with optional storage warning.
+ * Computes human-readable library count text with optional warning and Docker storage stats.
  * @param {number} count - Matching character count.
  * @param {string|null} warning - Storage warning text.
+ * @param {object|null} [storageStats] - Optional backend storage capacity payload.
  * @returns {string} Status string.
  */
-function formatLibraryStatus(count, warning) {
+export function formatLibraryStatus(count, warning, storageStats = null) {
   const countText = count ? `${count.toLocaleString()} ${count === 1 ? 'character' : 'characters'}` : 'No characters match these filters.';
-  return warning ? `${warning} · ${countText}` : countText;
+  const parts = [];
+  if (warning) parts.push(warning);
+  parts.push(countText);
+  const storageSummary = formatStorageSummary(storageStats);
+  if (storageSummary) parts.push(storageSummary);
+  return parts.join(' · ');
 }
 
 /**
@@ -317,8 +340,9 @@ export function VoiceLibrary({ open, openSaveForm, busy, library, anchors, onSel
   const dialog = useRef(null);
   const scroller = useRef(null);
   const [showSaveForm, setShowSaveForm] = useState(false);
-  const { matches, warning, filters, updateFilter } = library;
+  const { matches, warning, storageStats, refreshStats, filters, updateFilter } = library;
   useLibraryDialogSync(dialog, open, openSaveForm, setShowSaveForm);
+  useEffect(() => { if (open) refreshStats?.(); }, [open, refreshStats]);
   const handleSaveCharacter = input => onCreateCharacter(input).then(() => setShowSaveForm(false));
   return (
     <dialog className="voice-library" id="voice-library" aria-labelledby="library-title"
@@ -326,7 +350,7 @@ export function VoiceLibrary({ open, openSaveForm, busy, library, anchors, onSel
       <LibraryHeader showSaveForm={showSaveForm} onOpenSave={() => setShowSaveForm(true)} onCloseClick={() => dialog.current?.close()} />
       {showSaveForm && <SaveVoiceForm onSave={handleSaveCharacter} onCancel={() => setShowSaveForm(false)} />}
       <LibraryFilters filters={filters} onFilterChange={event => applyLibraryFilterChange(event, updateFilter, scroller)} />
-      <p className="library-count" id="library-status" role="status">{formatLibraryStatus(matches.length, warning)}</p>
+      <p className="library-count" id="library-status" role="status">{formatLibraryStatus(matches.length, warning, storageStats)}</p>
       <LibraryResultsList scroller={scroller} matches={matches} anchors={anchors} busy={busy}
         onSelectVoice={onSelectVoice} onDeleteCharacter={onDeleteCharacter} onUnpinAnchor={onUnpinAnchor} />
     </dialog>

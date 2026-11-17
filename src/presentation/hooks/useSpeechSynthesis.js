@@ -3,8 +3,11 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { formatGenerationMetrics } from '../../domain/audioValidation.js';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
 import { useStudioServices } from '../StudioContext.jsx';
+
+const LIVE_TIMER_TICK_MS = 100;
 
 /**
  * Translates synthesis or validation exceptions into status messages and field focus callbacks.
@@ -43,12 +46,20 @@ function formatProgressMessage({ completed, total }) {
  */
 function formatSuccessStatus(character, recording) {
   const identity = character ? `${character.name} (${character.id})` : 'Voice';
+  const metrics = formatGenerationMetrics(recording);
   const parts = ['Audio ready'];
   if (recording?.fromCache) parts.push('cached');
   else if (recording?.mastered) parts.push('-16 LUFS mastered');
+  if (metrics) parts.push(metrics);
   parts.push(identity);
   if (recording?.seed != null) parts.push(`Seed ${recording.seed}`);
   return parts.join(' · ');
+}
+
+function formatCompletedStatus({ customMessage, character, recording }) {
+  if (!customMessage) return formatSuccessStatus(character, recording);
+  const metrics = formatGenerationMetrics(recording);
+  return metrics ? `${customMessage} · ${metrics}` : customMessage;
 }
 
 /**
@@ -56,35 +67,47 @@ function formatSuccessStatus(character, recording) {
  * @param {object} spec - Execution callbacks and services.
  * @returns {Promise<void>} Completion promise.
  */
-async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, setStatus, setRecording, setLastSeed }) {
+async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, setRecording, setLastSeed }) {
   const result = await synthesizeSpeech.execute({
     ...request,
     signal,
-    onProgress: info => setStatus({ message: formatProgressMessage(info), error: false }),
+    onProgress: info => updateProgress(formatProgressMessage(info)),
     onReferenceUploaded: fileData => onReferenceUploaded?.(request.character.id, fileData),
   });
   setRecording(result.recording);
   if (result.recording.seed != null) setLastSeed(result.recording.seed);
   const customMessage = await onCompleted?.(result);
-  setStatus({ message: customMessage || formatSuccessStatus(request.character, result.recording), error: false });
+  setStatus({ message: formatCompletedStatus({ customMessage, character: request.character, recording: result.recording }), error: false });
 }
 
 /**
- * Manages AbortController, busy state, and failure translation around one synthesis run.
+ * Manages AbortController, busy state, live timer, and failure translation around one synthesis run.
  * @param {object} spec - Lifecycle state setters and runner.
  * @returns {Promise<void>} Completion promise.
  */
 async function runSynthesisLifecycle({ abortController, request, setBusy, setActiveCharacterId, setStatus, onFailure, onValidationFieldError, run }) {
   const controller = new AbortController();
   abortController.current = controller;
+  const startedAt = Date.now();
+  let baseMessage = 'Preparing speech generation…';
+  const syncTimerStatus = () => {
+    const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+    setStatus({ message: `${baseMessage} (${secs}s)`, error: false });
+  };
+  const updateProgress = nextMsg => {
+    baseMessage = nextMsg;
+    syncTimerStatus();
+  };
   setBusy(true);
   setActiveCharacterId(request?.character?.id || null);
-  setStatus({ message: 'Preparing speech generation…', error: false });
+  setStatus({ message: baseMessage, error: false });
+  const timer = globalThis.setInterval(syncTimerStatus, LIVE_TIMER_TICK_MS);
   try {
-    await run(controller.signal);
+    await run(controller.signal, updateProgress);
   } catch (error) {
     handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError });
   } finally {
+    globalThis.clearInterval(timer);
     if (abortController.current === controller) abortController.current = null;
     setActiveCharacterId(null);
     setBusy(false);
@@ -118,10 +141,10 @@ function startSynthesisGeneration(ctx) {
     abortController: ctx.abortController, request: ctx.request, setBusy: ctx.setBusy,
     setActiveCharacterId: ctx.setActiveCharacterId, setStatus: ctx.setStatus,
     onFailure: ctx.onFailure, onValidationFieldError: ctx.onValidationFieldError,
-    run: signal => executeSynthesisRequest({
+    run: (signal, updateProgress) => executeSynthesisRequest({
       synthesizeSpeech: ctx.synthesizeSpeech, request: ctx.request, signal,
       onReferenceUploaded: ctx.onReferenceUploaded, onCompleted: ctx.onCompleted,
-      setStatus: ctx.setStatus, setRecording: ctx.setRecording, setLastSeed: ctx.setLastSeed,
+      updateProgress, setStatus: ctx.setStatus, setRecording: ctx.setRecording, setLastSeed: ctx.setLastSeed,
     }),
   });
 }

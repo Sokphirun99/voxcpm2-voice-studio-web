@@ -389,6 +389,8 @@ test('synthesizeSpeech integrates audioMaster and synthesisCache cleanly without
   assert.equal(first.recording.fromCache, false);
   assert.equal(first.recording.mastered, true);
   assert.equal(first.recording.blob, masteredBlob);
+  assert.equal(first.recording.sizeBytes, masteredBlob.size);
+  assert.equal(Number.isFinite(first.recording.elapsedMs) && first.recording.elapsedMs >= 0, true);
 
   // Exact same inputs must hit cache without hitting gateway or audioMaster again
   const second = await useCase.execute({ script: 'សួស្តី', character: CHAR_NISA, guidance: 2, steps: 10, seed: '42', masterAudio: true });
@@ -396,6 +398,8 @@ test('synthesizeSpeech integrates audioMaster and synthesisCache cleanly without
   assert.equal(masterCalls, 1);
   assert.equal(second.recording.fromCache, true);
   assert.equal(second.recording.blob, masteredBlob);
+  assert.equal(second.recording.sizeBytes, masteredBlob.size);
+  assert.equal(Number.isFinite(second.recording.elapsedMs) && second.recording.elapsedMs >= 0, true);
 
   // Disabling masterAudio creates distinct cache entry and skips audioMaster
   const unmastered = await useCase.execute({ script: 'សួស្តី', character: CHAR_NISA, guidance: 2, steps: 10, seed: '42', masterAudio: false });

@@ -268,3 +268,22 @@ test('createHttpSynthesisCache computes unique keys and handles cache hits, miss
     assert.equal(pureSha256Hex(bytes), expected);
   }
 });
+
+test('createHttpVoiceRepository fetchStats retrieves /api/v1/stats and degrades to null when offline', async () => {
+  const statsPayload = { storage: { usedBytes: 1024, cacheEntriesCount: 2, maxCacheEntries: 100 }, container: { rssBytes: 64 * 1024 * 1024 } };
+  const onlineRepo = createHttpVoiceRepository({
+    fetchImpl: async url => {
+      assert.equal(url, '/api/v1/stats');
+      return new Response(JSON.stringify({ data: statsPayload, error: null, meta: {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+  assert.deepEqual(await onlineRepo.fetchStats(), statsPayload);
+
+  const offlineRepo = createHttpVoiceRepository({
+    fetchImpl: async () => new Response('down', { status: 503 }),
+    logger: { debug() {} },
+  });
+  assert.equal(await offlineRepo.fetchStats(), null);
+});

@@ -336,6 +336,12 @@ async function routeApiRequest(ctx) {
     sendJson({ res, status: 200, payload: { data: { status: 'ok', service: 'voice-studio-storage', ffmpegAvailable } }, requestId });
     return;
   }
+  if (url.pathname === `${API_PREFIX}/stats` && req.method === 'GET') {
+    const storage = await store.getStats();
+    const { rss } = process.memoryUsage();
+    sendJson({ res, status: 200, payload: { data: { storage, container: { rssBytes: rss, uptimeSeconds: Math.round(process.uptime()) } } }, requestId });
+    return;
+  }
   const handled = (await handleCharacterRoutes(ctx))
     || (await handleAnchorRoutes(ctx))
     || (await handleAudioMasterRoute(ctx))

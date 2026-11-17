@@ -40,6 +40,55 @@ export function formatTime(seconds) {
 }
 
 /**
+ * Formats a byte size into compact `B`, `KB`, `MB`, or `GB` notation.
+ * Inputs: non-negative byte count.
+ * Outputs: formatted byte-size string.
+ * Side effects: none.
+ * Failure modes: returns `'0 B'` for invalid or negative values.
+ * @param {number} bytes - Byte count.
+ * @returns {string} Human-readable size label.
+ */
+export function formatByteSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+/**
+ * Formats an elapsed millisecond duration into compact `ms` or `s` text.
+ * @param {number} elapsedMs - Elapsed duration in milliseconds.
+ * @returns {string} Formatted duration or empty string when invalid.
+ */
+export function formatElapsedTime(elapsedMs) {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return '';
+  if (elapsedMs < 1000) return `${Math.round(elapsedMs)}ms`;
+  return `${(elapsedMs / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Formats synthesis latency, real-time speed factor, and WAV file size into a single summary strip.
+ * Inputs: `{ elapsedMs, sizeBytes, audioDurationSeconds }`.
+ * Outputs: compact summary string separated by ` · `.
+ * Side effects: none.
+ * Failure modes: omits missing or non-finite metrics cleanly.
+ * @param {{ elapsedMs?: number, sizeBytes?: number, audioDurationSeconds?: number|null }} [metrics] - Recording metrics.
+ * @returns {string} Concise metric summary.
+ */
+export function formatGenerationMetrics({ elapsedMs, sizeBytes, audioDurationSeconds } = {}) {
+  const parts = [];
+  const elapsedLabel = formatElapsedTime(elapsedMs);
+  if (elapsedLabel) {
+    const canComputeSpeed = Number.isFinite(audioDurationSeconds) && audioDurationSeconds > 0 && elapsedMs >= 250;
+    const speedLabel = canComputeSpeed ? ` (${(audioDurationSeconds / (elapsedMs / 1000)).toFixed(1)}×)` : '';
+    parts.push(`${elapsedLabel}${speedLabel}`);
+  }
+  if (Number.isFinite(sizeBytes) && sizeBytes > 0) parts.push(formatByteSize(sizeBytes));
+  return parts.join(' · ');
+}
+
+/**
  * Computes normalized square-root peak amplitudes from PCM samples.
  * Inputs: numeric sample sequence and optional maximum bucket count.
  * Outputs: normalized peak values in [0, 1].

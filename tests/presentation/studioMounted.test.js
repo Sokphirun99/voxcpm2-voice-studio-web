@@ -429,6 +429,7 @@ test('mounted Studio auto-locks Take 1 voice for Take 2, ignores duplicate submi
     });
     assert.equal(anchorMap.has(CHAR_NISA.id), true);
     assert.match(container.querySelector('#active-character-card').textContent, /Voice locked/);
+    assert.match(container.querySelector('#generation-status').textContent, /\d+(?:ms|s) · \d+ B/);
 
     // Take 2 automatically uploads Take 1 anchor and clears control instruction
     await act(async () => {
@@ -442,6 +443,7 @@ test('mounted Studio auto-locks Take 1 voice for Take 2, ignores duplicate submi
     assert.equal(synthCalls.length, 2);
     assert.equal(synthCalls[1].instruction, '');
     assert.equal(synthCalls[1].referenceFile.path, '/tmp/nisa-take1.wav');
+    assert.match(container.querySelector('#generation-status').textContent, /Audio ready · \d+(?:ms|s) · \d+ B/);
 
     // Reset voice unpins anchor and reverts card to Locks on 1st take
     await act(async () => {
