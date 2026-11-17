@@ -4,8 +4,8 @@
   "description": "Khmer and multilingual character Text-to-Speech Voice Studio",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#22252d",
-  "theme_color": "#272b35",
+  "background_color": "#161616",
+  "theme_color": "#0a0a0a",
   "icons": [
     {
       "src": "/app-icon.svg",

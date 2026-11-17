@@ -1,57 +1,58 @@
 :root {
   color-scheme: light dark;
-  --window: #f6f6f8;
-  --sidebar: #eceef2;
-  --toolbar: #f1f2f5;
-  --editor: #fbfbfc;
-  --inspector: #f5f5f7;
+  --window: #f8f7f7;
+  --sidebar: #f1eeee;
+  --toolbar: #f8f7f7;
+  --editor: #fdfcfc;
+  --inspector: #f4f2f2;
   --control: #ffffff;
-  --control-hover: #e6e9ef;
-  --line: #d6d9e0;
-  --text: #1e2330;
-  --muted: #525a6a;
-  --quiet: #626b7e;
-  --accent: #075fc2;
-  --accent-wash: #dce9fc;
-  --action: #0860ca;
-  --action-hover: #064ea8;
-  --action-text: #ffffff;
-  --action-disabled: #e0e8f6;
-  --action-disabled-text: #5a6f8c;
-  --online: #247148;
-  --offline: #aa4e19;
-  --error: #a92d27;
-  --wave-neutral: #8d9ab1;
-  --scrim: #1b25314a;
-  --modal-shadow: #191d3838;
+  --control-hover: #e8e5e5;
+  --line: #dedada;
+  --text: #1c1a1a;
+  --muted: #5c5959;
+  --quiet: #767272;
+  --accent: #445b78;
+  --accent-wash: #e8ecf1;
+  --action: #1c1a1a;
+  --action-hover: #322f2f;
+  --action-text: #fdfcfc;
+  --action-disabled: #eae7e7;
+  --action-disabled-text: #858080;
+  --online: #1e7346;
+  --offline: #b35c1e;
+  --error: #b8322c;
+  --wave-neutral: #a6a2a2;
+  --scrim: #1c1a1a4a;
+  --modal-shadow: #1c1a1a2e;
   --studio-font-family: system-ui, -apple-system, "Noto Sans Khmer Variable", sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --window: #22252d;
-    --sidebar: #272b35;
-    --toolbar: #252831;
-    --editor: #1b1e26;
-    --inspector: #22252d;
-    --control: #2c303a;
-    --control-hover: #363c4a;
-    --line: #393e4a;
-    --text: #f0f2f8;
-    --muted: #bcc3d3;
-    --quiet: #9fa8bc;
-    --accent: #97beff;
-    --accent-wash: #293e61;
-    --action: #2166d6;
-    --action-hover: #1e59bd;
-    --action-disabled: #303b51;
-    --action-disabled-text: #a4b5d3;
-    --online: #72da9e;
-    --offline: #f1ad76;
-    --error: #ffada6;
-    --wave-neutral: #637994;
-    --scrim: #080b129c;
-    --modal-shadow: #03050a88;
+    --window: #161616;
+    --sidebar: #0a0a0a;
+    --toolbar: #161616;
+    --editor: #161616;
+    --inspector: #131313;
+    --control: #242424;
+    --control-hover: #333333;
+    --line: #2a2a2a;
+    --text: #eeeeec;
+    --muted: #9a9898;
+    --quiet: #6d6d6d;
+    --accent: #a7bdd5;
+    --accent-wash: #22262c;
+    --action: #ededeb;
+    --action-hover: #ffffff;
+    --action-text: #141414;
+    --action-disabled: #262626;
+    --action-disabled-text: #6e6e6e;
+    --online: #7fd88f;
+    --offline: #f5a742;
+    --error: #e06c75;
+    --wave-neutral: #505050;
+    --scrim: #000000b3;
+    --modal-shadow: #00000099;
   }
 }
 
@@ -142,8 +143,9 @@ a {
   height: 29px;
   flex: 0 0 29px;
   border-radius: 8px;
-  color: var(--action-text);
-  background: linear-gradient(150deg, #347eeb, #215cca);
+  border: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  color: #f3f3f2;
+  background: linear-gradient(155deg, #2b2b2e, #121214);
 }
 
 .studio-icon {
@@ -192,7 +194,11 @@ a {
 
 .sidebar-item .studio-icon { color: var(--accent); }
 .studio-page .sidebar-item:hover { background: var(--control-hover); }
-.studio-page .sidebar-item[aria-current="page"] { color: var(--accent); background: var(--accent-wash); }
+.studio-page .sidebar-item[aria-current="page"] {
+  color: var(--text);
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+}
 
 .engine {
   gap: 7px;
