@@ -201,7 +201,15 @@ a {
 
 .studio-workspace {
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-panel {
+  display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
+  height: 100%;
   min-width: 0;
   min-height: 0;
 }
@@ -1210,6 +1218,15 @@ a {
   .studio-workspace {
     display: flex;
     flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .workspace-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
     height: 100%;
     min-height: 0;
     overflow: hidden;

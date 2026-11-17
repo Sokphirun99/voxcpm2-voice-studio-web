@@ -119,6 +119,23 @@ const ICON_PATHS = {
       <path d="M12 16V4M12 4L15.5 7.5M12 4L8.5 7.5" />
     </g>
   ),
+  // Iconoir: closed-captions-tag / film-captions
+  subtitles: (
+    <g {...STROKE_STYLE}>
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <path d="M7 11H11" />
+      <path d="M13 11H17" />
+      <path d="M7 15H14" />
+      <path d="M16.5 15H17" />
+    </g>
+  ),
+  // Iconoir: copy
+  copy: (
+    <g {...STROKE_STYLE}>
+      <rect x="8" y="8" width="12" height="12" rx="2" />
+      <path d="M16 8V6C16 4.89543 15.1046 4 14 4H6C4.89543 4 4 4.89543 4 6V14C4 15.1046 4.89543 16 6 16H8" />
+    </g>
+  ),
 };
 
 /**

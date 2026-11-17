@@ -1,216 +1,24 @@
 /**
- * @fileoverview Top-level Voice Studio coordinator connecting character voices, persistent 1-voice locks, and playback.
+ * @fileoverview Top-level Voice Studio shell coordinating independent function workspaces and shared services.
  */
 
-import React, { useMemo, useRef, useState } from 'react';
-import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
-import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
-import { useStudioServices } from '../StudioContext.jsx';
+import React, { useCallback, useRef, useState } from 'react';
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
-import { resolveEffectiveSeed, useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
-import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
-import { AudioPlayer } from './AudioPlayer.jsx';
 import { Icon } from './Icon.jsx';
-import { ScriptEditor } from './ScriptEditor.jsx';
-import { Sidebar } from './Sidebar.jsx';
-import { Toolbar } from './Toolbar.jsx';
-import { VoiceControls } from './VoiceControls.jsx';
+import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
+import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
 import { VoiceLibrary } from './VoiceLibrary.jsx';
 
-const INITIAL_OPTIONS = {
-  guidance: 2,
-  steps: DEFAULT_STEPS,
-  seed: '',
-  lockSeed: true,
-  autoFormatKhmer: true,
-  styleMode: STYLE_MODES.AUTO,
-  customStyle: '',
-  denoiseReference: false,
-  masterAudio: true,
-};
+export { buildVoiceActions, finalizeCharacterGeneration };
 
 /**
- * Detects Apple platforms using User-Agent Client Hints with a userAgent fallback.
- * @returns {boolean} True on macOS, iOS, or iPadOS browsers.
+ * Renders a non-destructive update banner when a newer build is ready while the workspace is busy.
+ * @param {{ visible: boolean, onReload: () => void }} props - Update banner props.
+ * @returns {React.ReactElement|null} Banner element or null.
  */
-function isApplePlatform() {
-  const uaPlatform = navigator.userAgentData?.platform;
-  if (typeof uaPlatform === 'string') return /mac|iphone|ipad|ipod/i.test(uaPlatform);
-  return /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent);
-}
-
-/**
- * Pins a character's first generated voice take into persistent storage with status reporting.
- * @param {object} params - Pin context.
- * @returns {Promise<string>} User-facing status message.
- */
-async function pinFirstTakeAnchor({ submittedCharacter, recording, actions, anchorApi, logger }) {
-  try {
-    await anchorApi.pinCharacterAnchor({
-      characterId: submittedCharacter.id,
-      label: submittedCharacter.name,
-      blob: recording.anchorBlob,
-      source: 'generated',
-      takeId: recording.id,
-      promptText: recording.anchorTranscript || '',
-    });
-    actions.rerolledIdsRef.current.delete(submittedCharacter.id);
-    return `Audio ready · Locked 1-person voice for ${submittedCharacter.name} (${submittedCharacter.id})`;
-  } catch (error) {
-    logger.error('Studio.finalizeCharacterGeneration', error, { characterId: submittedCharacter.id });
-    return `Audio ready · ${submittedCharacter.name} (${submittedCharacter.id}) generated, but could not persist lock`;
-  }
-}
-
-/**
- * Handles post-synthesis auto-pinning of a character's first generated voice clip with race guards.
- * Inputs: `{ result, submittedCharacter, submittedRevision, characterExists, actions, anchorApi, logger }`.
- * Outputs: custom status string when Take 1 was auto-locked (or lock failed), or `null`.
- * Side effects: caches uploaded reference FileData and persists Take 1 anchor via `anchorApi`.
- * Failure modes: logs IndexedDB errors and returns a non-fatal warning status instead of throwing.
- * @param {object} ctx - Completion handler inputs.
- * @returns {Promise<string|null>} Custom status message or null.
- */
-export async function finalizeCharacterGeneration(ctx) {
-  const { result, submittedCharacter, submittedRevision, characterExists, actions, anchorApi } = ctx;
-  if (!characterExists(submittedCharacter.id)) return null;
-  const isSameRevision = anchorApi.getRevision(submittedCharacter.id) === submittedRevision;
-  if (result.uploadedFileData && isSameRevision) actions.setCachedUpload(submittedCharacter.id, result.uploadedFileData);
-  if (!isSameRevision || anchorApi.hasAnchor(submittedCharacter.id) || !result.recording?.anchorBlob) return null;
-  return pinFirstTakeAnchor({ ...ctx, recording: result.recording });
-}
-
-/**
- * Clears any saved locked seed for `characterId` when voice is reset or randomized.
- * @param {Function} [setLockedSeeds] - Optional locked-seed state setter.
- * @param {string} characterId - Target character ID.
- */
-function clearCharacterLockedSeed(setLockedSeeds, characterId) {
-  if (!setLockedSeeds || !characterId) return;
-  setLockedSeeds(prev => {
-    if (!(characterId in prev)) return prev;
-    const { [characterId]: _removed, ...rest } = prev;
-    return rest;
-  });
-}
-
-/**
- * Builds the validated submission request for the active character generation run.
- * @param {object} spec - Current script, character, anchor, actions, options, and locked seeds.
- * @returns {object} Synthesis request payload.
- */
-function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, actions, options, lockedSeeds = {} }) {
-  const lockedSeed = options.lockSeed !== false ? lockedSeeds[submittedCharacter.id] : null;
-  const seed = resolveEffectiveSeed({
-    rawSeed: options.seed,
-    character: submittedCharacter,
-    hasAnchor: Boolean(submittedAnchor),
-    rerolledIds: actions.rerolledIdsRef.current,
-    lockedSeed,
-  });
-  return {
-    script,
-    character: submittedCharacter,
-    anchor: submittedAnchor,
-    cachedUpload: actions.uploadedRefsRef.current[submittedCharacter.id] || null,
-    guidance: options.guidance,
-    steps: options.steps,
-    seed,
-    autoFormatKhmer: options.autoFormatKhmer !== false,
-    styleMode: options.styleMode || STYLE_MODES.AUTO,
-    customStyle: options.customStyle || '',
-    denoiseReference: options.denoiseReference,
-    masterAudio: options.masterAudio !== false,
-  };
-}
-
-/**
- * Builds the `VoiceControls` action callback bundle bound to the active character.
- * Inputs: `{ actions, activeCharacter, setLibraryModal, setOptions, setLockedSeeds }`.
- * Outputs: callback map passed to `<VoiceControls actions={...} />`.
- * Side effects: triggers character mutations, modal open state, seed clearing, and inference option updates.
- * Failure modes: async errors in sample upload, voice reset, and anchor updates are handled in `actions`.
- * @param {object} deps - Bound character action dependencies.
- * @returns {object} VoiceControls action callbacks.
- */
-export function buildVoiceActions({ actions, activeCharacter, setLibraryModal, setOptions, setLockedSeeds }) {
-  return {
-    onSelectCharacter: actions.handleSelectCharacter,
-    onOpenNewCharacter: () => setLibraryModal({ open: true, openForm: true }),
-    onUploadSample: file => { clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id); void actions.handleUploadSample(file); },
-    onResetVoice: () => { clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id); void actions.handleResetVoice(activeCharacter.id); },
-    onUpdateAnchor: patch => void actions.handleUpdateAnchor(activeCharacter.id, patch),
-    onChangeOption: (key, value) => {
-      if ((key === 'seed' && value === '') || (key === 'lockSeed' && value === false)) clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id);
-      setOptions(prev => ({ ...prev, [key]: value }));
-    },
-  };
-}
-
-/**
- * Submits the active character's script for synthesis, persists locked seeds, and wires Take-1 voice locking.
- * @param {Event} event - Form submit event.
- * @param {object} ctx - Studio submission context.
- */
-function submitCharacterSpeech(event, ctx) {
-  event.preventDefault();
-  if (!ctx.anchorApi.isLoaded) return;
-  const submittedCharacter = ctx.activeCharacter;
-  const submittedAnchor = ctx.anchorApi.anchors[submittedCharacter.id] || null;
-  const submittedRevision = ctx.anchorApi.getRevision(submittedCharacter.id);
-  const request = buildSubmissionRequest({ script: ctx.script, submittedCharacter, submittedAnchor, actions: ctx.actions, options: ctx.options, lockedSeeds: ctx.lockedSeeds });
-  void ctx.synthesis.runGeneration({
-    request,
-    onReferenceUploaded: ctx.actions.setCachedUpload,
-    onCompleted: result => {
-      if (ctx.options.lockSeed !== false && result.recording?.seed != null) {
-        ctx.setLockedSeeds?.(prev => ({ ...prev, [submittedCharacter.id]: result.recording.seed }));
-      }
-      return finalizeCharacterGeneration({
-        result, submittedCharacter, submittedRevision,
-        characterExists: id => ctx.charactersRef.current.some(item => item.id === id),
-        actions: ctx.actions, anchorApi: ctx.anchorApi, logger: ctx.logger,
-      });
-    },
-  });
-}
-
-/**
- * Submits the speech form on Cmd/Ctrl+Enter inside the script editor when generation is enabled.
- * @param {KeyboardEvent} event - Keydown event.
- * @param {boolean} generateDisabled - Whether generation is currently blocked.
- */
-function handleScriptShortcut(event, generateDisabled) {
-  if (event.key !== 'Enter' || (!event.metaKey && !event.ctrlKey) || generateDisabled) return;
-  event.preventDefault();
-  event.currentTarget.form?.requestSubmit();
-}
-
-/**
- * Renders the script editor and character voice inspector form.
- * @param {object} props - Form state, controller handles, and voice actions.
- * @returns {React.ReactElement} Speech form element.
- */
-function StudioSpeechForm({ state, ctrl, voiceActions }) {
-  return (
-    <form id="speech-form" className="studio-grid" onSubmit={event => submitCharacterSpeech(event, { ...state, ...ctrl })}>
-      <ScriptEditor scriptInput={state.scriptRef} script={state.script} count={ctrl.count} isOverLimit={ctrl.isOverLimit}
-        onReplaceScript={text => { state.setScript(text); state.scriptRef.current?.focus(); }}
-        onScriptChange={state.setScript} onScriptKey={event => handleScriptShortcut(event, ctrl.generateDisabled)} />
-      <section className="voice-inspector" aria-labelledby="voice-title">
-        <div className="pane-heading"><h2 id="voice-title">Voice</h2></div>
-        <VoiceControls characters={state.library.allVoices} anchors={state.anchorApi.anchors} activeCharacter={ctrl.activeCharacter}
-          activeAnchor={ctrl.activeAnchor} anchorWarning={state.anchorApi.anchorWarning} busy={ctrl.synthesis.busy}
-          options={state.options} lastSeed={ctrl.synthesis.lastSeed} lockedSeed={state.lockedSeeds[ctrl.activeCharacter.id] ?? null}
-          transcriptRef={state.transcriptRef} actions={voiceActions} />
-      </section>
-    </form>
-  );
-}
-
 export function UpdateBanner({ visible, onReload }) {
   if (!visible) return null;
   return (
@@ -248,129 +56,83 @@ export function EngineAlertBanner({ visible, reason, checking = false, onRetry, 
 }
 
 /**
- * Renders the main workspace pane containing toolbar, script/voice form, and playback dock.
- * @param {object} props - Workspace props.
- * @returns {React.ReactElement} Main workspace element.
+ * Renders top engine-offline and app-update notices shared across function workspaces.
+ * @param {{ engineMeta: object, refreshEngine: () => void, versionCheck: object }} props - Notice state.
+ * @returns {React.ReactElement} Workspace notices container.
  */
-function StudioWorkspace({ state, ctrl, voiceActions }) {
-  const { synthesis, activeCharacter, activeAnchor, actions, generateDisabled, versionCheck } = ctrl;
-  const { engineMeta, refreshEngine } = state;
+function WorkspaceNotices({ engineMeta, refreshEngine, versionCheck }) {
   return (
-    <main className="studio-workspace">
-      <div className="workspace-notices">
-        <EngineAlertBanner visible={engineMeta.showAlert} reason={engineMeta.reason} checking={engineMeta.checking}
-          onRetry={refreshEngine} onDismiss={engineMeta.dismissAlert} />
-        <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />
-      </div>
-      <Toolbar busy={synthesis.busy} generateDisabled={generateDisabled}
-        shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={synthesis.cancel} />
-      <StudioSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions} />
-      <AudioPlayer recording={synthesis.recording} activeCharacter={activeCharacter} activeAnchor={activeAnchor}
-        status={synthesis.status} onPinTake={() => void actions.handlePinCurrentTake()}
-        onPlaybackError={() => synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
-    </main>
-  );
-}
-
-/**
- * Renders the two-column studio layout pairing sidebar navigation with the workspace pane.
- * @param {object} props - Layout props.
- * @returns {React.ReactElement} Studio window container.
- */
-function StudioMain({ state, ctrl, voiceActions, onOpenLibrary }) {
-  return (
-    <div className="studio-window">
-      <Sidebar onFocusScript={() => state.scriptRef.current?.focus()} onOpenLibrary={onOpenLibrary} />
-      <StudioWorkspace state={state} ctrl={ctrl} voiceActions={voiceActions} />
+    <div className="workspace-notices">
+      <EngineAlertBanner visible={engineMeta.showAlert} reason={engineMeta.reason} checking={engineMeta.checking}
+        onRetry={refreshEngine} onDismiss={engineMeta.dismissAlert} />
+      <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />
     </div>
   );
 }
 
 /**
- * Focuses the input element matching a domain validation field error.
- * @param {object} state - Studio ref state.
- * @param {string} field - Failing validation field name.
+ * Handles selecting a workspace function and returning focus cleanly to TTS when appropriate.
+ * @param {string} id - Target workspace identifier.
+ * @param {Function} setActiveWorkspace - Workspace state setter.
+ * @param {{ current: object|null }} ttsRef - Active TTS workspace actions ref.
  */
-function focusValidationField(state, field) {
-  if (field === 'promptText') state.transcriptRef.current?.focus();
-  if (field === 'script') state.scriptRef.current?.focus();
+function selectWorkspace(id, setActiveWorkspace, ttsRef) {
+  setActiveWorkspace(id);
+  if (id === 'tts') ttsRef.current?.focusScript?.();
 }
 
 /**
- * Allocates refs, UI state, and persistence/engine hooks for the Studio workspace.
- * @returns {object} Studio state and service hook handles.
+ * Unpins a locked voice anchor and clears its locked TTS seed consistently.
+ * @param {string} id - Character ID to reset.
+ * @param {{ current: object|null }} ttsRef - TTS actions ref.
  */
-function useStudioState() {
-  const scriptRef = useRef(null);
-  const transcriptRef = useRef(null);
-  const [script, setScript] = useState('');
-  const [options, setOptions] = useState(INITIAL_OPTIONS);
-  const [lockedSeeds, setLockedSeeds] = useState({});
-  const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
-  const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
-  const [engine, refreshEngine, engineMeta] = useEngineStatus();
-  const library = useVoiceLibrary();
-  const anchorApi = useVoiceAnchors();
-  const charactersRef = useRef(library.allVoices);
-  charactersRef.current = library.allVoices;
-  return {
-    scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, selectedCharacterId,
-    setSelectedCharacterId, libraryModal, setLibraryModal, engine, refreshEngine, engineMeta, library, anchorApi, charactersRef,
-  };
+function resetSharedCharacterVoice(id, ttsRef) {
+  clearCharacterLockedSeed(ttsRef.current?.setLockedSeeds, id);
+  void ttsRef.current?.actions?.handleResetVoice(id);
 }
 
 /**
- * Connects synthesis and character mutation actions to `useStudioState`.
- * @param {object} state - Studio state returned by `useStudioState`.
- * @returns {object} Derived active character, synthesis state, and character action handlers.
- */
-function useStudioController(state) {
-  const { logger } = useStudioServices();
-  const synthesis = useSpeechSynthesis({
-    onFailure: state.refreshEngine,
-    onValidationFieldError: field => focusValidationField(state, field),
-  });
-  const activeCharacter = useMemo(() => findCharacterById(state.library.allVoices, state.selectedCharacterId), [state.library.allVoices, state.selectedCharacterId]);
-  const activeAnchor = state.anchorApi.anchors[activeCharacter.id] || null;
-  const actions = useCharacterActions({
-    activeCharacter, library: state.library, synthesis, anchorApi: state.anchorApi,
-    onCharacterSelected: state.setSelectedCharacterId,
-    onCloseLibrary: () => state.setLibraryModal({ open: false, openForm: false }),
-  });
-  const count = countGraphemes(state.script);
-  const isOverLimit = count > MAX_SCRIPT_LENGTH;
-  const generateDisabled = synthesis.busy || !state.anchorApi.isLoaded || !state.script.trim() || isOverLimit;
-  const versionCheck = useAppVersionCheck({
-    canAutoReload: !synthesis.busy && !state.script.trim() && !state.libraryModal.open,
-  });
-  return { logger, synthesis, activeCharacter, activeAnchor, actions, count, isOverLimit, generateDisabled, versionCheck };
-}
-
-/**
- * Coordinates studio workspace state across script editor, Narakeet-style character voices, library modal, and player.
- * Inputs: none (consumes injected services via presentation hooks).
- * Outputs: complete Voice Studio workspace tree.
- * Side effects: delegates network/storage/audio work to presentation hooks backed by domain use cases.
- * Failure modes: displays errors in the playback status bar without uncaught UI crashes.
- * @returns {React.ReactElement} Voice Studio root component.
+ * Coordinates the multi-function Voice Studio shell, shared Character Library, and active workspaces.
+ * Inputs: none (consumes Studio services via hooks).
+ * Outputs: complete Voice Studio application shell.
+ * Side effects: mounts function workspaces, engine status monitor, version checker, and library modal.
+ * Failure modes: per-workspace errors are surfaced cleanly within each function workspace.
+ * @returns {React.ReactElement} Studio application root.
  */
 export function Studio() {
-  const state = useStudioState();
-  const ctrl = useStudioController(state);
-  const voiceActions = buildVoiceActions({
-    actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
-    setLibraryModal: state.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
-  });
+  const ttsRef = useRef(null);
+  const [activeWorkspace, setActiveWorkspace] = useState('tts');
+  const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
+  const [ttsState, setTtsState] = useState({ busy: false, hasScript: false });
+  const handleTtsStateChange = useCallback(next => {
+    setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript ? prev : next));
+  }, []);
+  const [, refreshEngine, engineMeta] = useEngineStatus();
+  const library = useVoiceLibrary();
+  const anchorApi = useVoiceAnchors();
+  const canAutoReload = !libraryModal.open && !ttsState.busy && !ttsState.hasScript;
+  const versionCheck = useAppVersionCheck({ canAutoReload });
+  const notices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
+  const shared = { library, anchorApi, refreshEngine, setLibraryModal, onTtsStateChange: handleTtsStateChange };
+
   return (
     <>
-      <StudioMain state={state} ctrl={ctrl} voiceActions={voiceActions}
-        onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
-      <VoiceLibrary open={state.libraryModal.open} openSaveForm={state.libraryModal.openForm} busy={ctrl.synthesis.busy}
-        library={state.library} anchors={state.anchorApi.anchors}
-        onSelectVoice={ctrl.actions.handleSelectCharacter} onCreateCharacter={ctrl.actions.handleCreateCharacter}
-        onDeleteCharacter={id => void ctrl.actions.handleDeleteCharacter(id)}
-        onUnpinAnchor={id => { clearCharacterLockedSeed(state.setLockedSeeds, id); void ctrl.actions.handleResetVoice(id); }}
-        onClose={() => state.setLibraryModal({ open: false, openForm: false })} />
+      <div className="studio-window">
+        <Sidebar activeWorkspace={activeWorkspace} workspaces={DEFAULT_WORKSPACES}
+          onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
+          onOpenLibrary={() => setLibraryModal({ open: true, openForm: false })} />
+        <main className="studio-workspace">
+          <TextToSpeechWorkspace shared={shared} notices={notices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef} />
+        </main>
+      </div>
+      <VoiceLibrary open={libraryModal.open} openSaveForm={libraryModal.openForm}
+        busy={ttsState.busy}
+        library={library} anchors={anchorApi.anchors}
+        onSelectVoice={voice => void ttsRef.current?.actions?.handleSelectCharacter(voice)}
+        onCreateCharacter={input => ttsRef.current?.actions?.handleCreateCharacter(input)}
+        onDeleteCharacter={id => void ttsRef.current?.actions?.handleDeleteCharacter(id)}
+        onUnpinAnchor={id => resetSharedCharacterVoice(id, ttsRef)}
+        onClose={() => setLibraryModal({ open: false, openForm: false })} />
     </>
   );
 }
