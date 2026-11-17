@@ -1,0 +1,21 @@
+name: voxcpm-voice-studio
+
+services:
+  studio:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "127.0.0.1:${VOICE_STUDIO_PORT:-8087}:5173"
+    volumes:
+      - ./index.html:/app/index.html:ro
+      - ./vite.config.js:/app/vite.config.js:ro
+      - ./src:/app/src:ro
+    environment:
+      GRADIO_URL: ${GRADIO_URL:-http://host.docker.internal:8808}
+      VITE_USE_POLLING: ${VITE_USE_POLLING:-true}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

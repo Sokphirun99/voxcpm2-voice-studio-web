@@ -1,0 +1,14 @@
+name: voxcpm-voice-studio
+
+services:
+  studio:
+    build:
+      context: .
+      target: prod
+    ports:
+      - "127.0.0.1:${VOICE_STUDIO_PORT:-8087}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
