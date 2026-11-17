@@ -6,8 +6,11 @@ import {
   MAX_SCRIPT_LENGTH,
   MAX_STEPS,
   MIN_STEPS,
+  STYLE_MODES,
   buildCharacterInstruction,
   countGraphemes,
+  inferScriptStyleInstruction,
+  resolveStyleInstruction,
   stripParentheses,
   validateGenerationInput,
 } from '../../src/domain/presets.js';
@@ -121,4 +124,42 @@ test('validateGenerationInput supports Exact transcript match for uploaded sampl
   assert.equal(exact.usePromptText, true);
   assert.equal(exact.promptText, 'សួស្តីអ្នកទាំងអស់គ្នា');
   assert.equal(exact.instruction, '');
+});
+
+test('inferScriptStyleInstruction, resolveStyleInstruction, and autoFormatKhmer guide locked voices from writing format', () => {
+  assert.equal(inferScriptStyleInstruction('សួស្តីអ្នកទាំងអស់គ្នា'), '');
+  assert.match(inferScriptStyleInstruction('តើអ្នកសុខសប្បាយជាទេ?'), /inquisitive tone/i);
+  assert.match(inferScriptStyleInstruction('អបអរសាទរខ្លាំងណាស់!'), /energetic upbeat/i);
+  assert.match(inferScriptStyleInstruction('ចំណុចសំខាន់៖\n1. គុណភាព'), /structured presenter cadence/i);
+
+  assert.equal(resolveStyleInstruction({ styleMode: STYLE_MODES.NATURAL, script: 'សួស្តី!' }), '');
+  assert.match(resolveStyleInstruction({ styleMode: STYLE_MODES.FORMAL, script: 'សួស្តី' }), /news broadcast/i);
+  assert.equal(resolveStyleInstruction({ styleMode: STYLE_MODES.CUSTOM, customStyle: ' (Calm) radio host ' }), 'Calm radio host');
+
+  const lockedStyled = validateGenerationInput({
+    script: 'តម្លៃ $25 សម្រាប់ថ្ងៃនេះ!',
+    character: SAMPLE_CHARACTER,
+    guidance: 2,
+    steps: 10,
+    seed: '10',
+    hasLockedAudio: true,
+    exactClone: false,
+    autoFormatKhmer: true,
+    styleMode: STYLE_MODES.AUTO,
+  });
+  assert.equal(lockedStyled.text, 'តម្លៃ ម្ភៃប្រាំដុល្លារ សម្រាប់ថ្ងៃនេះ!');
+  assert.match(lockedStyled.instruction, /energetic upbeat/i);
+
+  const exactOverridesStyle = validateGenerationInput({
+    script: 'អបអរសាទរ!',
+    character: SAMPLE_CHARACTER,
+    guidance: 2,
+    steps: 10,
+    seed: '10',
+    hasLockedAudio: true,
+    exactClone: true,
+    promptText: 'សួស្តី',
+    styleMode: STYLE_MODES.FORMAL,
+  });
+  assert.equal(exactOverridesStyle.instruction, '');
 });

@@ -554,6 +554,7 @@ a {
 
 .studio-page select,
 .studio-page #seed,
+.studio-page #custom-style,
 .studio-page .library-filters input,
 .studio-page .library-save-form input,
 .studio-page .library-save-form textarea {
@@ -1019,6 +1020,21 @@ a {
 .advanced-checkbox {
   margin-top: 10px;
   color: var(--text);
+}
+
+.style-control-block {
+  margin-bottom: 12px;
+}
+
+.studio-page #custom-style {
+  margin-top: 6px;
+}
+
+.style-hint {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .library-name-row {

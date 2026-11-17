@@ -123,7 +123,26 @@ test('VoiceControls displays locked dropdown label, uploaded filename, anchor wa
     );
     assert.ok(generatedHtml.includes('id="exact-voice-match"'));
     assert.ok(generatedHtml.includes('id="master-audio"'));
+    assert.ok(generatedHtml.includes('id="auto-format-khmer"'));
+    assert.ok(generatedHtml.includes('id="lock-seed"'));
+    assert.ok(generatedHtml.includes('id="style-mode"'));
     assert.match(generatedHtml, /id="master-audio"[^>]*checked=""/);
+    assert.match(generatedHtml, /id="auto-format-khmer"[^>]*checked=""/);
+    assert.match(generatedHtml, /id="lock-seed"[^>]*checked=""/);
+
+    const customStyleHtml = renderToStaticMarkup(
+      React.createElement(VoiceControls, {
+        characters: BUILT_IN_VOICES,
+        anchors: {},
+        activeCharacter: CHAR_NISA,
+        activeAnchor: null,
+        anchorWarning: null, busy: false,
+        options: { guidance: 2, steps: 10, seed: '', styleMode: 'custom', customStyle: 'News host' },
+        lastSeed: null, transcriptRef: { current: null },
+        actions: { onSelectCharacter() {}, onOpenNewCharacter() {}, onUploadSample() {}, onResetVoice() {}, onUpdateAnchor() {}, onChangeOption() {} },
+      })
+    );
+    assert.ok(customStyleHtml.includes('id="custom-style"'));
 
     const { ScriptEditor } = await vite.ssrLoadModule('/src/presentation/components/ScriptEditor.jsx');
     const numericScriptHtml = renderToStaticMarkup(
@@ -305,6 +324,8 @@ test('resolveEffectiveSeed uses character defaultSeed only before locking or res
     const { resolveEffectiveSeed } = await vite.ssrLoadModule('/src/presentation/hooks/useCharacterActions.js');
     assert.equal(resolveEffectiveSeed({ rawSeed: '', character: CHAR_NISA, hasAnchor: false, rerolledIds: new Set() }), CHAR_NISA.defaultSeed);
     assert.equal(resolveEffectiveSeed({ rawSeed: '', character: CHAR_NISA, hasAnchor: true, rerolledIds: new Set() }), '');
+    assert.equal(resolveEffectiveSeed({ rawSeed: '', character: CHAR_NISA, hasAnchor: true, rerolledIds: new Set(), lockedSeed: 777 }), 777);
+    assert.equal(resolveEffectiveSeed({ rawSeed: '', character: CHAR_NISA, hasAnchor: true, rerolledIds: new Set([CHAR_NISA.id]), lockedSeed: 777 }), '');
     assert.equal(resolveEffectiveSeed({ rawSeed: '', character: CHAR_NISA, hasAnchor: false, rerolledIds: new Set([CHAR_NISA.id]) }), '');
     assert.equal(resolveEffectiveSeed({ rawSeed: '999', character: CHAR_NISA, hasAnchor: true, rerolledIds: new Set() }), '999');
   });

@@ -442,8 +442,21 @@ test('mounted Studio auto-locks Take 1 voice for Take 2, ignores duplicate submi
     assert.equal(uploadCalls.length, 1);
     assert.equal(synthCalls.length, 2);
     assert.equal(synthCalls[1].instruction, '');
+    assert.equal(synthCalls[1].seed, CHAR_NISA.defaultSeed);
     assert.equal(synthCalls[1].referenceFile.path, '/tmp/nisa-take1.wav');
     assert.match(container.querySelector('#generation-status').textContent, /Audio ready · \d+(?:ms|s) · \d+ B/);
+
+    // Take 3 automatically expands Khmer currency/time and infers writing-format style cue even when locked
+    await act(async () => {
+      setControlledText(scriptInput, 'តម្លៃ $25 ម៉ោង 10:30 អស្ចារ្យ!', 30);
+    });
+    await act(async () => {
+      speechForm.dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(synthCalls.length, 3);
+    assert.equal(synthCalls[2].text, 'តម្លៃ ម្ភៃប្រាំដុល្លារ ម៉ោង ដប់ម៉ោងសាមសិបនាទី អស្ចារ្យ!');
+    assert.match(synthCalls[2].instruction, /energetic upbeat/i);
 
     // Reset voice unpins anchor and reverts card to Locks on 1st take
     await act(async () => {

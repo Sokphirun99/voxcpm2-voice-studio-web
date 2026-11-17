@@ -3,7 +3,7 @@
  */
 
 import React, { useMemo, useRef, useState } from 'react';
-import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, countGraphemes } from '../../domain/presets.js';
+import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
 import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
@@ -20,7 +20,17 @@ import { Toolbar } from './Toolbar.jsx';
 import { VoiceControls } from './VoiceControls.jsx';
 import { VoiceLibrary } from './VoiceLibrary.jsx';
 
-const INITIAL_OPTIONS = { guidance: 2, steps: DEFAULT_STEPS, seed: '', denoiseReference: false, masterAudio: true };
+const INITIAL_OPTIONS = {
+  guidance: 2,
+  steps: DEFAULT_STEPS,
+  seed: '',
+  lockSeed: true,
+  autoFormatKhmer: true,
+  styleMode: STYLE_MODES.AUTO,
+  customStyle: '',
+  denoiseReference: false,
+  masterAudio: true,
+};
 
 /**
  * Detects Apple platforms using User-Agent Client Hints with a userAgent fallback.
@@ -74,16 +84,32 @@ export async function finalizeCharacterGeneration(ctx) {
 }
 
 /**
+ * Clears any saved locked seed for `characterId` when voice is reset or randomized.
+ * @param {Function} [setLockedSeeds] - Optional locked-seed state setter.
+ * @param {string} characterId - Target character ID.
+ */
+function clearCharacterLockedSeed(setLockedSeeds, characterId) {
+  if (!setLockedSeeds || !characterId) return;
+  setLockedSeeds(prev => {
+    if (!(characterId in prev)) return prev;
+    const { [characterId]: _removed, ...rest } = prev;
+    return rest;
+  });
+}
+
+/**
  * Builds the validated submission request for the active character generation run.
- * @param {object} spec - Current script, character, anchor, actions, and inference options.
+ * @param {object} spec - Current script, character, anchor, actions, options, and locked seeds.
  * @returns {object} Synthesis request payload.
  */
-function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, actions, options }) {
+function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, actions, options, lockedSeeds = {} }) {
+  const lockedSeed = options.lockSeed !== false ? lockedSeeds[submittedCharacter.id] : null;
   const seed = resolveEffectiveSeed({
     rawSeed: options.seed,
     character: submittedCharacter,
     hasAnchor: Boolean(submittedAnchor),
     rerolledIds: actions.rerolledIdsRef.current,
+    lockedSeed,
   });
   return {
     script,
@@ -93,6 +119,9 @@ function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, a
     guidance: options.guidance,
     steps: options.steps,
     seed,
+    autoFormatKhmer: options.autoFormatKhmer !== false,
+    styleMode: options.styleMode || STYLE_MODES.AUTO,
+    customStyle: options.customStyle || '',
     denoiseReference: options.denoiseReference,
     masterAudio: options.masterAudio !== false,
   };
@@ -100,26 +129,29 @@ function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, a
 
 /**
  * Builds the `VoiceControls` action callback bundle bound to the active character.
- * Inputs: `{ actions, activeCharacter, setLibraryModal, setOptions }`.
+ * Inputs: `{ actions, activeCharacter, setLibraryModal, setOptions, setLockedSeeds }`.
  * Outputs: callback map passed to `<VoiceControls actions={...} />`.
- * Side effects: triggers character mutations, modal open state, and inference option updates.
+ * Side effects: triggers character mutations, modal open state, seed clearing, and inference option updates.
  * Failure modes: async errors in sample upload, voice reset, and anchor updates are handled in `actions`.
  * @param {object} deps - Bound character action dependencies.
  * @returns {object} VoiceControls action callbacks.
  */
-export function buildVoiceActions({ actions, activeCharacter, setLibraryModal, setOptions }) {
+export function buildVoiceActions({ actions, activeCharacter, setLibraryModal, setOptions, setLockedSeeds }) {
   return {
     onSelectCharacter: actions.handleSelectCharacter,
     onOpenNewCharacter: () => setLibraryModal({ open: true, openForm: true }),
-    onUploadSample: file => void actions.handleUploadSample(file),
-    onResetVoice: () => void actions.handleResetVoice(activeCharacter.id),
+    onUploadSample: file => { clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id); void actions.handleUploadSample(file); },
+    onResetVoice: () => { clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id); void actions.handleResetVoice(activeCharacter.id); },
     onUpdateAnchor: patch => void actions.handleUpdateAnchor(activeCharacter.id, patch),
-    onChangeOption: (key, value) => setOptions(prev => ({ ...prev, [key]: value })),
+    onChangeOption: (key, value) => {
+      if ((key === 'seed' && value === '') || (key === 'lockSeed' && value === false)) clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id);
+      setOptions(prev => ({ ...prev, [key]: value }));
+    },
   };
 }
 
 /**
- * Submits the active character's script for synthesis and wires Take-1 voice auto-locking.
+ * Submits the active character's script for synthesis, persists locked seeds, and wires Take-1 voice locking.
  * @param {Event} event - Form submit event.
  * @param {object} ctx - Studio submission context.
  */
@@ -129,15 +161,20 @@ function submitCharacterSpeech(event, ctx) {
   const submittedCharacter = ctx.activeCharacter;
   const submittedAnchor = ctx.anchorApi.anchors[submittedCharacter.id] || null;
   const submittedRevision = ctx.anchorApi.getRevision(submittedCharacter.id);
-  const request = buildSubmissionRequest({ script: ctx.script, submittedCharacter, submittedAnchor, actions: ctx.actions, options: ctx.options });
+  const request = buildSubmissionRequest({ script: ctx.script, submittedCharacter, submittedAnchor, actions: ctx.actions, options: ctx.options, lockedSeeds: ctx.lockedSeeds });
   void ctx.synthesis.runGeneration({
     request,
     onReferenceUploaded: ctx.actions.setCachedUpload,
-    onCompleted: result => finalizeCharacterGeneration({
-      result, submittedCharacter, submittedRevision,
-      characterExists: id => ctx.charactersRef.current.some(item => item.id === id),
-      actions: ctx.actions, anchorApi: ctx.anchorApi, logger: ctx.logger,
-    }),
+    onCompleted: result => {
+      if (ctx.options.lockSeed !== false && result.recording?.seed != null) {
+        ctx.setLockedSeeds?.(prev => ({ ...prev, [submittedCharacter.id]: result.recording.seed }));
+      }
+      return finalizeCharacterGeneration({
+        result, submittedCharacter, submittedRevision,
+        characterExists: id => ctx.charactersRef.current.some(item => item.id === id),
+        actions: ctx.actions, anchorApi: ctx.anchorApi, logger: ctx.logger,
+      });
+    },
   });
 }
 
@@ -167,7 +204,8 @@ function StudioSpeechForm({ state, ctrl, voiceActions }) {
         <div className="pane-heading"><h2 id="voice-title">Voice</h2></div>
         <VoiceControls characters={state.library.allVoices} anchors={state.anchorApi.anchors} activeCharacter={ctrl.activeCharacter}
           activeAnchor={ctrl.activeAnchor} anchorWarning={state.anchorApi.anchorWarning} busy={ctrl.synthesis.busy}
-          options={state.options} lastSeed={ctrl.synthesis.lastSeed} transcriptRef={state.transcriptRef} actions={voiceActions} />
+          options={state.options} lastSeed={ctrl.synthesis.lastSeed} lockedSeed={state.lockedSeeds[ctrl.activeCharacter.id] ?? null}
+          transcriptRef={state.transcriptRef} actions={voiceActions} />
       </section>
     </form>
   );
@@ -267,6 +305,7 @@ function useStudioState() {
   const transcriptRef = useRef(null);
   const [script, setScript] = useState('');
   const [options, setOptions] = useState(INITIAL_OPTIONS);
+  const [lockedSeeds, setLockedSeeds] = useState({});
   const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
   const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
   const [engine, refreshEngine, engineMeta] = useEngineStatus();
@@ -275,7 +314,7 @@ function useStudioState() {
   const charactersRef = useRef(library.allVoices);
   charactersRef.current = library.allVoices;
   return {
-    scriptRef, transcriptRef, script, setScript, options, setOptions, selectedCharacterId,
+    scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, selectedCharacterId,
     setSelectedCharacterId, libraryModal, setLibraryModal, engine, refreshEngine, engineMeta, library, anchorApi, charactersRef,
   };
 }
@@ -320,7 +359,7 @@ export function Studio() {
   const ctrl = useStudioController(state);
   const voiceActions = buildVoiceActions({
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
-    setLibraryModal: state.setLibraryModal, setOptions: state.setOptions,
+    setLibraryModal: state.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
   });
   return (
     <>
@@ -330,7 +369,7 @@ export function Studio() {
         library={state.library} anchors={state.anchorApi.anchors}
         onSelectVoice={ctrl.actions.handleSelectCharacter} onCreateCharacter={ctrl.actions.handleCreateCharacter}
         onDeleteCharacter={id => void ctrl.actions.handleDeleteCharacter(id)}
-        onUnpinAnchor={id => void ctrl.actions.handleResetVoice(id)}
+        onUnpinAnchor={id => { clearCharacterLockedSeed(state.setLockedSeeds, id); void ctrl.actions.handleResetVoice(id); }}
         onClose={() => state.setLibraryModal({ open: false, openForm: false })} />
     </>
   );

@@ -3,7 +3,7 @@
  */
 
 import { ValidationError } from './errors.js';
-import { normalizeKhmerUnicode } from './khmerText.js';
+import { expandKhmerNumbers, normalizeKhmerUnicode } from './khmerText.js';
 
 export const MAX_SCRIPT_LENGTH = 2000;
 export const MAX_DESCRIPTION_LENGTH = 300;
@@ -14,6 +14,32 @@ export const MAX_STEPS = 20;
 export const DEFAULT_STEPS = 10;
 export const MAX_SEED = 4294967295;
 
+export const STYLE_MODES = Object.freeze({
+  AUTO: 'auto',
+  NATURAL: 'natural',
+  FORMAL: 'formal',
+  WARM: 'warm',
+  STORY: 'story',
+  CALM: 'calm',
+  CUSTOM: 'custom',
+});
+
+export const STYLE_PRESET_OPTIONS = Object.freeze([
+  { id: STYLE_MODES.AUTO, label: 'Auto (follow writing format)', prompt: '' },
+  { id: STYLE_MODES.NATURAL, label: 'Natural (voice default)', prompt: '' },
+  { id: STYLE_MODES.FORMAL, label: 'Formal / News briefing', prompt: 'Clear, composed news broadcast delivery with steady articulation' },
+  { id: STYLE_MODES.WARM, label: 'Warm & conversational', prompt: 'Warm, friendly conversational tone with natural relaxed phrasing' },
+  { id: STYLE_MODES.STORY, label: 'Expressive storytelling', prompt: 'Expressive storytelling cadence with vivid emotion and clear pauses' },
+  { id: STYLE_MODES.CALM, label: 'Calm & deliberate', prompt: 'Calm, gentle, unhurried pace with crisp articulation' },
+  { id: STYLE_MODES.CUSTOM, label: 'Custom style prompt…', prompt: '' },
+]);
+
+const FORMAL_PROSE_MIN_GRAPHEMES = 120;
+const QUOTE_CUE_PATTERN = /[«»“”"]/;
+const EXCLAMATION_CUE_PATTERN = /[!！]/;
+const QUESTION_CUE_PATTERN = /[?？]/;
+const STRUCTURE_CUE_PATTERN = /(?:^|\n)\s*(?:[-•*]|\d+[.)។])\s|៖/m;
+const FORMAL_SENTENCE_PATTERN = /[។៕]/g;
 const PARENTHESES_PATTERN = /[()（）]/g;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
@@ -48,16 +74,73 @@ export function countGraphemes(text) {
 }
 
 /**
- * Builds the VoxCPM2 control instruction for a single speaking character.
- * Inputs: `{ character, hasLockedAudio, usePromptText }`.
- * Outputs: character design prompt on first generation, or empty string when cloning locked audio.
+ * Infers a VoxCPM2 style instruction from script punctuation and layout cues.
+ * Inputs: raw or normalized script text.
+ * Outputs: style control string matching the script format, or `''` for simple neutral sentences.
  * Side effects: none.
- * Failure modes: throws ValidationError when an unpinned character has no speaking description.
- * @param {{ character?: { description?: string }|null, hasLockedAudio?: boolean, usePromptText?: boolean }} params - Instruction params.
+ * Failure modes: returns `''` for non-string or empty input.
+ * @param {unknown} rawScript - Script text to inspect.
+ * @returns {string} Inferred style cue or `''`.
+ */
+export function inferScriptStyleInstruction(rawScript) {
+  if (typeof rawScript !== 'string') return '';
+  const text = rawScript.trim();
+  if (!text) return '';
+  if (QUOTE_CUE_PATTERN.test(text)) return 'Expressive narrative dialogue tone with natural conversational shifts';
+  if (EXCLAMATION_CUE_PATTERN.test(text)) return 'Expressive, energetic upbeat delivery matching enthusiastic punctuation';
+  if (QUESTION_CUE_PATTERN.test(text)) return 'Natural inquisitive tone with rising inflection at questions';
+  if (STRUCTURE_CUE_PATTERN.test(text)) return 'Clear, structured presenter cadence with brief pauses between points';
+  const stops = text.match(FORMAL_SENTENCE_PATTERN)?.length || 0;
+  if (stops >= 2 || (stops >= 1 && countGraphemes(text) >= FORMAL_PROSE_MIN_GRAPHEMES)) {
+    return 'Steady, articulate natural cadence matching formal prose';
+  }
+  return '';
+}
+
+/**
+ * Resolves the active style cue for a selected `styleMode`, custom prompt, and script.
+ * Inputs: `{ styleMode, customStyle, script }`.
+ * Outputs: sanitized style cue string or `''`.
+ * Side effects: none.
+ * Failure modes: returns `''` for unrecognized style modes or empty custom text.
+ * @param {{ styleMode?: string, customStyle?: string, script?: string }} [spec] - Style resolution spec.
+ * @returns {string} Resolved style instruction without parentheses.
+ */
+export function resolveStyleInstruction({ styleMode = STYLE_MODES.NATURAL, customStyle = '', script = '' } = {}) {
+  if (styleMode === STYLE_MODES.NATURAL) return '';
+  if (styleMode === STYLE_MODES.CUSTOM) return stripParentheses(customStyle);
+  if (styleMode === STYLE_MODES.AUTO) return inferScriptStyleInstruction(script);
+  const preset = STYLE_PRESET_OPTIONS.find(item => item.id === styleMode);
+  return preset ? stripParentheses(preset.prompt) : '';
+}
+
+/**
+ * Combines a character baseline description with an optional style cue within `MAX_DESCRIPTION_LENGTH`.
+ * @param {string} baseVoice - Character baseline voice description.
+ * @param {string} styleText - Non-empty style cue.
+ * @returns {string} Merged description string.
+ */
+function combineVoiceAndStyle(baseVoice, styleText) {
+  const merged = `${baseVoice}, ${styleText}`;
+  return countGraphemes(merged) <= MAX_DESCRIPTION_LENGTH ? merged : baseVoice;
+}
+
+/**
+ * Builds the VoxCPM2 control instruction for a single speaking character.
+ * Inputs: `{ character, hasLockedAudio, usePromptText, styleInstruction }`.
+ * Outputs: combined voice/style prompt or empty string when exact-cloning or unstyled locked voice.
+ * Side effects: none.
+ * Failure modes: throws ValidationError when an unpinned character has no speaking description or style exceeds `MAX_DESCRIPTION_LENGTH`.
+ * @param {{ character?: { description?: string }|null, hasLockedAudio?: boolean, usePromptText?: boolean, styleInstruction?: string }} params - Instruction params.
  * @returns {string} Control instruction string.
  */
-export function buildCharacterInstruction({ character, hasLockedAudio = false, usePromptText = false }) {
-  if (usePromptText || hasLockedAudio) return '';
+export function buildCharacterInstruction({ character, hasLockedAudio = false, usePromptText = false, styleInstruction = '' }) {
+  if (usePromptText) return '';
+  const cleanStyle = stripParentheses(styleInstruction);
+  if (countGraphemes(cleanStyle) > MAX_DESCRIPTION_LENGTH) {
+    throw new ValidationError(`Keep the style instruction under ${MAX_DESCRIPTION_LENGTH} characters.`, 'style', 'STYLE_TOO_LONG');
+  }
+  if (hasLockedAudio) return cleanStyle;
   const cleaned = stripParentheses(character?.description || '');
   if (!cleaned) {
     throw new ValidationError('Select a character with a voice description or upload a voice sample.', 'character', 'MISSING_CHARACTER_VOICE');
@@ -65,7 +148,7 @@ export function buildCharacterInstruction({ character, hasLockedAudio = false, u
   if (countGraphemes(cleaned) > MAX_DESCRIPTION_LENGTH) {
     throw new ValidationError(`Keep the character description under ${MAX_DESCRIPTION_LENGTH} characters.`, 'description', 'DESCRIPTION_TOO_LONG');
   }
-  return cleaned;
+  return cleanStyle ? combineVoiceAndStyle(cleaned, cleanStyle) : cleaned;
 }
 
 /**
@@ -111,13 +194,15 @@ function resolveExactCloneOptions({ hasLockedAudio, exactClone, promptText }) {
 }
 
 /**
- * Validates script text against non-empty and grapheme length bounds.
+ * Validates script text against non-empty and grapheme length bounds, optionally expanding Khmer numbers/time.
  * @param {unknown} rawScript - Raw script input.
- * @returns {string} Trimmed script text.
+ * @param {{ autoFormatKhmer?: boolean }} [options] - Normalization flags.
+ * @returns {string} Normalized script text.
  */
-function validateScriptText(rawScript) {
-  const text = normalizeKhmerUnicode(rawScript);
-  if (!text) throw new ValidationError('Enter text to generate speech.', 'script', 'EMPTY_SCRIPT');
+function validateScriptText(rawScript, { autoFormatKhmer = false } = {}) {
+  const normalized = normalizeKhmerUnicode(rawScript);
+  if (!normalized) throw new ValidationError('Enter text to generate speech.', 'script', 'EMPTY_SCRIPT');
+  const text = autoFormatKhmer ? expandKhmerNumbers(normalized) : normalized;
   if (countGraphemes(text) > MAX_SCRIPT_LENGTH) {
     throw new ValidationError(`Keep your script under ${MAX_SCRIPT_LENGTH.toLocaleString()} characters.`, 'script', 'SCRIPT_TOO_LONG');
   }
@@ -126,7 +211,7 @@ function validateScriptText(rawScript) {
 
 /**
  * Validates and normalizes generation inputs into a clean command object.
- * Inputs: raw generation options `{ script, character, hasLockedAudio, exactClone, promptText, guidance, steps, seed }` and optional `seedGenerator`.
+ * Inputs: raw generation options and optional `seedGenerator`.
  * Outputs: `{ text, instruction, usePromptText, promptText, guidance, steps, seed }`.
  * Side effects: none.
  * Failure modes: throws ValidationError when any field violates domain rules.
@@ -135,15 +220,16 @@ function validateScriptText(rawScript) {
  * @returns {{ text: string, instruction: string, usePromptText: boolean, promptText: string, guidance: number, steps: number, seed: number }} Validated payload.
  */
 export function validateGenerationInput(input, seedGenerator = () => crypto.getRandomValues(new Uint32Array(1))[0]) {
-  const text = validateScriptText(input?.script);
+  const text = validateScriptText(input?.script, { autoFormatKhmer: Boolean(input?.autoFormatKhmer) });
   if (!input?.character?.id) {
     throw new ValidationError('Select a speaking character before generating speech.', 'character', 'MISSING_CHARACTER');
   }
   const hasLockedAudio = Boolean(input?.hasLockedAudio);
   const cloneConfig = resolveExactCloneOptions({ hasLockedAudio, exactClone: input?.exactClone, promptText: input?.promptText });
+  const styleInstruction = resolveStyleInstruction({ styleMode: input?.styleMode ?? STYLE_MODES.NATURAL, customStyle: input?.customStyle, script: text });
   return {
     text,
-    instruction: buildCharacterInstruction({ character: input.character, hasLockedAudio, usePromptText: cloneConfig.usePromptText }),
+    instruction: buildCharacterInstruction({ character: input.character, hasLockedAudio, usePromptText: cloneConfig.usePromptText, styleInstruction }),
     ...cloneConfig,
     guidance: parseBoundedNumber({ raw: input?.guidance, min: MIN_GUIDANCE, max: MAX_GUIDANCE, integer: false, field: 'guidance' }),
     steps: parseBoundedNumber({ raw: input?.steps ?? DEFAULT_STEPS, min: MIN_STEPS, max: MAX_STEPS, integer: true, field: 'steps' }),

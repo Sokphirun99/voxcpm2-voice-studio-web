@@ -4,7 +4,16 @@
 
 import React, { useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import { MAX_GUIDANCE, MAX_SEED, MAX_STEPS, MIN_GUIDANCE, MIN_STEPS } from '../../domain/presets.js';
+import {
+  MAX_DESCRIPTION_LENGTH,
+  MAX_GUIDANCE,
+  MAX_SEED,
+  MAX_STEPS,
+  MIN_GUIDANCE,
+  MIN_STEPS,
+  STYLE_MODES,
+  STYLE_PRESET_OPTIONS,
+} from '../../domain/presets.js';
 import { formatCharacterOptionLabel, groupCharactersByCategory } from '../../domain/voiceLibrary.js';
 import { Icon } from './Icon.jsx';
 
@@ -166,11 +175,12 @@ function CharacterIdentityCard({ character, anchor, busy, transcriptRef, onUploa
 
 /**
  * Renders the seed field header with quick Reuse-last-seed and Random actions.
- * @param {{ seed: string, lastSeed: number|null, onChange: (key: string, value: unknown) => void }} props - Seed header props.
+ * @param {{ seed: string, lastSeed: number|null, lockedSeed: number|null, onChange: (key: string, value: unknown) => void }} props - Seed header props.
  * @returns {React.ReactElement} Seed label row.
  */
-function SeedLabelRow({ seed, lastSeed, onChange }) {
+function SeedLabelRow({ seed, lastSeed, lockedSeed, onChange }) {
   const canReuse = lastSeed != null && String(lastSeed) !== String(seed);
+  const canClear = seed !== '' || lockedSeed != null;
   return (
     <div className="field-label-row">
       <label className="field-label" htmlFor="seed">Seed</label>
@@ -181,13 +191,37 @@ function SeedLabelRow({ seed, lastSeed, onChange }) {
             Use last ({lastSeed})
           </button>
         )}
-        {seed !== '' && (
+        {canClear && (
           <button type="button" className="button subtle-button seed-helper-button" id="clear-seed"
             onClick={() => onChange('seed', '')}>
             Random
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Renders script-format style selection and optional custom prompt inside Advanced settings.
+ * @param {{ options: object, isExactClone: boolean, onChange: (key: string, value: unknown) => void }} props - Style control props.
+ * @returns {React.ReactElement} Style selector section.
+ */
+function ScriptStyleControl({ options, isExactClone, onChange }) {
+  const styleMode = options.styleMode || STYLE_MODES.AUTO;
+  return (
+    <div className="style-control-block">
+      <label className="field-label" htmlFor="style-mode">Script format &amp; style</label>
+      <select id="style-mode" name="styleMode" value={styleMode} disabled={isExactClone}
+        onChange={event => onChange('styleMode', event.target.value)}>
+        {STYLE_PRESET_OPTIONS.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+      </select>
+      {styleMode === STYLE_MODES.CUSTOM && !isExactClone && (
+        <input id="custom-style" name="customStyle" type="text" maxLength={MAX_DESCRIPTION_LENGTH}
+          placeholder="e.g. Clear Khmer news anchor, calm steady pace"
+          value={options.customStyle || ''} onChange={event => onChange('customStyle', event.target.value)} />
+      )}
+      {isExactClone && <p className="style-hint">Exact transcript match sets pacing directly from the sample.</p>}
     </div>
   );
 }
@@ -215,13 +249,40 @@ function InferenceSliders({ guidance, steps, onChange }) {
 }
 
 /**
- * Renders reference denoising and loudness mastering checkboxes inside Advanced settings.
+ * Renders seed input alongside per-character seed locking toggle.
+ * @param {{ options: object, lastSeed: number|null, lockedSeed: number|null, onChange: (key: string, value: unknown) => void, onAutoExpand: () => void }} props - Seed control props.
+ * @returns {React.ReactElement} Seed field and lock toggle.
+ */
+function SeedControl({ options, lastSeed, lockedSeed, onChange, onAutoExpand }) {
+  const lockSeed = options.lockSeed !== false;
+  const placeholder = lockSeed && lockedSeed != null ? `Locked (${lockedSeed})` : 'Auto';
+  return (
+    <>
+      <SeedLabelRow seed={options.seed} lastSeed={lastSeed} lockedSeed={lockedSeed} onChange={onChange} />
+      <input id="seed" name="seed" type="number" min="0" max={MAX_SEED} step="1" placeholder={placeholder}
+        value={options.seed} onChange={event => onChange('seed', event.target.value)} onInvalid={onAutoExpand} />
+      <label className="locked-checkbox advanced-checkbox">
+        <input type="checkbox" id="lock-seed" checked={lockSeed}
+          onChange={event => onChange('lockSeed', event.currentTarget.checked)} />
+        <span>Keep consistent voice seed</span>
+      </label>
+    </>
+  );
+}
+
+/**
+ * Renders Khmer formatting, loudness mastering, and reference denoising checkboxes inside Advanced settings.
  * @param {{ options: object, onChange: (key: string, value: unknown) => void }} props - Toggle props.
  * @returns {React.ReactElement} Checkbox toggles.
  */
 function AdvancedToggles({ options, onChange }) {
   return (
     <>
+      <label className="locked-checkbox advanced-checkbox">
+        <input type="checkbox" id="auto-format-khmer" checked={options.autoFormatKhmer !== false}
+          onChange={event => onChange('autoFormatKhmer', event.currentTarget.checked)} />
+        <span>Auto-speak Khmer numbers &amp; time</span>
+      </label>
       <label className="locked-checkbox advanced-checkbox">
         <input type="checkbox" id="master-audio" checked={options.masterAudio !== false}
           onChange={event => onChange('masterAudio', event.currentTarget.checked)} />
@@ -237,11 +298,11 @@ function AdvancedToggles({ options, onChange }) {
 }
 
 /**
- * Renders collapsible guidance, diffusion steps (4–20), seed, mastering, and reference denoising controls.
- * @param {{ options: object, lastSeed: number|null, onChange: (key: string, value: unknown) => void }} props - Advanced props.
+ * Renders collapsible style, guidance, diffusion steps, seed locking, formatting, and denoising controls.
+ * @param {{ options: object, lastSeed: number|null, lockedSeed?: number|null, isExactClone?: boolean, onChange: (key: string, value: unknown) => void }} props - Advanced props.
  * @returns {React.ReactElement} Collapsible advanced panel.
  */
-function AdvancedSection({ options, lastSeed, onChange }) {
+function AdvancedSection({ options, lastSeed, lockedSeed = null, isExactClone = false, onChange }) {
   const [advanced, setAdvanced] = useState(false);
   return (
     <div className="advanced">
@@ -251,11 +312,10 @@ function AdvancedSection({ options, lastSeed, onChange }) {
         <Icon name="chevron_down" />
       </button>
       <div className="advanced-fields" id="advanced-fields" hidden={!advanced}>
+        <ScriptStyleControl options={options} isExactClone={isExactClone} onChange={onChange} />
         <InferenceSliders guidance={options.guidance} steps={options.steps} onChange={onChange} />
-        <SeedLabelRow seed={options.seed} lastSeed={lastSeed} onChange={onChange} />
-        <input id="seed" name="seed" type="number" min="0" max={MAX_SEED} step="1" placeholder="Auto"
-          value={options.seed} onChange={event => onChange('seed', event.target.value)}
-          onInvalid={() => { if (!advanced) flushSync(() => setAdvanced(true)); }} />
+        <SeedControl options={options} lastSeed={lastSeed} lockedSeed={lockedSeed} onChange={onChange}
+          onAutoExpand={() => { if (!advanced) flushSync(() => setAdvanced(true)); }} />
         <AdvancedToggles options={options} onChange={onChange} />
       </div>
     </div>
@@ -264,14 +324,15 @@ function AdvancedSection({ options, lastSeed, onChange }) {
 
 /**
  * Renders the Narakeet-style Character Voice inspector panel.
- * Inputs: `{ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, transcriptRef, actions }`.
+ * Inputs: `{ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed, transcriptRef, actions }`.
  * Outputs: `<div className="voice-body">` element.
  * Side effects: triggers callbacks on character selection, sample upload, reset, or option updates.
  * Failure modes: displays storage warnings if persisted voice clips fail to load.
  * @param {object} props - Voice inspector props.
  * @returns {React.ReactElement} Voice controls panel.
  */
-export function VoiceControls({ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, transcriptRef, actions }) {
+export function VoiceControls({ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed = null, transcriptRef, actions }) {
+  const isExactClone = Boolean(activeAnchor?.blob && activeAnchor?.exactClone);
   return (
     <div className="voice-body">
       {anchorWarning && <p className="voice-warning" role="alert">{anchorWarning}</p>}
@@ -279,7 +340,8 @@ export function VoiceControls({ characters, anchors, activeCharacter, activeAnch
         onSelectId={actions.onSelectCharacter} onNewCharacter={actions.onOpenNewCharacter} />
       <CharacterIdentityCard character={activeCharacter} anchor={activeAnchor} busy={busy} transcriptRef={transcriptRef}
         onUploadSample={actions.onUploadSample} onResetVoice={actions.onResetVoice} onUpdateAnchor={actions.onUpdateAnchor} />
-      <AdvancedSection options={options} lastSeed={lastSeed} onChange={actions.onChangeOption} />
+      <AdvancedSection options={options} lastSeed={lastSeed} lockedSeed={lockedSeed}
+        isExactClone={isExactClone} onChange={actions.onChangeOption} />
     </div>
   );
 }

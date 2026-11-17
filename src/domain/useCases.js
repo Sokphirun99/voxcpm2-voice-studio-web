@@ -224,9 +224,9 @@ async function attachRecordingMetrics(result, startedAt) {
  * @returns {Promise<object>} Recording metadata and uploaded FileData cache.
  */
 async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, seedGenerator }, params) {
-  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, denoiseReference = false, masterAudio = true, signal, onProgress, onReferenceUploaded } = params || {};
+  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, signal, onProgress, onReferenceUploaded } = params || {};
   const payload = validateGenerationInput(
-    { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed },
+    { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed, autoFormatKhmer, styleMode, customStyle },
     seedGenerator
   );
   const startedAt = Date.now();

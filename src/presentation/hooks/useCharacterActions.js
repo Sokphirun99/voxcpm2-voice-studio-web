@@ -7,12 +7,15 @@ import { DEFAULT_CHARACTER_ID } from '../../domain/voiceLibrary.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
 /**
- * Resolves the seed passed to VoxCPM2 based on explicit input, anchor state, and reset history.
- * @param {{ rawSeed: string, character: object, hasAnchor: boolean, rerolledIds: Set<string> }} spec - Seed context.
+ * Resolves the seed passed to VoxCPM2 based on explicit input, locked character seed, anchor state, and reset history.
+ * @param {{ rawSeed: string, character: object, hasAnchor: boolean, rerolledIds: Set<string>, lockedSeed?: number|string|null }} spec - Seed context.
  * @returns {string|number} Seed value or blank for automatic randomization.
  */
-export function resolveEffectiveSeed({ rawSeed, character, hasAnchor, rerolledIds }) {
+export function resolveEffectiveSeed({ rawSeed, character, hasAnchor, rerolledIds, lockedSeed = null }) {
   if (rawSeed !== '' && rawSeed !== null && rawSeed !== undefined) return rawSeed;
+  if (lockedSeed !== null && lockedSeed !== undefined && lockedSeed !== '' && !rerolledIds.has(character.id)) {
+    return lockedSeed;
+  }
   if (hasAnchor || rerolledIds.has(character.id)) return '';
   return character.defaultSeed ?? '';
 }

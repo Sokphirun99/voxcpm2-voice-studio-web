@@ -111,20 +111,49 @@ function numberTokenToKhmer(token) {
 }
 
 /**
- * Expands currency (`$25`, `1500៛`), percentages (`50%`), and numbers into spoken Khmer words when Khmer text is present.
+ * Formats a `HH:MM` clock token into spoken Khmer hours and minutes.
+ * @param {string} match - Matched raw token.
+ * @param {string} hoursRaw - Hour digits.
+ * @param {string} minutesRaw - Minute digits.
+ * @returns {string} Spoken Khmer time phrase or original token when out of range.
+ */
+function formatTimeTokenToKhmer(match, hoursRaw, minutesRaw) {
+  const hours = Number(toAsciiDigits(hoursRaw));
+  const minutes = Number(toAsciiDigits(minutesRaw));
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes) || hours > 23 || minutes > 59) return match;
+  const minPhrase = minutes === 0 ? 'គត់' : `${integerToKhmerWords(minutes)}នាទី`;
+  return `${integerToKhmerWords(hours)}ម៉ោង${minPhrase}`;
+}
+
+/**
+ * Formats a Celsius or Fahrenheit temperature token into spoken Khmer words.
+ * @param {string} numRaw - Numeric token.
+ * @param {string} unit - Temperature unit letter (`C` or `F`).
+ * @returns {string} Spoken Khmer temperature phrase.
+ */
+function formatTemperatureTokenToKhmer(numRaw, unit) {
+  const label = unit.toUpperCase() === 'C' ? 'អង្សាសេ' : 'អង្សាហ្វារិនហៃ';
+  return `${numberTokenToKhmer(numRaw)}${label}`;
+}
+
+/**
+ * Expands currency (`$25`, `1500៛`), percentages (`50%`), time (`10:30`), temperature (`37°C`), and numbers into spoken Khmer words when Khmer text is present.
  * Inputs: script text string.
- * Outputs: Unicode-normalized text with Khmer-context numerals/currencies spoken out.
+ * Outputs: Unicode-normalized text with Khmer-context numerals/currencies/times spoken out.
  * Side effects: none.
  * Failure modes: returns trimmed string unchanged for non-Khmer scripts without Khmer digits.
  * @param {unknown} rawText - Input script text.
- * @returns {string} Script with spoken Khmer numbers and currencies.
+ * @returns {string} Script with spoken Khmer numbers, times, temperatures, and currencies.
  */
 export function expandKhmerNumbers(rawText) {
   const text = normalizeKhmerUnicode(rawText);
   if (!text) return '';
   if (!KHMER_SCRIPT_PATTERN.test(text) && !/[\u17E0-\u17E9៛]/.test(text)) return text;
   const numPattern = '[0-9\u17E0-\u17E9]+(?:,[0-9\u17E0-\u17E9]{3})*(?:\\.[0-9\u17E0-\u17E9]+)?';
+  const timePattern = '(?<![A-Za-z0-9_:.])([0-2]?[0-9]|[\u17E0-\u17E2]?[\u17E0-\u17E9]):([0-5][0-9]|[\u17E0-\u17E5][\u17E0-\u17E9])(?![A-Za-z0-9_:.])';
   return text
+    .replace(new RegExp(`(${numPattern})\\s*°\\s*([CFcf])`, 'g'), (_, num, unit) => formatTemperatureTokenToKhmer(num, unit))
+    .replace(new RegExp(timePattern, 'g'), formatTimeTokenToKhmer)
     .replace(new RegExp(`\\$\\s*(${numPattern})`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ដុល្លារ`)
     .replace(new RegExp(`(${numPattern})\\s*\\$`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ដុល្លារ`)
     .replace(new RegExp(`(${numPattern})\\s*៛`, 'g'), (_, num) => `${numberTokenToKhmer(num)}រៀល`)

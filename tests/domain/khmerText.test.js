@@ -23,9 +23,10 @@ test('integerToKhmerWords formats Khmer and Arabic integers cleanly', () => {
   assert.equal(integerToKhmerWords('1000000000'), '1000000000');
 });
 
-test('expandKhmerNumbers expands Khmer-context currencies, percentages, and digits without corrupting Latin text', () => {
+test('expandKhmerNumbers expands Khmer-context currencies, percentages, time, temperature, and digits without corrupting Latin text', () => {
   assert.equal(expandKhmerNumbers('Save $25 and 50% today on VoxCPM2.'), 'Save $25 and 50% today on VoxCPM2.');
   assert.equal(expandKhmerNumbers('តម្លៃ $25 ឬ 1,500៛ បញ្ចុះ 50%'), 'តម្លៃ ម្ភៃប្រាំដុល្លារ ឬ មួយពាន់ប្រាំរយរៀល បញ្ចុះ ហាសិបភាគរយ');
+  assert.equal(expandKhmerNumbers('ម៉ោង 10:30 និង ០៨:០០ សីតុណ្ហភាព 37°C ក្នុងអេក្រង់ 16:9'), 'ម៉ោង ដប់ម៉ោងសាមសិបនាទី និង ប្រាំបីម៉ោងគត់ សីតុណ្ហភាព សាមសិបប្រាំពីរអង្សាសេ ក្នុងអេក្រង់ ដប់ប្រាំមួយ:ប្រាំបួន');
   assert.equal(expandKhmerNumbers('ខ្ញុំអាយុ ២៥ ឆ្នាំ ប្រើ VoxCPM2'), 'ខ្ញុំអាយុ ម្ភៃប្រាំ ឆ្នាំ ប្រើ VoxCPM2');
   assert.equal(hasConvertibleKhmerNumbers('តម្លៃ ៥០០៛'), true);
   assert.equal(hasConvertibleKhmerNumbers('សួស្តីអ្នកទាំងអស់គ្នា'), false);
