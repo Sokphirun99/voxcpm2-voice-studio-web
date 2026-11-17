@@ -219,8 +219,10 @@ function TtsSpeechForm({ state, ctrl, voiceActions }) {
  * @param {object} props - Shared shell services and library state.
  * @returns {object} Combined workspace state and controller handles.
  */
-function useTextToSpeechWorkspace({ shared, actionsRef }) {
-  const { library, anchorApi, refreshEngine, setLibraryModal, externalScript, onConsumeExternalScript, onTtsStateChange } = shared;
+function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume }) {
+  const { library, anchorApi, refreshEngine, setLibraryModal, externalScript: sharedScript, onConsumeExternalScript: sharedConsume, onTtsStateChange } = shared;
+  const externalScript = propExternalScript || sharedScript || '';
+  const onConsumeExternalScript = propConsume || sharedConsume;
   const { logger } = useStudioServices();
   const scriptRef = useRef(null);
   const transcriptRef = useRef(null);
@@ -269,8 +271,8 @@ function useTextToSpeechWorkspace({ shared, actionsRef }) {
  * @param {object} props - Workspace container props.
  * @returns {React.ReactElement} Text-to-Speech function workspace.
  */
-export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef }) {
-  const { state, ctrl } = useTextToSpeechWorkspace({ shared, actionsRef });
+export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef, externalScript = '', onConsumeExternalScript }) {
+  const { state, ctrl } = useTextToSpeechWorkspace({ shared, actionsRef, externalScript, onConsumeExternalScript });
   const voiceActions = buildVoiceActions({
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
     setLibraryModal: shared.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,

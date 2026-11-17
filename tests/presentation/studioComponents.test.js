@@ -817,3 +817,38 @@ test('formatLibraryStatus formats concise storage capacity summary alongside cha
     assert.equal(summary, '12 characters · Storage 4.8 MB · 12/100 cached · 84.2 GB free · 62.0 MB RAM');
   });
 });
+
+test('Sidebar SSR renders both Text to speech and Video to subtitle function switches', async () => {
+  await withViteSsr(async vite => {
+    const { Sidebar } = await vite.ssrLoadModule('/src/presentation/components/Sidebar.jsx');
+    const html = renderToStaticMarkup(
+      React.createElement(Sidebar, { activeWorkspace: 'subtitles', onSelectWorkspace() {}, onOpenLibrary() {} })
+    );
+    assert.ok(html.includes('id="nav-tts"'));
+    assert.ok(html.includes('id="nav-subtitles"'));
+    assert.ok(html.includes('Text to speech'));
+    assert.ok(html.includes('Video to subtitle'));
+    assert.ok(html.includes('id="open-voice-library"'));
+  });
+});
+
+test('VideoSubtitleWorkspace SSR renders uploader, options, empty cue state, and export dock', async () => {
+  await withViteSsr(async vite => {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    const html = renderToStaticMarkup(
+      React.createElement(
+        StudioProvider,
+        { services: createStubServices() },
+        React.createElement(VideoSubtitleWorkspace, { notices: null, hidden: false, onSendToTts() {} })
+      )
+    );
+    assert.ok(html.includes('id="subtitle-video-input"'));
+    assert.ok(html.includes('id="subtitle-source-lang"'));
+    assert.ok(html.includes('id="subtitle-speaker-count"'));
+    assert.ok(html.includes('id="subtitle-extract-btn"'));
+    assert.ok(html.includes('id="subtitle-burn-btn"'));
+    assert.ok(html.includes('id="subtitle-send-tts-btn"'));
+    assert.ok(html.includes('No dialogue extracted yet'));
+  });
+});

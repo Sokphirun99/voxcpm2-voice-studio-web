@@ -35,6 +35,7 @@ services:
     environment:
       GRADIO_URL: ${GRADIO_URL:-http://host.docker.internal:8808}
       STORAGE_URL: ${STORAGE_URL:-http://storage:8090}
+      MEDIA_URL: ${MEDIA_URL:-http://host.docker.internal:8810}
       VITE_USE_POLLING: ${VITE_USE_POLLING:-true}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]

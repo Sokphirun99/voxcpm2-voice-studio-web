@@ -1,0 +1,46 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createMediaSubtitleGateway } from '../../src/data/mediaSubtitleGateway.js';
+import { SynthesisCancelledError, SynthesisError } from '../../src/domain/errors.js';
+
+test('mediaSubtitleGateway checks health, transcribes video, translates, and burns MP4 cleanly', async () => {
+  const calls = [];
+  const gateway = createMediaSubtitleGateway({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      if (url === '/media_api/health') return new Response(JSON.stringify({ burnInSupported: true, diarizationReady: true }), { status: 200 });
+      if (url === '/media_api/transcribe') return new Response(JSON.stringify({ jobId: 'abcd1234ef567890', language: 'en', segments: [] }), { status: 200 });
+      if (url === '/media_api/translate') return new Response(JSON.stringify({ segments: [{ text: 'Hi', translatedText: 'សួស្តី' }] }), { status: 200 });
+      if (url === '/media_api/burn') return new Response(new Blob(['MP4']), { status: 200, headers: { 'content-type': 'video/mp4' } });
+      throw new Error(`Unexpected URL ${url}`);
+    },
+  });
+
+  const health = await gateway.checkHealth();
+  assert.deepEqual(health, { online: true, burnInSupported: true, diarizationReady: true });
+
+  const tr = await gateway.transcribeVideo({ file: new Blob(['vid'], { type: 'video/mp4' }), language: 'en', numSpeakers: 2, translateToKhmer: true });
+  assert.equal(tr.jobId, 'abcd1234ef567890');
+  assert.equal(calls[1].init.body.get('translate_to'), 'km');
+
+  const translated = await gateway.translateSegments({ segments: [{ text: 'Hi' }], sourceLanguage: 'en', targetLanguage: 'km' });
+  assert.equal(translated.segments[0].translatedText, 'សួស្តី');
+
+  const mp4 = await gateway.burnSubtitles({ jobId: tr.jobId, segments: [], speakerNames: {} });
+  assert.equal(await mp4.text(), 'MP4');
+});
+
+test('mediaSubtitleGateway surfaces HTTP error details and cancellation cleanly', async () => {
+  const errGw = createMediaSubtitleGateway({
+    fetchImpl: async () => new Response(JSON.stringify({ detail: 'Video session expired.' }), { status: 404 }),
+  });
+  await assert.rejects(
+    () => errGw.burnSubtitles({ jobId: 'abcd1234ef567890', segments: [], speakerNames: {} }),
+    err => err instanceof SynthesisError && /Video session expired/.test(err.message)
+  );
+
+  const abortGw = createMediaSubtitleGateway({
+    fetchImpl: async () => { throw new DOMException('Aborted', 'AbortError'); },
+  });
+  await assert.rejects(() => abortGw.transcribeVideo({ file: new Blob(['v']) }), SynthesisCancelledError);
+});

@@ -7,6 +7,7 @@ import { Icon } from './Icon.jsx';
 
 export const DEFAULT_WORKSPACES = Object.freeze([
   { id: 'tts', label: 'Text to speech', icon: 'square_pencil' },
+  { id: 'subtitles', label: 'Video to subtitle', icon: 'subtitles' },
 ]);
 
 /**
@@ -15,9 +16,8 @@ export const DEFAULT_WORKSPACES = Object.freeze([
  * @returns {React.ReactElement} Workspace nav button.
  */
 function WorkspaceNavButton({ item, isActive, onSelect }) {
-  const navClass = item.id === 'tts' ? 'button sidebar-item editor-nav' : 'button sidebar-item';
   return (
-    <button type="button" id={`nav-${item.id}`} className={navClass}
+    <button type="button" id={`nav-${item.id}`} className="button sidebar-item workspace-nav"
       aria-current={isActive ? 'page' : undefined} onClick={() => onSelect(item.id)}>
       <Icon name={item.icon} /><span>{item.label}</span>
     </button>

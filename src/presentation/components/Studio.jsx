@@ -10,6 +10,7 @@ import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { Icon } from './Icon.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
+import { VideoSubtitleWorkspace } from './VideoSubtitleWorkspace.jsx';
 import { VoiceLibrary } from './VoiceLibrary.jsx';
 
 export { buildVoiceActions, finalizeCharacterGeneration };
@@ -103,16 +104,27 @@ export function Studio() {
   const ttsRef = useRef(null);
   const [activeWorkspace, setActiveWorkspace] = useState('tts');
   const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
+  const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false });
+  const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript ? prev : next));
   }, []);
+  const handleSubtitleStateChange = useCallback(next => {
+    setSubtitleState(prev => (prev.busy === next.busy && prev.hasVideo === next.hasVideo ? prev : next));
+  }, []);
+  const handleSendToTts = useCallback(script => {
+    setExternalScript(script);
+    selectWorkspace('tts', setActiveWorkspace, ttsRef);
+  }, []);
+  const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
   const library = useVoiceLibrary();
   const anchorApi = useVoiceAnchors();
-  const canAutoReload = !libraryModal.open && !ttsState.busy && !ttsState.hasScript;
+  const canAutoReload = !libraryModal.open && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
   const versionCheck = useAppVersionCheck({ canAutoReload });
   const notices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
+  const subtitleNotices = <UpdateBanner visible={versionCheck.updateReady} onReload={versionCheck.reload} />;
   const shared = { library, anchorApi, refreshEngine, setLibraryModal, onTtsStateChange: handleTtsStateChange };
 
   return (
@@ -122,7 +134,10 @@ export function Studio() {
           onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
           onOpenLibrary={() => setLibraryModal({ open: true, openForm: false })} />
         <main className="studio-workspace">
-          <TextToSpeechWorkspace shared={shared} notices={notices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef} />
+          <TextToSpeechWorkspace shared={shared} notices={notices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
+            externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
+          <VideoSubtitleWorkspace notices={subtitleNotices} hidden={activeWorkspace !== 'subtitles'}
+            onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange} />
         </main>
       </div>
       <VoiceLibrary open={libraryModal.open} openSaveForm={libraryModal.openForm}

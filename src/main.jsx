@@ -15,6 +15,7 @@ import { createHttpVersionChecker } from './data/httpVersionChecker.js';
 import { createHttpVoiceRepository } from './data/httpVoiceRepository.js';
 import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepository.js';
 import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
+import { createMediaSubtitleGateway } from './data/mediaSubtitleGateway.js';
 import { createWebAudioDecoder } from './data/webAudioDecoder.js';
 import {
   createLockReferenceAudioUseCase,
@@ -45,9 +46,11 @@ function createStudioServices() {
   const anchorRepository = createDockerVoiceAnchorRepository({ localRepository: localAnchors, logger });
   const audioDecoder = createWebAudioDecoder();
   const versionChecker = createHttpVersionChecker({ logger });
+  const mediaSubtitleGateway = createMediaSubtitleGateway({ logger });
 
   return {
     speechGateway,
+    mediaSubtitleGateway,
     audioDecoder,
     versionChecker,
     logger,
