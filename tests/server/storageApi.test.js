@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createAudioMaster } from '../../server/audioMaster.js';
 import { createStorageHttpApp } from '../../server/httpApp.js';
 import { createStorageStore } from '../../server/storageStore.js';
 
@@ -64,12 +65,12 @@ async function invokeApp(handler, { method = 'GET', urlPath, headers = {}, body 
   };
 }
 
-async function withStorageHandler(run, rateLimitOptions = { maxRequests: 100 }) {
+async function withStorageHandler(run, rateLimitOptions = { maxRequests: 100 }, extra = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'voxcpm-storage-test-'));
   const silentLogger = { debug() {}, info() {}, warn() {}, error() {} };
-  const store = createStorageStore({ dataDir });
+  const store = createStorageStore({ dataDir, maxCacheEntries: extra.maxCacheEntries });
   await store.init();
-  const handler = createStorageHttpApp({ store, rateLimitOptions, logger: silentLogger });
+  const handler = createStorageHttpApp({ store, audioMaster: extra.audioMaster, rateLimitOptions, logger: silentLogger });
   try {
     return await run({ handler, dataDir, store });
   } finally {
@@ -207,4 +208,78 @@ test('storage API accepts legacy application/octet-stream WAV after verifying ma
     assert.equal(spoofedOctet.status, 422);
     assert.equal(spoofedOctet.json().error.code, 'INVALID_AUDIO_CONTENT');
   });
+});
+
+test('storage API masters audio via two-pass FFmpeg, handles unavailable/silent clips, and manages bounded LRU cache', async () => {
+  const wavBytes = createValidWavBytes([10, -10, 20, -20]);
+  const masteredOut = createValidWavBytes([50, -50, 60, -60]);
+  const calls = [];
+  let silentMode = false;
+  let unavailableMode = false;
+
+  const mockMaster = createAudioMaster({
+    async runProcess({ args }) {
+      calls.push(args);
+      if (unavailableMode) {
+        const err = new Error('not found');
+        err.code = 'ENOENT';
+        throw Object.assign(new (await import('../../server/audioMaster.js')).FfmpegUnavailableError(), {});
+      }
+      if (args.includes('-version')) return { stderr: 'ffmpeg version 7.0' };
+      if (args.includes('null')) {
+        return {
+          stderr: silentMode
+            ? '{"input_i":"-inf"}'
+            : 'Summary:\n{"input_i":"-22.4","input_lra":"4.0","input_tp":"-6.2","input_thresh":"-32.0","target_offset":"1.2"}',
+        };
+      }
+      const outPath = args[args.length - 1];
+      await writeFile(outPath, masteredOut);
+      return { stderr: '' };
+    },
+  });
+
+  await withStorageHandler(async ({ handler }) => {
+    const health = await invokeApp(handler, { urlPath: '/api/v1/health' });
+    assert.equal(health.json().data.ffmpegAvailable, true);
+
+    const form = new FormData();
+    form.set('audio', new File([wavBytes], 'take.wav', { type: 'audio/wav' }));
+    const masterRes = await invokeApp(handler, { method: 'POST', urlPath: '/api/v1/audio/master', body: form });
+    assert.equal(masterRes.status, 200);
+    assert.equal(masterRes.headers['x-audio-mastered'], 'ffmpeg-ebur128');
+    assert.deepEqual(new Uint8Array(masterRes.buffer), masteredOut);
+    assert.ok(calls.some(args => args.includes('-ar') && args.includes('48000')));
+
+    // Silent clip returns original WAV bytes safely
+    silentMode = true;
+    const silentForm = new FormData();
+    silentForm.set('audio', new File([wavBytes], 'silent.wav', { type: 'audio/wav' }));
+    const silentRes = await invokeApp(handler, { method: 'POST', urlPath: '/api/v1/audio/master', body: silentForm });
+    assert.equal(silentRes.status, 200);
+    assert.deepEqual(new Uint8Array(silentRes.buffer), wavBytes);
+
+    // Missing ffmpeg surfaces truthful 503
+    unavailableMode = true;
+    const unavailForm = new FormData();
+    unavailForm.set('audio', new File([wavBytes], 'x.wav', { type: 'audio/wav' }));
+    const unavailRes = await invokeApp(handler, { method: 'POST', urlPath: '/api/v1/audio/master', body: unavailForm });
+    assert.equal(unavailRes.status, 503);
+    assert.equal(unavailRes.json().error.code, 'FFMPEG_UNAVAILABLE');
+
+    // Synthesis cache put/get/invalid key & LRU eviction (maxCacheEntries: 2)
+    const k1 = 'a'.repeat(64);
+    const k2 = 'b'.repeat(64);
+    const k3 = 'c'.repeat(64);
+    for (const [k, seed] of [[k1, 1], [k2, 2], [k3, 3]]) {
+      const f = new FormData();
+      f.set('metadata', JSON.stringify({ characterId: 'char-malis', seed }));
+      f.set('audio', new File([wavBytes], `${k}.wav`, { type: 'audio/wav' }));
+      const putCache = await invokeApp(handler, { method: 'PUT', urlPath: `/api/v1/cache/${k}`, body: f });
+      assert.equal(putCache.status, 200);
+    }
+    assert.equal((await invokeApp(handler, { urlPath: `/api/v1/cache/${k1}` })).status, 404);
+    assert.equal((await invokeApp(handler, { urlPath: `/api/v1/cache/${k3}/audio` })).status, 200);
+    assert.equal((await invokeApp(handler, { urlPath: '/api/v1/cache/not-a-sha' })).status, 422);
+  }, { maxRequests: 100 }, { audioMaster: mockMaster, maxCacheEntries: 2 });
 });

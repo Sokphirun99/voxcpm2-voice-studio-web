@@ -4,6 +4,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { StorageError, ValidationError } from '../src/domain/errors.js';
+import { FfmpegUnavailableError, createAudioMaster } from './audioMaster.js';
 import { createServerLogger } from './logger.js';
 import { createRateLimiter } from './rateLimiter.js';
 
@@ -160,6 +161,7 @@ function decodePathId(rawSegment) {
  */
 function mapErrorToHttp(error) {
   if (error instanceof HttpApiError) return { status: error.status, code: error.code, message: error.message };
+  if (error instanceof FfmpegUnavailableError) return { status: 503, code: error.code, message: error.message };
   if (error instanceof ValidationError) {
     const status = error.code === 'UNSUPPORTED_AUDIO_TYPE' ? 415 : 422;
     return { status, code: error.code || 'VALIDATION_ERROR', message: error.message };
@@ -265,25 +267,95 @@ async function handleAnchorMutationRoutes({ req, res, url, store, requestId }) {
 }
 
 /**
+ * Writes binary WAV audio bytes with safe download headers.
+ * @param {object} spec - Response stream configuration.
+ */
+function sendBinaryAudio({ res, bytes, mimeType, requestId, extraHeaders = {} }) {
+  res.writeHead(200, {
+    'Content-Type': mimeType || 'audio/wav',
+    'Content-Length': String(bytes.byteLength),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Request-Id': requestId,
+    ...extraHeaders,
+  });
+  res.end(bytes);
+}
+
+/**
+ * Dispatches FFmpeg EBU R128 mastering endpoint (`POST /api/v1/audio/master`).
+ * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, audioMaster: object, requestId: string }} ctx - Route context.
+ * @returns {Promise<boolean>} True if route matched.
+ */
+async function handleAudioMasterRoute({ req, res, url, audioMaster, requestId }) {
+  if (url.pathname !== `${API_PREFIX}/audio/master` || req.method !== 'POST') return false;
+  if (!audioMaster) throw new FfmpegUnavailableError();
+  const parsed = await readMultipartAnchor(req);
+  const bytes = await audioMaster.masterWav({ bytes: parsed.bytes, mimeType: parsed.mimeType });
+  sendBinaryAudio({ res, bytes, mimeType: 'audio/wav', requestId, extraHeaders: { 'X-Audio-Mastered': 'ffmpeg-ebur128' } });
+  return true;
+}
+
+/**
+ * Dispatches bounded synthesis cache endpoints (`GET`, `PUT /api/v1/cache/:key`).
+ * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
+ * @returns {Promise<boolean>} True if route matched.
+ */
+async function handleCacheRoutes({ req, res, url, store, requestId }) {
+  const audioMatch = /^\/api\/v1\/cache\/([^/]+)\/audio$/.exec(url.pathname);
+  if (audioMatch && req.method === 'GET') {
+    const cached = await store.getCacheAudio(decodePathId(audioMatch[1]));
+    if (!cached) throw new HttpApiError(404, 'CACHE_MISS', 'Cached synthesis audio not found.');
+    sendBinaryAudio({ res, bytes: cached.bytes, mimeType: cached.meta.mimeType, requestId });
+    return true;
+  }
+  const metaMatch = /^\/api\/v1\/cache\/([^/]+)$/.exec(url.pathname);
+  if (!metaMatch) return false;
+  const key = decodePathId(metaMatch[1]);
+  if (req.method === 'GET') {
+    const entry = await store.getCacheEntry(key);
+    if (!entry) throw new HttpApiError(404, 'CACHE_MISS', 'Cached synthesis entry not found.');
+    sendJson({ res, status: 200, payload: { data: { hit: true, entry } }, requestId });
+    return true;
+  }
+  if (req.method !== 'PUT') return false;
+  const entry = await store.putCacheEntry({ key, ...(await readMultipartAnchor(req)) });
+  sendJson({ res, status: 200, payload: { data: { entry } }, requestId });
+  return true;
+}
+
+/**
+ * Resolves health or domain/audio routes inside the API gateway.
+ * @param {object} ctx - Dispatch context.
+ * @returns {Promise<void>} Resolves once response has been written.
+ */
+async function routeApiRequest(ctx) {
+  const { req, res, url, store, audioMaster, requestId } = ctx;
+  if (url.pathname === `${API_PREFIX}/health` && req.method === 'GET') {
+    const ffmpegAvailable = audioMaster ? await audioMaster.checkAvailability() : false;
+    sendJson({ res, status: 200, payload: { data: { status: 'ok', service: 'voice-studio-storage', ffmpegAvailable } }, requestId });
+    return;
+  }
+  const handled = (await handleCharacterRoutes(ctx))
+    || (await handleAnchorRoutes(ctx))
+    || (await handleAudioMasterRoute(ctx))
+    || (await handleCacheRoutes(ctx));
+  if (!handled) throw new HttpApiError(404, 'NOT_FOUND', 'Endpoint not found.');
+}
+
+/**
  * Routes a single API request and guarantees structured error/access logging.
  * @param {object} deps - Request handler dependencies.
  * @returns {Promise<void>} Resolves once response ends.
  */
-async function dispatchStorageRequest({ req, res, store, limiter, logger }) {
+async function dispatchStorageRequest({ req, res, store, audioMaster, limiter, logger }) {
   const startedAt = Date.now();
   const requestId = resolveRequestId(req);
   const url = new URL(req.url || '/', 'http://storage.local');
   try {
     const rate = limiter.check(resolveClientIp(req));
-    if (!rate.allowed) {
-      throw new HttpApiError(429, 'RATE_LIMIT_EXCEEDED', 'Too many storage requests. Retry shortly.', rate.retryAfterSeconds);
-    }
-    if (url.pathname === `${API_PREFIX}/health` && req.method === 'GET') {
-      sendJson({ res, status: 200, payload: { data: { status: 'ok', service: 'voice-studio-storage' } }, requestId });
-    } else if (!(await handleCharacterRoutes({ req, res, url, store, requestId }))
-      && !(await handleAnchorRoutes({ req, res, url, store, requestId }))) {
-      throw new HttpApiError(404, 'NOT_FOUND', 'Endpoint not found.');
-    }
+    if (!rate.allowed) throw new HttpApiError(429, 'RATE_LIMIT_EXCEEDED', 'Too many storage requests. Retry shortly.', rate.retryAfterSeconds);
+    await routeApiRequest({ req, res, url, store, audioMaster, requestId });
     logger.info('HTTP request completed', { method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }, requestId);
   } catch (error) {
     const mapped = mapErrorToHttp(error);
@@ -295,14 +367,15 @@ async function dispatchStorageRequest({ req, res, store, limiter, logger }) {
 
 /**
  * Creates the Node HTTP request listener for Voice Studio persistent backend storage.
- * Inputs: `{ store, rateLimitOptions, logger }`.
+ * Inputs: `{ store, audioMaster, rateLimitOptions, logger }`.
  * Outputs: `(req, res) => Promise<void>` HTTP handler.
- * Side effects: reads/writes `store`, applies per-IP rate limiting, emits structured JSON logs.
+ * Side effects: reads/writes `store`, invokes FFmpeg mastering if available, applies per-IP rate limiting, emits structured JSON logs.
  * Failure modes: converts all unhandled rejections into HTTP 500 JSON envelopes without crashing.
- * @param {{ store: object, rateLimitOptions?: object, logger?: object }} deps - App dependencies.
+ * @param {{ store: object, audioMaster?: object, rateLimitOptions?: object, logger?: object }} deps - App dependencies.
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>} Request handler.
  */
-export function createStorageHttpApp({ store, rateLimitOptions = {}, logger = createServerLogger() }) {
+export function createStorageHttpApp({ store, audioMaster, rateLimitOptions = {}, logger = createServerLogger() }) {
   const limiter = createRateLimiter(rateLimitOptions);
-  return (req, res) => dispatchStorageRequest({ req, res, store, limiter, logger });
+  const effectiveAudioMaster = audioMaster ?? createAudioMaster({ logger });
+  return (req, res) => dispatchStorageRequest({ req, res, store, audioMaster: effectiveAudioMaster, limiter, logger });
 }

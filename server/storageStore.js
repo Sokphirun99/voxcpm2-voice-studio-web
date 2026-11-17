@@ -16,11 +16,28 @@ import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
 const CATALOG_VERSION = 1;
 const CATALOG_FILE_NAME = 'catalog.json';
 const ANCHORS_DIR_NAME = 'anchors';
+const CACHE_DIR_NAME = 'cache';
+const CACHE_INDEX_FILE_NAME = 'cache-index.json';
 const SAFE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+const CACHE_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const DEFAULT_PAGE_LIMIT = 100;
 const MAX_PAGE_LIMIT = 200;
+const MAX_CACHE_ENTRIES = 100;
 const DEFAULT_AUDIO_MIME = 'audio/wav';
 const OCTET_STREAM_MIME = 'application/octet-stream';
+
+/**
+ * Validates that a cache key is a 64-character lowercase SHA-256 hex digest.
+ * @param {unknown} rawKey - Candidate cache key.
+ * @returns {string} Normalized cache key.
+ */
+export function assertSafeCacheKey(rawKey) {
+  const key = typeof rawKey === 'string' ? rawKey.trim().toLowerCase() : '';
+  if (!CACHE_KEY_PATTERN.test(key)) {
+    throw new ValidationError('Invalid synthesis cache key.', 'cacheKey', 'INVALID_CACHE_KEY');
+  }
+  return key;
+}
 
 /**
  * Validates that a character ID is non-empty and safe for filesystem and URL paths.
@@ -339,26 +356,134 @@ function softDeleteAnchorRecord(ctx, rawId) {
 }
 
 /**
+ * Loads synthesis cache metadata index or returns an empty entry map when absent.
+ * @param {string} indexPath - Path to `cache-index.json`.
+ * @returns {Promise<{ entries: Record<string, object> }>} Parsed cache index.
+ */
+async function loadCacheIndex(indexPath) {
+  try {
+    const raw = await readFile(indexPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return { entries: parsed?.entries && typeof parsed.entries === 'object' ? parsed.entries : {} };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { entries: {} };
+    throw new StorageError('Could not read synthesis cache index from disk.', error);
+  }
+}
+
+/**
+ * Evicts oldest LRU synthesis cache files when total cached takes exceed `maxEntries`.
+ * @param {object} ctx - Store internals.
+ * @param {Record<string, object>} entries - Mutable cache entry map.
+ * @param {number} maxEntries - Maximum allowed entries.
+ * @returns {Promise<void>} Resolves once overflow entries are removed.
+ */
+async function evictOverflowCacheEntries(ctx, entries, maxEntries) {
+  const ordered = Object.values(entries).sort((a, b) => (a.lastAccessedAt || 0) - (b.lastAccessedAt || 0));
+  while (ordered.length > maxEntries) {
+    const victim = ordered.shift();
+    if (!victim?.key) continue;
+    delete entries[victim.key];
+    await unlink(resolveSafeAnchorPath(ctx.cacheDir, `${victim.key}.wav`)).catch(err => {
+      if (err?.code !== 'ENOENT') throw err;
+    });
+  }
+}
+
+/**
+ * Formats a cached synthesis entry for public API metadata responses.
+ * @param {object} record - Cache index entry.
+ * @returns {object} Public cache summary.
+ */
+function toPublicCacheEntry(record) {
+  return {
+    key: record.key,
+    seed: record.seed ?? null,
+    characterId: record.characterId || null,
+    mimeType: record.mimeType || DEFAULT_AUDIO_MIME,
+    sizeBytes: record.sizeBytes,
+    created_at: record.created_at,
+    audioUrl: `/api/v1/cache/${record.key}/audio`,
+  };
+}
+
+/**
+ * Saves a mastered synthesis WAV clip into the bounded LRU cache on disk.
+ * @param {object} ctx - Store internals.
+ * @param {{ key: string, bytes: Uint8Array, mimeType?: string, metadata?: object }} input - Cache payload.
+ * @returns {Promise<object>} Stored public cache metadata.
+ */
+function saveCacheRecord(ctx, { key: rawKey, bytes, mimeType, metadata }) {
+  const key = assertSafeCacheKey(rawKey);
+  const validMime = validateAudioBytes({ bytes, mimeType });
+  return ctx.enqueueWrite(async () => {
+    await ctx.init();
+    await writeAtomicFile(resolveSafeAnchorPath(ctx.cacheDir, `${key}.wav`), bytes);
+    const index = await loadCacheIndex(ctx.cacheIndexPath);
+    const nowMs = Date.now();
+    const row = {
+      key,
+      characterId: typeof metadata?.characterId === 'string' ? metadata.characterId : null,
+      seed: Number.isFinite(Number(metadata?.seed)) ? Number(metadata.seed) : null,
+      mimeType: validMime,
+      sizeBytes: bytes.byteLength,
+      created_at: new Date(nowMs).toISOString(),
+      lastAccessedAt: nowMs,
+    };
+    index.entries[key] = row;
+    await evictOverflowCacheEntries(ctx, index.entries, ctx.maxCacheEntries);
+    await writeAtomicFile(ctx.cacheIndexPath, JSON.stringify(index, null, 2));
+    return toPublicCacheEntry(row);
+  });
+}
+
+/**
+ * Reads cached synthesis audio bytes and returns null if missing or expired on disk.
+ * @param {object} ctx - Store internals.
+ * @param {string} rawKey - Cache SHA-256 key.
+ * @returns {Promise<object|null>} Cached audio payload or null.
+ */
+async function readCacheAudioRecord(ctx, rawKey) {
+  const key = assertSafeCacheKey(rawKey);
+  const index = await loadCacheIndex(ctx.cacheIndexPath);
+  const record = index.entries[key];
+  if (!record) return null;
+  try {
+    const bytes = await readFile(resolveSafeAnchorPath(ctx.cacheDir, `${key}.wav`));
+    return { bytes, meta: toPublicCacheEntry(record) };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw new StorageError('Could not read cached audio from disk.', error);
+  }
+}
+
+/**
  * Creates a disk-backed persistent store for Voice Studio characters and original WAV voice anchors.
- * Inputs: `{ dataDir }`.
- * Outputs: serialized async store API (`init`, character & anchor CRUD with soft deletes).
- * Side effects: creates `dataDir/anchors`, writes `catalog.json` and audio binaries atomically.
+ * Inputs: `{ dataDir, maxCacheEntries }`.
+ * Outputs: serialized async store API (`init`, character & anchor CRUD with soft deletes, LRU synthesis cache).
+ * Side effects: creates `dataDir/anchors` and `dataDir/cache`, writes `catalog.json`, `cache-index.json`, and audio binaries atomically.
  * Failure modes: throws `ValidationError` on bad input or `StorageError` on IO failures.
- * @param {{ dataDir: string }} config - Storage configuration.
+ * @param {{ dataDir: string, maxCacheEntries?: number }} config - Storage configuration.
  * @returns {object} Persistent storage store.
  */
-export function createStorageStore({ dataDir }) {
+export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIES }) {
   const rootDir = path.resolve(dataDir);
   const anchorsDir = path.join(rootDir, ANCHORS_DIR_NAME);
+  const cacheDir = path.join(rootDir, CACHE_DIR_NAME);
   const catalogPath = path.join(rootDir, CATALOG_FILE_NAME);
+  const cacheIndexPath = path.join(rootDir, CACHE_INDEX_FILE_NAME);
   let writeChain = Promise.resolve();
   const enqueueWrite = task => {
     const run = writeChain.then(task, task);
     writeChain = run.catch(() => {});
     return run;
   };
-  const init = async () => { await mkdir(anchorsDir, { recursive: true }); await stat(anchorsDir); };
-  const ctx = { rootDir, anchorsDir, catalogPath, enqueueWrite, init };
+  const init = async () => {
+    await mkdir(anchorsDir, { recursive: true });
+    await mkdir(cacheDir, { recursive: true });
+    await stat(anchorsDir);
+  };
+  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, maxCacheEntries, enqueueWrite, init };
   return {
     init,
     dataDir: rootDir,
@@ -373,5 +498,8 @@ export function createStorageStore({ dataDir }) {
     upsertAnchor: input => saveAnchorRecord(ctx, input),
     patchAnchor: (rawId, patch) => patchAnchorRecord(ctx, rawId, patch),
     deleteAnchor: rawId => softDeleteAnchorRecord(ctx, rawId),
+    getCacheEntry: async rawKey => (await readCacheAudioRecord(ctx, rawKey))?.meta || null,
+    getCacheAudio: rawKey => readCacheAudioRecord(ctx, rawKey),
+    putCacheEntry: input => saveCacheRecord(ctx, input),
   };
 }

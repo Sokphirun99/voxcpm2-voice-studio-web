@@ -3,6 +3,7 @@
  */
 
 import http from 'node:http';
+import { createAudioMaster } from './audioMaster.js';
 import { createStorageHttpApp } from './httpApp.js';
 import { createServerLogger } from './logger.js';
 import { createStorageStore } from './storageStore.js';
@@ -28,10 +29,12 @@ export async function startStorageServer({
   const logger = createServerLogger('startup');
   const store = createStorageStore({ dataDir });
   await store.init();
+  const audioMaster = createAudioMaster({ logger });
+  const ffmpegAvailable = await audioMaster.checkAvailability();
 
-  const server = http.createServer(createStorageHttpApp({ store, logger }));
+  const server = http.createServer(createStorageHttpApp({ store, audioMaster, logger }));
   await new Promise(resolve => server.listen(port, host, resolve));
-  logger.info('Voice Studio storage service listening', { host, port, dataDir: store.dataDir });
+  logger.info('Voice Studio storage service listening', { host, port, dataDir: store.dataDir, ffmpegAvailable });
 
   const shutdown = signal => {
     logger.info('Shutting down storage service', { signal });
