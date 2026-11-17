@@ -25,7 +25,7 @@ function CharacterSelector({ characters, anchors, selectedId, onSelectId, onNewC
       </div>
       <div className="select-field">
         <Icon name="person" />
-        <select id="character-select" name="character" aria-describedby="character-help"
+        <select id="character-select" name="character"
           value={selectedId} onChange={event => onSelectId(event.target.value)}>
           {groups.map(([groupLabel, items]) => (
             <optgroup label={groupLabel} key={groupLabel}>
@@ -39,9 +39,6 @@ function CharacterSelector({ characters, anchors, selectedId, onSelectId, onNewC
         </select>
         <Icon name="chevron_down" className="select-chevron" />
       </div>
-      <p id="character-help" className="field-help">
-        Each character has one exclusive speaker voice that stays fixed across every script you generate.
-      </p>
     </div>
   );
 }
@@ -73,10 +70,10 @@ function UploadedTranscriptMatch({ anchor, disabled, transcriptRef, onUpdateAnch
 
 /**
  * Renders sample upload and reset actions for the active speaking character.
- * @param {{ hasAnchor: boolean, characterName: string, disabled: boolean, onUploadSample: (file: File) => void, onResetVoice: () => void }} props - Action props.
+ * @param {{ hasAnchor: boolean, disabled: boolean, onUploadSample: (file: File) => void, onResetVoice: () => void }} props - Action props.
  * @returns {React.ReactElement} Action buttons row.
  */
-function CharacterVoiceActions({ hasAnchor, characterName, disabled, onUploadSample, onResetVoice }) {
+function CharacterVoiceActions({ hasAnchor, disabled, onUploadSample, onResetVoice }) {
   const fileInput = useRef(null);
   return (
     <div className="character-actions-row">
@@ -89,7 +86,7 @@ function CharacterVoiceActions({ hasAnchor, characterName, disabled, onUploadSam
       <button type="button" className="button subtle-button upload-ref-button" id="upload-reference-audio"
         disabled={disabled} onClick={() => fileInput.current?.click()}>
         <Icon name="upload" />
-        <span>{hasAnchor ? `Replace ${characterName}'s sample…` : `Upload voice sample…`}</span>
+        <span>{hasAnchor ? 'Replace sample…' : 'Upload sample…'}</span>
       </button>
       {hasAnchor && (
         <button type="button" className="button subtle-button seed-helper-button" id="reset-character-voice"
@@ -102,31 +99,67 @@ function CharacterVoiceActions({ hasAnchor, characterName, disabled, onUploadSam
 }
 
 /**
- * Renders the active Character identity card displaying unique ID, lock status, persona traits, and sample actions.
+ * Renders the top identity header with character title, lock badge, and collapsible details toggle.
+ * @param {{ character: object, hasAnchor: boolean, detailsOpen: boolean, onToggleDetails: () => void, onCloseDetails: () => void }} props - Header props.
+ * @returns {React.ReactElement} Card header.
+ */
+function CharacterCardHeader({ character, hasAnchor, detailsOpen, onToggleDetails, onCloseDetails }) {
+  return (
+    <div className="character-card-head">
+      <div className="character-card-title">
+        <strong>{character.name}</strong>
+        {character.role && <span className="character-role-note">{character.role}</span>}
+      </div>
+      <div className="character-card-status">
+        <span className={hasAnchor ? 'anchor-badge' : 'design-badge'}>
+          {hasAnchor ? 'Voice locked' : 'Locks on 1st take'}
+        </span>
+        <button type="button" className="character-details-toggle" id="character-details-toggle"
+          aria-expanded={detailsOpen} aria-controls="character-details-panel" aria-label="Character details"
+          onClick={onToggleDetails} onKeyDown={event => { if (event.key === 'Escape') onCloseDetails(); }}>
+          <Icon name="chevron_down" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Renders collapsible secondary metadata, lock source, and exact-transcript controls.
+ * @param {object} props - Details panel props.
+ * @returns {React.ReactElement} Collapsible details block.
+ */
+function CharacterDetailsPanel({ character, anchor, busy, detailsOpen, transcriptRef, onUpdateAnchor }) {
+  const lockDetail = anchor?.source === 'upload'
+    ? `Locked sample: ${anchor.fileName}`
+    : 'Locked from 1st generated take';
+  return (
+    <div className="character-details-panel" id="character-details-panel" hidden={!detailsOpen}>
+      <span className="character-id-code">ID: {character.id}</span>
+      {character.traits && <span className="character-traits">{character.traits}</span>}
+      <p className="character-description-note">{character.description}</p>
+      {anchor?.blob && <p className="character-lock-source">{lockDetail}</p>}
+      <UploadedTranscriptMatch anchor={anchor} disabled={busy} transcriptRef={transcriptRef} onUpdateAnchor={onUpdateAnchor} />
+    </div>
+  );
+}
+
+/**
+ * Renders the layered Character identity card with primary controls visible and metadata collapsed by default.
  * @param {object} props - Card props.
  * @returns {React.ReactElement} Character card.
  */
 function CharacterIdentityCard({ character, anchor, busy, transcriptRef, onUploadSample, onResetVoice, onUpdateAnchor }) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const hasAnchor = Boolean(anchor?.blob);
-  const badgeText = hasAnchor ? 'Voice locked' : 'Locks on 1st take';
-  const lockDetail = anchor?.source === 'upload'
-    ? `Locked sample: ${anchor.fileName}`
-    : 'Locked to 1st generated take — same voice reused across scripts';
   return (
     <div className="character-card" id="active-character-card">
-      <div className="character-card-head">
-        <div>
-          <strong>{character.name}{character.role ? ` · ${character.role}` : ''}</strong>
-          <span className="character-id-code">ID: {character.id}</span>
-          <span className="character-traits">{character.traits}</span>
-        </div>
-        <span className={hasAnchor ? 'anchor-badge' : 'design-badge'}>{badgeText}</span>
-      </div>
-      <p className="character-description-note">{character.description}</p>
-      {hasAnchor && <p className="character-lock-source">{lockDetail}</p>}
-      <UploadedTranscriptMatch anchor={anchor} disabled={busy} transcriptRef={transcriptRef} onUpdateAnchor={onUpdateAnchor} />
-      <CharacterVoiceActions hasAnchor={hasAnchor} characterName={character.name} disabled={busy}
+      <CharacterCardHeader character={character} hasAnchor={hasAnchor} detailsOpen={detailsOpen}
+        onToggleDetails={() => setDetailsOpen(prev => !prev)} onCloseDetails={() => setDetailsOpen(false)} />
+      <CharacterVoiceActions hasAnchor={hasAnchor} disabled={busy}
         onUploadSample={onUploadSample} onResetVoice={onResetVoice} />
+      <CharacterDetailsPanel character={character} anchor={anchor} busy={busy} detailsOpen={detailsOpen}
+        transcriptRef={transcriptRef} onUpdateAnchor={onUpdateAnchor} />
     </div>
   );
 }
@@ -177,7 +210,6 @@ function InferenceSliders({ guidance, steps, onChange }) {
       </label>
       <input id="steps" name="steps" type="range" min={MIN_STEPS} max={MAX_STEPS} step="1"
         value={steps} onChange={event => onChange('steps', event.target.valueAsNumber)} />
-      <p className="field-help">Lower (4–6) generates faster when testing; 10 is the balanced default.</p>
     </>
   );
 }

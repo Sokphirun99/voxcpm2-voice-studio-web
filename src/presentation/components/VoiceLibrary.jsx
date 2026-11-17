@@ -38,7 +38,7 @@ function VoiceRowActions({ voice, isPinned, busy, onSelect, onDelete, onUnpin })
  * @returns {React.ReactElement} List item element.
  */
 function VoiceRow({ voice, isPinned, busy, onSelect, onDelete, onUnpin }) {
-  const metaParts = [voice.isBuiltIn ? 'Built-in character' : 'Custom character', CATEGORY_LABELS[voice.category], voice.traits, `ID: ${voice.id}`];
+  const metaParts = [voice.isBuiltIn ? 'Built-in' : 'Custom', CATEGORY_LABELS[voice.category], `ID: ${voice.id}`];
   return (
     <li>
       <div>
@@ -92,7 +92,7 @@ function VoiceAudioField({ audioFile, setAudioFile }) {
   }
   return (
     <label>
-      <span>Voice sample audio (optional — locks this exact person immediately)</span>
+      <span>Voice sample (optional)</span>
       <div className="save-file-picker">
         <input ref={fileInputRef} type="file" id="save-voice-audio" accept="audio/*"
           onChange={event => setAudioFile(event.currentTarget.files?.[0] || null)} />
@@ -196,7 +196,7 @@ function LibraryHeader({ showSaveForm, onOpenSave, onCloseClick }) {
     <div className="library-header">
       <div>
         <h2 id="library-title">Character library</h2>
-        <p id="library-description">Pick a speaking character or create your own. Each ID belongs exclusively to one person.</p>
+        <p id="library-description">Pick a character or create your own.</p>
       </div>
       <div className="library-header-actions">
         {!showSaveForm && (

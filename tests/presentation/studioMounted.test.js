@@ -450,6 +450,22 @@ test('mounted Studio auto-locks Take 1 voice for Take 2, ignores duplicate submi
     });
     assert.equal(anchorMap.has(CHAR_NISA.id), false);
     assert.match(container.querySelector('#active-character-card').textContent, /Locks on 1st take/);
+
+    // Character secondary details start closed and toggle cleanly on click
+    const detailsToggle = container.querySelector('#character-details-toggle');
+    const detailsPanel = container.querySelector('#character-details-panel');
+    assert.equal(detailsToggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(detailsPanel.hasAttribute('hidden'), true);
+    await act(async () => {
+      detailsToggle.dispatchEvent({ type: 'click', bubbles: true });
+    });
+    assert.equal(detailsToggle.getAttribute('aria-expanded'), 'true');
+    assert.equal(detailsPanel.hasAttribute('hidden'), false);
+    await act(async () => {
+      detailsToggle.dispatchEvent({ type: 'click', bubbles: true });
+    });
+    assert.equal(detailsToggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(detailsPanel.hasAttribute('hidden'), true);
   } finally {
     if (root) {
       await act(async () => { root.unmount(); });

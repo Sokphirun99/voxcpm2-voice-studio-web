@@ -101,6 +101,9 @@ test('VoiceControls displays locked dropdown label, uploaded filename, anchor wa
     assert.ok(html.includes('Locked sample: nisa-reference.mp3'));
     assert.ok(html.includes('Could not load saved character voices.'));
     assert.ok(html.includes('id="locked-transcript"'));
+    assert.equal(html.includes('id="character-help"'), false);
+    assert.match(html, /id="character-details-toggle"[^>]*aria-expanded="false"/);
+    assert.match(html, /id="character-details-panel"[^>]*hidden=""/);
     assert.match(html, /id="upload-reference-audio"[^>]*disabled=""/);
     assert.match(html, /id="reset-character-voice"[^>]*disabled=""/);
 
