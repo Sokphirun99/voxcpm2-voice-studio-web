@@ -12,9 +12,11 @@ services:
       - voice_studio_data:/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/api/v1/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
-      interval: 5s
+      interval: 30s
       timeout: 3s
-      retries: 5
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
 
   studio:
     build:
@@ -27,9 +29,11 @@ services:
       - "${VOICE_STUDIO_BIND:-0.0.0.0}:${VOICE_STUDIO_PORT:-8087}:80"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
-      interval: 5s
+      interval: 30s
       timeout: 3s
-      retries: 5
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
 
 volumes:
   voice_studio_data:

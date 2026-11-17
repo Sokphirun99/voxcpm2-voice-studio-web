@@ -70,7 +70,7 @@ async function withStorageHandler(run, rateLimitOptions = { maxRequests: 100 }, 
   const silentLogger = { debug() {}, info() {}, warn() {}, error() {} };
   const store = createStorageStore({ dataDir, maxCacheEntries: extra.maxCacheEntries });
   await store.init();
-  const handler = createStorageHttpApp({ store, audioMaster: extra.audioMaster, rateLimitOptions, logger: silentLogger });
+  const handler = createStorageHttpApp({ store, audioMaster: extra.audioMaster, rateLimitOptions, logger: extra.logger || silentLogger });
   try {
     return await run({ handler, dataDir, store });
   } finally {
@@ -282,4 +282,28 @@ test('storage API masters audio via two-pass FFmpeg, handles unavailable/silent 
     assert.equal((await invokeApp(handler, { urlPath: `/api/v1/cache/${k3}/audio` })).status, 200);
     assert.equal((await invokeApp(handler, { urlPath: '/api/v1/cache/not-a-sha' })).status, 422);
   }, { maxRequests: 100 }, { audioMaster: mockMaster, maxCacheEntries: 2 });
+});
+
+test('storage API skips noisy INFO logs on 200 /api/v1/health while keeping real request and error logs', async () => {
+  const events = [];
+  const captureLogger = {
+    debug(msg, ctx) { events.push({ level: 'debug', msg, ctx }); },
+    info(msg, ctx) { events.push({ level: 'info', msg, ctx }); },
+    warn(msg, ctx) { events.push({ level: 'warn', msg, ctx }); },
+    error(msg, ctx) { events.push({ level: 'error', msg, ctx }); },
+  };
+  await withStorageHandler(async ({ handler }) => {
+    const h1 = await invokeApp(handler, { urlPath: '/api/v1/health' });
+    assert.equal(h1.status, 200);
+    assert.equal(events.filter(e => e.level === 'info').length, 0);
+
+    const listRes = await invokeApp(handler, { urlPath: '/api/v1/characters' });
+    assert.equal(listRes.status, 200);
+    assert.equal(events.filter(e => e.level === 'info').length, 1);
+    assert.equal(events.find(e => e.level === 'info').ctx.path, '/api/v1/characters');
+
+    const limited = await invokeApp(handler, { urlPath: '/api/v1/health' });
+    assert.equal(limited.status, 429);
+    assert.equal(events.filter(e => e.level === 'error').length, 1);
+  }, { maxRequests: 2 }, { logger: captureLogger });
 });

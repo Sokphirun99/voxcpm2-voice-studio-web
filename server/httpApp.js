@@ -356,7 +356,9 @@ async function dispatchStorageRequest({ req, res, store, audioMaster, limiter, l
     const rate = limiter.check(resolveClientIp(req));
     if (!rate.allowed) throw new HttpApiError(429, 'RATE_LIMIT_EXCEEDED', 'Too many storage requests. Retry shortly.', rate.retryAfterSeconds);
     await routeApiRequest({ req, res, url, store, audioMaster, requestId });
-    logger.info('HTTP request completed', { method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }, requestId);
+    if (url.pathname !== `${API_PREFIX}/health`) {
+      logger.info('HTTP request completed', { method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }, requestId);
+    }
   } catch (error) {
     const mapped = mapErrorToHttp(error);
     const retryHeader = mapped.status === 429 ? { 'Retry-After': String(error?.retryAfterSeconds || 60) } : {};
