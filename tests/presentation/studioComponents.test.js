@@ -57,6 +57,8 @@ test('Studio SSR renders Narakeet-style Character UI without Voice type, Deliver
     assert.ok(html.includes('Locks on 1st take'));
     assert.ok(html.includes('Khmer example'));
     assert.ok(html.includes('Character library'));
+    assert.equal(html.includes('id="engine"'), false);
+    assert.equal(html.includes('VoxCPM2 online'), false);
     assert.ok(!/Voice type|Speaking speed|Conversation \(2/i.test(html));
   });
 });

@@ -684,16 +684,15 @@ test('mounted Studio pops up top offline banner with root cause and hides automa
       await new Promise(r => setTimeout(r, 20));
     });
 
-    assert.equal(container.querySelector('#engine').getAttribute('data-state'), 'offline');
+    assert.equal(container.querySelector('#engine'), null);
     assert.ok(container.querySelector('#engine-offline-banner'));
     assert.match(container.querySelector('#engine-offline-reason').textContent, /HTTP 502/);
 
-    // Dismiss hides banner while engine dot remains offline
+    // Dismiss hides banner cleanly
     await act(async () => {
       container.querySelector('#dismiss-engine-alert').dispatchEvent({ type: 'click', bubbles: true });
     });
     assert.equal(container.querySelector('#engine-offline-banner'), null);
-    assert.equal(container.querySelector('#engine').getAttribute('data-state'), 'offline');
 
     // Fresh mount recovering online via Retry removes offline banner completely
     const recoveryRootContainer = dom.doc.createElement('div');
@@ -710,7 +709,7 @@ test('mounted Studio pops up top offline banner with root cause and hides automa
         recoveryRootContainer.querySelector('#retry-engine-check').dispatchEvent({ type: 'click', bubbles: true });
         await new Promise(r => setTimeout(r, 20));
       });
-      assert.equal(recoveryRootContainer.querySelector('#engine').getAttribute('data-state'), 'ready');
+      assert.equal(recoveryRootContainer.querySelector('#engine'), null);
       assert.equal(recoveryRootContainer.querySelector('#engine-offline-banner'), null);
     } finally {
       await act(async () => { recoveryRoot.unmount(); });

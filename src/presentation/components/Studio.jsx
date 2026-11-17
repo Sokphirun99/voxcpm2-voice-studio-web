@@ -240,7 +240,7 @@ function StudioWorkspace({ state, ctrl, voiceActions }) {
 function StudioMain({ state, ctrl, voiceActions, onOpenLibrary }) {
   return (
     <div className="studio-window">
-      <Sidebar engine={state.engine} onFocusScript={() => state.scriptRef.current?.focus()} onOpenLibrary={onOpenLibrary} />
+      <Sidebar onFocusScript={() => state.scriptRef.current?.focus()} onOpenLibrary={onOpenLibrary} />
       <StudioWorkspace state={state} ctrl={ctrl} voiceActions={voiceActions} />
     </div>
   );
