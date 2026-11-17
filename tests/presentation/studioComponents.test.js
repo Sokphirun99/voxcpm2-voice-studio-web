@@ -103,6 +103,20 @@ test('VoiceControls displays locked dropdown label, uploaded filename, anchor wa
     assert.ok(html.includes('id="locked-transcript"'));
     assert.match(html, /id="upload-reference-audio"[^>]*disabled=""/);
     assert.match(html, /id="reset-character-voice"[^>]*disabled=""/);
+
+    const generatedHtml = renderToStaticMarkup(
+      React.createElement(VoiceControls, {
+        characters: BUILT_IN_VOICES,
+        anchors: { [CHAR_NISA.id]: { characterId: CHAR_NISA.id, source: 'generated', exactClone: false, promptText: 'សួស្តី', blob: new Blob(['RIFF']) } },
+        activeCharacter: CHAR_NISA,
+        activeAnchor: { characterId: CHAR_NISA.id, source: 'generated', exactClone: false, promptText: 'សួស្តី', blob: new Blob(['RIFF']) },
+        anchorWarning: null, busy: false,
+        options: { guidance: 2, steps: 10, seed: '', denoiseReference: false },
+        lastSeed: null, transcriptRef: { current: null },
+        actions: { onSelectCharacter() {}, onOpenNewCharacter() {}, onUploadSample() {}, onResetVoice() {}, onUpdateAnchor() {}, onChangeOption() {} },
+      })
+    );
+    assert.ok(generatedHtml.includes('id="exact-voice-match"'));
   });
 });
 

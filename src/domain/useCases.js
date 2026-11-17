@@ -234,20 +234,38 @@ function deleteCustomCharacter(voiceRepository, id) {
 }
 
 /**
- * Creates Character Library CRUD use cases backed by an injected VoiceRepositoryPort.
- * Inputs: `{ voiceRepository, idGenerator }`.
- * Outputs: `{ loadSaved(), saveCustom(input), deleteCustom(id) }`.
- * Side effects: reads/writes through injected `voiceRepository`.
- * Failure modes: throws ValidationError on invalid character input or StorageError on persistence failure.
- * @param {{ voiceRepository: import('./ports.js').VoiceRepositoryPort, idGenerator?: () => string }} deps - Injected repository.
- * @returns {{ loadSaved: () => { entries: Array<object>, warning: string|null }, saveCustom: (input: object) => { entry: object, entries: Array<object> }, deleteCustom: (id: string) => Array<object> }} Library use cases.
+ * Hydrates custom characters from an optional remote backend repository and caches them locally.
+ * @param {import('./ports.js').VoiceRepositoryPort} voiceRepository - Local voice repository.
+ * @param {object|null} remoteRepository - Optional remote character sync adapter.
+ * @returns {Promise<{ entries: Array<object>, warning: string|null }|null>} Merged library state or null if unavailable.
  */
-export function createVoiceLibraryUseCases({ voiceRepository, idGenerator = defaultIdGenerator }) {
+async function syncCustomCharactersFromRemote(voiceRepository, remoteRepository) {
+  if (!remoteRepository) return null;
+  const { entries: localEntries } = voiceRepository.loadSavedEntries();
+  const merged = await remoteRepository.syncWithLocal(localEntries);
+  if (!merged) return null;
+  voiceRepository.saveEntries(merged);
+  return { entries: merged, warning: null };
+}
+
+/**
+ * Creates Character Library CRUD use cases backed by an injected VoiceRepositoryPort and optional remote backend.
+ * Inputs: `{ voiceRepository, remoteRepository, idGenerator }`.
+ * Outputs: `{ loadSaved(), saveCustom(input), deleteCustom(id), syncSavedFromRemote(), persistCustomRemote(entry), deleteCustomRemote(id) }`.
+ * Side effects: reads/writes through injected `voiceRepository` and optional `remoteRepository`.
+ * Failure modes: throws ValidationError on invalid character input or StorageError on persistence failure.
+ * @param {{ voiceRepository: import('./ports.js').VoiceRepositoryPort, remoteRepository?: object|null, idGenerator?: () => string }} deps - Injected repositories.
+ * @returns {object} Library use cases.
+ */
+export function createVoiceLibraryUseCases({ voiceRepository, remoteRepository = null, idGenerator = defaultIdGenerator }) {
   assertPort(voiceRepository, 'voiceRepository', ['loadSavedEntries', 'saveEntries']);
   return {
     loadSaved: () => voiceRepository.loadSavedEntries(),
     saveCustom: input => saveCustomCharacter(voiceRepository, idGenerator, input),
     deleteCustom: id => deleteCustomCharacter(voiceRepository, id),
+    syncSavedFromRemote: () => syncCustomCharactersFromRemote(voiceRepository, remoteRepository),
+    persistCustomRemote: entry => (remoteRepository ? remoteRepository.upsertRemoteEntry(entry) : Promise.resolve(entry)),
+    deleteCustomRemote: id => (remoteRepository ? remoteRepository.deleteRemoteEntry(id) : Promise.resolve()),
   };
 }
 

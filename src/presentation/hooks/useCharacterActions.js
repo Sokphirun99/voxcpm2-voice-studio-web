@@ -154,6 +154,7 @@ function rollbackSavedVoice(entryId, library, logger) {
   } catch (rollbackError) {
     logger.error('useCharacterActions.handleCreateCharacter.rollback', rollbackError, { characterId: entryId });
   }
+  void library.deleteVoiceRemote?.(entryId).catch(err => logger.error('useCharacterActions.handleCreateCharacter.remoteRollback', err, { characterId: entryId }));
 }
 
 /**
@@ -166,16 +167,17 @@ async function createCharacterWithAnchor(input, ctx) {
   const { lockReferenceAudio, library, anchorApi, logger, onCharacterSelected, onCloseLibrary, synthesis } = ctx;
   const validatedAudio = input.audioFile ? await lockReferenceAudio.execute(input.audioFile) : null;
   const entry = library.saveVoice(input);
-  if (validatedAudio) {
-    try {
+  try {
+    await library.saveVoiceRemote?.(entry);
+    if (validatedAudio) {
       await anchorApi.pinCharacterAnchor({
         characterId: entry.id, label: entry.name, blob: validatedAudio.blob,
         fileName: validatedAudio.fileName, source: 'upload', promptText: '', exactClone: false,
       });
-    } catch (error) {
-      rollbackSavedVoice(entry.id, library, logger);
-      throw error;
     }
+  } catch (error) {
+    rollbackSavedVoice(entry.id, library, logger);
+    throw error;
   }
   onCharacterSelected(entry.id);
   onCloseLibrary();
@@ -213,6 +215,7 @@ async function deleteCharacterWithAnchor(id, ctx) {
   if (!id) return;
   const label = formatCharacterLabel(ctx.library.allVoices, id);
   try {
+    await ctx.library.deleteVoiceRemote?.(id);
     ctx.library.deleteVoice(id);
   } catch (error) {
     ctx.logger.error('useCharacterActions.handleDeleteCharacter', error, { id });

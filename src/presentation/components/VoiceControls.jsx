@@ -47,12 +47,12 @@ function CharacterSelector({ characters, anchors, selectedId, onSelectId, onNewC
 }
 
 /**
- * Renders optional exact-transcript cloning inputs when the character uses an uploaded audio file.
+ * Renders optional exact-transcript cloning inputs for any locked character voice (generated or uploaded).
  * @param {{ anchor: object, disabled: boolean, transcriptRef: object, onUpdateAnchor: (patch: object) => void }} props - Exact match props.
  * @returns {React.ReactElement|null} Transcript controls or null.
  */
 function UploadedTranscriptMatch({ anchor, disabled, transcriptRef, onUpdateAnchor }) {
-  if (anchor?.source !== 'upload') return null;
+  if (!anchor?.blob) return null;
   const isExact = Boolean(anchor.exactClone);
   return (
     <div className="locked-voice-options">
@@ -63,7 +63,7 @@ function UploadedTranscriptMatch({ anchor, disabled, transcriptRef, onUpdateAnch
       </label>
       {isExact && (
         <textarea ref={transcriptRef} id="locked-transcript" className="locked-transcript" rows={2}
-          disabled={disabled} placeholder="Transcript spoken in the uploaded audio sample…"
+          disabled={disabled} placeholder="Transcript spoken in the locked voice sample…"
           value={anchor.promptText || ''}
           onChange={event => onUpdateAnchor({ promptText: event.target.value })} />
       )}
