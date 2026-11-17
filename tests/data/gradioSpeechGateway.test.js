@@ -27,6 +27,7 @@ test('extractErrorDetail and translateServerError surface real error causes with
   assert.match(translateServerError('Queue is full. Max size is 10.', 503), /queue is full/i);
   assert.match(translateServerError('MPS backend out of memory'), /ran out of GPU or system memory/i);
   assert.match(translateServerError('HfHubHTTPError: 401 Client Error for weights'), /model weights/i);
+  assert.match(translateServerError('RuntimeError: Audio denoising processing failed: Could not load libtorchcodec'), /noise cleanup failed.*denoiser/i);
   assert.match(translateServerError('InvalidPathError: not uploaded by a user'), /expired on the server/i);
   const stripped = translateServerError('Traceback (most recent call last):\nFile "/Users/dev/app.py", line 10\nValueError: bad pitch');
   assert.ok(!stripped.includes('Traceback'));

@@ -28,6 +28,7 @@ const ERROR_PATTERNS = [
   { pattern: /queue is stopped|server stopped/i, message: 'The VoxCPM2 engine stopped. Restart app.py and try again.' },
   { pattern: /not uploaded by a user|cannot move .* gradio cache/i, message: 'The locked reference audio expired on the server. Unlock and re-lock or re-upload the clip.' },
   { pattern: /out of memory|\boom\b|mps backend out of memory|cuda error/i, message: 'VoxCPM2 ran out of GPU or system memory. Try shorter text or free memory.' },
+  { pattern: /audio denoising processing failed|libtorchcodec|torchcodec/i, message: 'Voice sample noise cleanup failed in the VoxCPM2 denoiser (FFmpeg/TorchCodec runtime issue). Check engine logs or disable noise cleanup and retry.' },
   { pattern: /huggingface|hf_hub|connection|timed out|readtimeout|repository|weights|no such file|filenotfound/i, message: 'VoxCPM2 could not load its model weights. Check the app.py terminal for details.' },
   { pattern: /input text to synthesize/i, message: 'Enter text before generating speech.' },
 ];
