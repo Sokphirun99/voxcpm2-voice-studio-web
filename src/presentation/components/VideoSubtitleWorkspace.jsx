@@ -62,14 +62,17 @@ function MediaOfflineBanner({ health, onRefresh }) {
 }
 
 function VideoPreviewCard({ ctrl }) {
-  const { videoRef, vttUrl, useTranslation, selectVideoFile } = ctrl;
-  const { videoFile, videoUrl, detectedLanguage, busyAction } = ctrl.state;
+  const { videoRef, vttUrl, useTranslation, selectVideoFile, handleVideoMetadata } = ctrl;
+  const { videoFile, videoUrl, videoSize, detectedLanguage, busyAction } = ctrl.state;
   const busy = Boolean(busyAction);
+  const isPortrait = Boolean(videoSize && videoSize.height > videoSize.width);
+  const aspectStyle = videoSize ? { '--video-aspect': `${videoSize.width} / ${videoSize.height}` } : undefined;
   return (
     <section className="subtitle-video-card" aria-label="Video preview">
       {videoUrl ? (
-        <div className="subtitle-video-frame">
-          <video ref={videoRef} src={videoUrl} controls playsInline className="subtitle-video-player">
+        <div className="subtitle-video-frame" data-orientation={isPortrait ? 'portrait' : 'landscape'} style={aspectStyle}>
+          <video ref={videoRef} src={videoUrl} controls playsInline className="subtitle-video-player"
+            onLoadedMetadata={e => handleVideoMetadata?.(e.currentTarget)}>
             {vttUrl && (
               <track key={vttUrl} kind="subtitles" src={vttUrl}
                 srcLang={useTranslation ? 'km' : (detectedLanguage || 'en')}

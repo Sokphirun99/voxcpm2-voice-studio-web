@@ -331,6 +331,13 @@ export function useVideoSubtitles({ onStateChange } = {}) {
     void el.play?.().catch(() => {});
   }, []);
 
+  const handleVideoMetadata = useCallback(videoEl => {
+    const width = Number(videoEl?.videoWidth) || 0;
+    const height = Number(videoEl?.videoHeight) || 0;
+    if (width <= 0 || height <= 0) return;
+    setState(prev => ({ ...prev, videoSize: { width, height } }));
+  }, []);
+
   const exportFile = useCallback(format => {
     const spec = { segments: state.segments, speakerNames: state.speakerNames, includeSpeaker: state.options.includeSpeaker, useTranslation };
     if (format === 'srt') {
@@ -379,6 +386,7 @@ export function useVideoSubtitles({ onStateChange } = {}) {
     updateSpeakerName,
     updateSegment,
     seekToSegment,
+    handleVideoMetadata,
     exportFile,
     copyDialogue,
     getTtsScript,
