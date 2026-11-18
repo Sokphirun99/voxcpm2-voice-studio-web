@@ -829,6 +829,51 @@ test('Sidebar SSR renders both Text to speech and Video to subtitle function swi
     assert.ok(html.includes('Text to speech'));
     assert.ok(html.includes('Video to subtitle'));
     assert.ok(html.includes('id="open-voice-library"'));
+    const charActiveHtml = renderToStaticMarkup(
+      React.createElement(Sidebar, { activeWorkspace: 'characters', onSelectWorkspace() {} })
+    );
+    assert.match(charActiveHtml, /id="open-voice-library"[^>]*aria-current="page"/);
+  });
+});
+
+test('CharacterLibraryWorkspace SSR renders standalone directory and create mode', async () => {
+  await withViteSsr(async vite => {
+    const { CharacterLibraryWorkspace } = await vite.ssrLoadModule('/src/presentation/components/CharacterLibraryWorkspace.jsx');
+    const browseHtml = renderToStaticMarkup(
+      React.createElement(CharacterLibraryWorkspace, {
+        hidden: false,
+        showSaveForm: false,
+        activeCharacter: CHAR_NISA,
+        selectedCharacterId: CHAR_NISA.id,
+        library: {
+          matches: [CHAR_NISA, CHAR_SOVATH],
+          warning: null,
+          filters: { search: '', source: '', category: '' },
+          updateFilter() {},
+        },
+        anchors: {},
+        busy: false,
+        status: { message: '', error: false },
+      })
+    );
+    assert.ok(browseHtml.includes('id="voice-library"'));
+    assert.ok(browseHtml.includes('id="new-saved-voice"'));
+    assert.ok(browseHtml.includes('library-active-badge'));
+    assert.ok(browseHtml.includes('id="character-status"'));
+
+    const formHtml = renderToStaticMarkup(
+      React.createElement(CharacterLibraryWorkspace, {
+        hidden: false,
+        showSaveForm: true,
+        activeCharacter: CHAR_NISA,
+        selectedCharacterId: CHAR_NISA.id,
+        library: { matches: [], warning: null, filters: { search: '', source: '', category: '' }, updateFilter() {} },
+        anchors: {},
+      })
+    );
+    assert.ok(formHtml.includes('id="cancel-create-character"'));
+    assert.ok(formHtml.includes('id="save-voice-name"'));
+    assert.equal(formHtml.includes('id="library-results"'), false);
   });
 });
 

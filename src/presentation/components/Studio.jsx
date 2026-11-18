@@ -1,17 +1,19 @@
 /**
- * @fileoverview Top-level Voice Studio shell coordinating independent function workspaces and shared services.
+ * @fileoverview Top-level Voice Studio shell coordinating independent function workspaces and shared Character Library state.
  */
 
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
+import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
+import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
+import { CharacterLibraryWorkspace } from './CharacterLibraryWorkspace.jsx';
 import { Icon } from './Icon.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
 import { VideoSubtitleWorkspace } from './VideoSubtitleWorkspace.jsx';
-import { VoiceLibrary } from './VoiceLibrary.jsx';
 
 export { buildVoiceActions, finalizeCharacterGeneration };
 
@@ -56,11 +58,6 @@ export function EngineAlertBanner({ visible, reason, checking = false, onRetry, 
   );
 }
 
-/**
- * Renders top engine-offline and app-update notices shared across function workspaces.
- * @param {{ engineMeta: object, refreshEngine: () => void, versionCheck: object }} props - Notice state.
- * @returns {React.ReactElement} Workspace notices container.
- */
 function WorkspaceNotices({ engineMeta, refreshEngine, versionCheck }) {
   return (
     <div className="workspace-notices">
@@ -71,39 +68,65 @@ function WorkspaceNotices({ engineMeta, refreshEngine, versionCheck }) {
   );
 }
 
-/**
- * Handles selecting a workspace function and returning focus cleanly to TTS when appropriate.
- * @param {string} id - Target workspace identifier.
- * @param {Function} setActiveWorkspace - Workspace state setter.
- * @param {{ current: object|null }} ttsRef - Active TTS workspace actions ref.
- */
 function selectWorkspace(id, setActiveWorkspace, ttsRef) {
   setActiveWorkspace(id);
   if (id === 'tts') ttsRef.current?.focusScript?.();
 }
 
-/**
- * Unpins a locked voice anchor and clears its locked TTS seed consistently.
- * @param {string} id - Character ID to reset.
- * @param {{ current: object|null }} ttsRef - TTS actions ref.
- */
-function resetSharedCharacterVoice(id, ttsRef) {
-  clearCharacterLockedSeed(ttsRef.current?.setLockedSeeds, id);
-  void ttsRef.current?.actions?.handleResetVoice(id);
+function useSharedCharacterCatalog({ ttsRef, setActiveWorkspace }) {
+  const library = useVoiceLibrary();
+  const anchorApi = useVoiceAnchors();
+  const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
+  const [lockedSeeds, setLockedSeeds] = useState({});
+  const [characterStatus, setCharacterStatus] = useState({ message: '', error: false });
+  const [formState, setFormState] = useState({ open: false, returnTo: '' });
+  const formStateRef = useRef(formState);
+  formStateRef.current = formState;
+
+  const activeCharacter = useMemo(
+    () => findCharacterById(library.allVoices, selectedCharacterId),
+    [library.allVoices, selectedCharacterId]
+  );
+  const activeAnchor = anchorApi.anchors[activeCharacter.id] || null;
+  const closeCreateForm = useCallback(() => {
+    const returnTo = formStateRef.current.returnTo;
+    setFormState({ open: false, returnTo: '' });
+    if (returnTo) selectWorkspace(returnTo, setActiveWorkspace, ttsRef);
+  }, [setActiveWorkspace, ttsRef]);
+  const handleStatus = useCallback(next => {
+    setCharacterStatus(next);
+    ttsRef.current?.setStatus?.(next);
+  }, [ttsRef]);
+
+  const actions = useCharacterActions({
+    activeCharacter,
+    library,
+    anchorApi,
+    onCharacterSelected: setSelectedCharacterId,
+    onClearLockedSeed: id => clearCharacterLockedSeed(setLockedSeeds, id),
+    onCancelCharacterSynthesis: id => ttsRef.current?.cancelIfCharacter?.(id),
+    onCharacterUsed: () => selectWorkspace('tts', setActiveWorkspace, ttsRef),
+    onStatus: handleStatus,
+  });
+
+  return {
+    library, anchorApi, selectedCharacterId, activeCharacter, activeAnchor,
+    lockedSeeds, setLockedSeeds, characterStatus, actions,
+    formState, setFormState, closeCreateForm,
+  };
 }
 
 /**
- * Coordinates the multi-function Voice Studio shell, shared Character Library, and active workspaces.
+ * Coordinates the three standalone Voice Studio workspaces and shared Character Catalog.
  * Inputs: none (consumes Studio services via hooks).
  * Outputs: complete Voice Studio application shell.
- * Side effects: mounts function workspaces, engine status monitor, version checker, and library modal.
- * Failure modes: per-workspace errors are surfaced cleanly within each function workspace.
+ * Side effects: mounts TTS, Video-to-Subtitle, and Character Library workspaces plus update/engine monitors.
+ * Failure modes: per-workspace errors surface cleanly inside each workspace's status bar/banner.
  * @returns {React.ReactElement} Studio application root.
  */
 export function Studio() {
   const ttsRef = useRef(null);
   const [activeWorkspace, setActiveWorkspace] = useState('tts');
-  const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
   const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
@@ -119,35 +142,61 @@ export function Studio() {
   }, []);
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
-  const library = useVoiceLibrary();
-  const anchorApi = useVoiceAnchors();
-  const canAutoReload = !libraryModal.open && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
+  const catalog = useSharedCharacterCatalog({ ttsRef, setActiveWorkspace });
+  const canAutoReload = !catalog.formState.open && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
   const versionCheck = useAppVersionCheck({ canAutoReload });
-  const notices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
-  const subtitleNotices = <UpdateBanner visible={versionCheck.updateReady} onReload={versionCheck.reload} />;
-  const shared = { library, anchorApi, refreshEngine, setLibraryModal, onTtsStateChange: handleTtsStateChange };
+  const ttsNotices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
+  const updateBanner = <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />;
+
+  const handleSelectWorkspace = useCallback(id => {
+    if (id === 'characters') catalog.setFormState(prev => ({ ...prev, open: false, returnTo: '' }));
+    selectWorkspace(id, setActiveWorkspace, ttsRef);
+  }, [catalog]);
+
+  const handleOpenNewFromTts = useCallback(() => {
+    catalog.setFormState({ open: true, returnTo: 'tts' });
+    setActiveWorkspace('characters');
+  }, [catalog]);
+
+  const sharedTts = {
+    library: catalog.library,
+    anchorApi: catalog.anchorApi,
+    activeCharacter: catalog.activeCharacter,
+    activeAnchor: catalog.activeAnchor,
+    lockedSeeds: catalog.lockedSeeds,
+    setLockedSeeds: catalog.setLockedSeeds,
+    characterActions: catalog.actions,
+    refreshEngine,
+    onOpenNewCharacter: handleOpenNewFromTts,
+    onTtsStateChange: handleTtsStateChange,
+  };
 
   return (
-    <>
-      <div className="studio-window">
-        <Sidebar activeWorkspace={activeWorkspace} workspaces={DEFAULT_WORKSPACES}
-          onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
-          onOpenLibrary={() => setLibraryModal({ open: true, openForm: false })} />
-        <main className="studio-workspace">
-          <TextToSpeechWorkspace shared={shared} notices={notices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
-            externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
-          <VideoSubtitleWorkspace notices={subtitleNotices} hidden={activeWorkspace !== 'subtitles'}
-            onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange} />
-        </main>
-      </div>
-      <VoiceLibrary open={libraryModal.open} openSaveForm={libraryModal.openForm}
-        busy={ttsState.busy}
-        library={library} anchors={anchorApi.anchors}
-        onSelectVoice={voice => void ttsRef.current?.actions?.handleSelectCharacter(voice)}
-        onCreateCharacter={input => ttsRef.current?.actions?.handleCreateCharacter(input)}
-        onDeleteCharacter={id => void ttsRef.current?.actions?.handleDeleteCharacter(id)}
-        onUnpinAnchor={id => resetSharedCharacterVoice(id, ttsRef)}
-        onClose={() => setLibraryModal({ open: false, openForm: false })} />
-    </>
+    <div className="studio-window">
+      <Sidebar activeWorkspace={activeWorkspace} workspaces={DEFAULT_WORKSPACES} onSelectWorkspace={handleSelectWorkspace} />
+      <main className="studio-workspace">
+        <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
+          externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
+        <VideoSubtitleWorkspace notices={updateBanner} hidden={activeWorkspace !== 'subtitles'}
+          onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange} />
+        <CharacterLibraryWorkspace
+          hidden={activeWorkspace !== 'characters'}
+          showSaveForm={catalog.formState.open}
+          activeCharacter={catalog.activeCharacter}
+          selectedCharacterId={catalog.selectedCharacterId}
+          library={catalog.library}
+          anchors={catalog.anchorApi.anchors}
+          busy={ttsState.busy}
+          status={catalog.characterStatus}
+          notices={updateBanner}
+          onOpenSave={() => catalog.setFormState({ open: true, returnTo: '' })}
+          onCancelSave={catalog.closeCreateForm}
+          onSelectVoice={voice => catalog.actions.handleSelectCharacter(voice, { fromLibrary: true })}
+          onCreateCharacter={input => catalog.actions.handleCreateCharacter(input)}
+          onDeleteCharacter={id => void catalog.actions.handleDeleteCharacter(id)}
+          onUnpinAnchor={id => void catalog.actions.handleResetVoice(id)}
+        />
+      </main>
+    </div>
   );
 }

@@ -38,13 +38,14 @@ function VoiceRowActions({ voice, isPinned, busy, onSelect, onDelete, onUnpin })
  * @param {{ voice: object, isPinned: boolean, busy: boolean, onSelect: (voice: object) => void, onDelete: (id: string) => void, onUnpin: (id: string) => void }} props - Row props.
  * @returns {React.ReactElement} List item element.
  */
-function VoiceRow({ voice, isPinned, busy, onSelect, onDelete, onUnpin }) {
+function VoiceRow({ voice, isPinned, isSelected, busy, onSelect, onDelete, onUnpin }) {
   const metaParts = [voice.isBuiltIn ? 'Built-in' : 'Custom', CATEGORY_LABELS[voice.category], `ID: ${voice.id}`];
   return (
     <li>
       <div>
         <div className="library-name-row">
           <strong>{voice.name}{voice.role ? ` — ${voice.role}` : ''}</strong>
+          {isSelected && <span className="library-active-badge">Active</span>}
           {isPinned && <span className="anchor-badge">Voice locked</span>}
         </div>
         <span className="library-meta">{metaParts.filter(Boolean).join(' · ')}</span>
@@ -170,7 +171,7 @@ function SaveFormActions({ error, submitting, onCancel }) {
  * @param {{ onSave: (input: object) => Promise<void>, onCancel: () => void }} props - Form props.
  * @returns {React.ReactElement} Form element.
  */
-function SaveVoiceForm({ onSave, onCancel }) {
+export function SaveVoiceForm({ onSave, onCancel }) {
   const [name, setName] = useState('');
   const [category, setCategory] = useState('female');
   const [description, setDescription] = useState('');
@@ -313,12 +314,12 @@ function useLibraryDialogSync(dialog, open, openSaveForm, setShowSaveForm) {
  * @param {object} props - Scroll ref, matches, anchors, busy flag, and row callbacks.
  * @returns {React.ReactElement} Scrollable results list.
  */
-function LibraryResultsList({ scroller, matches, anchors, busy, onSelectVoice, onDeleteCharacter, onUnpinAnchor }) {
+function LibraryResultsList({ scroller, matches, anchors, selectedCharacterId, busy, onSelectVoice, onDeleteCharacter, onUnpinAnchor }) {
   return (
     <div className="library-scroll" ref={scroller}>
       <ul className="library-results" id="library-results" aria-label="Available characters">
         {matches.map(voice => (
-          <VoiceRow voice={voice} key={voice.id} isPinned={Boolean(anchors?.[voice.id])} busy={busy}
+          <VoiceRow voice={voice} key={voice.id} isPinned={Boolean(anchors?.[voice.id])} isSelected={voice.id === selectedCharacterId} busy={busy}
             onSelect={onSelectVoice} onDelete={onDeleteCharacter} onUnpin={onUnpinAnchor} />
         ))}
       </ul>
@@ -338,16 +339,16 @@ function applyLibraryFilterChange(event, updateFilter, scroller) {
 }
 
 /**
- * Renders searchable character filters, count status, and scrollable rows inside the Character Library dialog.
+ * Renders searchable character filters, count status, and scrollable rows inside the Character Library view.
  * @param {object} props - Library filters, list refs, anchors, busy state, and row callbacks.
  * @returns {React.ReactElement} Browse view fragment.
  */
-function LibraryBrowseSection({ filters, scroller, matches, warning, storageStats, anchors, busy, updateFilter, onSelectVoice, onDeleteCharacter, onUnpinAnchor }) {
+export function LibraryBrowseSection({ filters, scroller, matches, warning, storageStats, anchors, selectedCharacterId = '', busy, updateFilter, onSelectVoice, onDeleteCharacter, onUnpinAnchor }) {
   return (
     <>
       <LibraryFilters filters={filters} onFilterChange={event => applyLibraryFilterChange(event, updateFilter, scroller)} />
       <p className="library-count" id="library-status" role="status">{formatLibraryStatus(matches.length, warning, storageStats)}</p>
-      <LibraryResultsList scroller={scroller} matches={matches} anchors={anchors} busy={busy}
+      <LibraryResultsList scroller={scroller} matches={matches} anchors={anchors} selectedCharacterId={selectedCharacterId} busy={busy}
         onSelectVoice={onSelectVoice} onDeleteCharacter={onDeleteCharacter} onUnpinAnchor={onUnpinAnchor} />
     </>
   );

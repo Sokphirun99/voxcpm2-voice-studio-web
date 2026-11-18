@@ -2,11 +2,10 @@
  * @fileoverview Standalone Text-to-Speech function workspace managing scripts, character voices, and playback.
  */
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
-import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
 import { useStudioServices } from '../StudioContext.jsx';
-import { resolveEffectiveSeed, useCharacterActions } from '../hooks/useCharacterActions.js';
+import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
@@ -129,10 +128,10 @@ function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, a
  * @param {object} deps - Bound character action dependencies.
  * @returns {object} VoiceControls action callbacks.
  */
-export function buildVoiceActions({ actions, activeCharacter, setLibraryModal, setOptions, setLockedSeeds }) {
+export function buildVoiceActions({ actions, activeCharacter, onOpenNewCharacter, setLibraryModal, setOptions, setLockedSeeds }) {
   return {
     onSelectCharacter: actions.handleSelectCharacter,
-    onOpenNewCharacter: () => setLibraryModal({ open: true, openForm: true }),
+    onOpenNewCharacter: () => (onOpenNewCharacter ? onOpenNewCharacter() : setLibraryModal?.({ open: true, openForm: true })),
     onUploadSample: file => { clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id); void actions.handleUploadSample(file); },
     onResetVoice: () => { clearCharacterLockedSeed(setLockedSeeds, activeCharacter.id); void actions.handleResetVoice(activeCharacter.id); },
     onUpdateAnchor: patch => void actions.handleUpdateAnchor(activeCharacter.id, patch),
@@ -220,7 +219,18 @@ function TtsSpeechForm({ state, ctrl, voiceActions }) {
  * @returns {object} Combined workspace state and controller handles.
  */
 function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume }) {
-  const { library, anchorApi, refreshEngine, setLibraryModal, externalScript: sharedScript, onConsumeExternalScript: sharedConsume, onTtsStateChange } = shared;
+  const {
+    library,
+    anchorApi,
+    activeCharacter,
+    activeAnchor,
+    lockedSeeds,
+    setLockedSeeds,
+    characterActions,
+    externalScript: sharedScript,
+    onConsumeExternalScript: sharedConsume,
+    onTtsStateChange,
+  } = shared;
   const externalScript = propExternalScript || sharedScript || '';
   const onConsumeExternalScript = propConsume || sharedConsume;
   const { logger } = useStudioServices();
@@ -228,8 +238,6 @@ function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExte
   const transcriptRef = useRef(null);
   const [script, setScript] = useState('');
   const [options, setOptions] = useState(INITIAL_OPTIONS);
-  const [lockedSeeds, setLockedSeeds] = useState({});
-  const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
   const charactersRef = useRef(library.allVoices);
   charactersRef.current = library.allVoices;
 
@@ -239,34 +247,32 @@ function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExte
     onConsumeExternalScript?.();
   }, [externalScript, onConsumeExternalScript]);
 
-  const synthesis = useSpeechSynthesis({ onFailure: refreshEngine, onValidationFieldError: field => focusValidationField({ scriptRef, transcriptRef }, field) });
+  const synthesis = useSpeechSynthesis({ onFailure: shared.refreshEngine, onValidationFieldError: field => focusValidationField({ scriptRef, transcriptRef }, field) });
   const hasScript = Boolean(script.trim());
   useEffect(() => {
     onTtsStateChange?.({ busy: synthesis.busy, hasScript });
   }, [synthesis.busy, hasScript, onTtsStateChange]);
 
-  const activeCharacter = useMemo(() => findCharacterById(library.allVoices, selectedCharacterId), [library.allVoices, selectedCharacterId]);
-  const activeAnchor = anchorApi.anchors[activeCharacter.id] || null;
-  const actions = useCharacterActions({
-    activeCharacter, library, synthesis, anchorApi,
-    onCharacterSelected: setSelectedCharacterId,
-    onCloseLibrary: () => setLibraryModal({ open: false, openForm: false }),
-  });
-
-  if (actionsRef) actionsRef.current = { actions, setLockedSeeds, focusScript: () => scriptRef.current?.focus() };
+  if (actionsRef) {
+    actionsRef.current = {
+      focusScript: () => scriptRef.current?.focus(),
+      cancelIfCharacter: id => { if (synthesis.activeCharacterId === id) synthesis.cancel(); },
+      setStatus: synthesis.setStatus,
+    };
+  }
   const count = countGraphemes(script);
   const isOverLimit = count > MAX_SCRIPT_LENGTH;
   const generateDisabled = synthesis.busy || !anchorApi.isLoaded || !hasScript || isOverLimit;
   const state = { scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi, charactersRef };
-  const ctrl = { logger, synthesis, activeCharacter, activeAnchor, actions, count, isOverLimit, generateDisabled };
+  const ctrl = { logger, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled };
   return { state, ctrl };
 }
 
 /**
  * Self-contained Text-to-Speech workspace function rendered inside the Studio shell.
- * Inputs: `{ shared, notices, hidden, actionsRef }`.
+ * Inputs: `{ shared, notices, hidden, actionsRef, externalScript, onConsumeExternalScript }`.
  * Outputs: `<div className="workspace-panel">` element containing TTS toolbar, form, and playback dock.
- * Side effects: delegates speech synthesis, character locks, and audio mastering via Studio services.
+ * Side effects: delegates speech synthesis and audio mastering while consuming shared Character catalog state.
  * Failure modes: surfaces validation, engine, and storage errors inside playback status bar.
  * @param {object} props - Workspace container props.
  * @returns {React.ReactElement} Text-to-Speech function workspace.
@@ -275,7 +281,7 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
   const { state, ctrl } = useTextToSpeechWorkspace({ shared, actionsRef, externalScript, onConsumeExternalScript });
   const voiceActions = buildVoiceActions({
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
-    setLibraryModal: shared.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
+    onOpenNewCharacter: shared.onOpenNewCharacter, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
   });
   return (
     <div className="workspace-panel" hidden={hidden}>
@@ -284,7 +290,7 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel} />
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions} />
       <AudioPlayer recording={ctrl.synthesis.recording} activeCharacter={ctrl.activeCharacter} activeAnchor={ctrl.activeAnchor}
-        status={ctrl.synthesis.status} onPinTake={() => void ctrl.actions.handlePinCurrentTake()}
+        status={ctrl.synthesis.status} onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
         onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
     </div>
   );
