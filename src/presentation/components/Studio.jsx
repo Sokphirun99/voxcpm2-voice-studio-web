@@ -1,5 +1,5 @@
 /**
- * @fileoverview Top-level Voice Studio shell coordinating independent function workspaces and shared Character Library state.
+ * @fileoverview Top-level Voice Studio shell coordinating top-level function workspaces and shared Character Domain state.
  */
 
 import React, { useCallback, useMemo, useRef, useState } from 'react';
@@ -9,7 +9,6 @@ import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
-import { CharacterLibraryWorkspace } from './CharacterLibraryWorkspace.jsx';
 import { Icon } from './Icon.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
@@ -73,31 +72,17 @@ function selectWorkspace(id, setActiveWorkspace, ttsRef) {
   if (id === 'tts') ttsRef.current?.focusScript?.();
 }
 
-function useSharedCharacterCatalog({ ttsRef, setActiveWorkspace }) {
+function useSharedCharacterCatalog({ ttsRef }) {
   const library = useVoiceLibrary();
   const anchorApi = useVoiceAnchors();
   const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
   const [lockedSeeds, setLockedSeeds] = useState({});
-  const [characterStatus, setCharacterStatus] = useState({ message: '', error: false });
-  const [formState, setFormState] = useState({ open: false, returnTo: '' });
-  const formStateRef = useRef(formState);
-  formStateRef.current = formState;
 
   const activeCharacter = useMemo(
     () => findCharacterById(library.allVoices, selectedCharacterId),
     [library.allVoices, selectedCharacterId]
   );
   const activeAnchor = anchorApi.anchors[activeCharacter.id] || null;
-  const closeCreateForm = useCallback(() => {
-    const returnTo = formStateRef.current.returnTo;
-    setFormState({ open: false, returnTo: '' });
-    if (returnTo) selectWorkspace(returnTo, setActiveWorkspace, ttsRef);
-  }, [setActiveWorkspace, ttsRef]);
-  const handleStatus = useCallback(next => {
-    setCharacterStatus(next);
-    ttsRef.current?.setStatus?.(next);
-  }, [ttsRef]);
-
   const actions = useCharacterActions({
     activeCharacter,
     library,
@@ -105,22 +90,18 @@ function useSharedCharacterCatalog({ ttsRef, setActiveWorkspace }) {
     onCharacterSelected: setSelectedCharacterId,
     onClearLockedSeed: id => clearCharacterLockedSeed(setLockedSeeds, id),
     onCancelCharacterSynthesis: id => ttsRef.current?.cancelIfCharacter?.(id),
-    onCharacterUsed: () => selectWorkspace('tts', setActiveWorkspace, ttsRef),
-    onStatus: handleStatus,
+    onCloseLibrary: () => ttsRef.current?.closeLibrary?.(),
+    onStatus: next => ttsRef.current?.setStatus?.(next),
   });
 
-  return {
-    library, anchorApi, selectedCharacterId, activeCharacter, activeAnchor,
-    lockedSeeds, setLockedSeeds, characterStatus, actions,
-    formState, setFormState, closeCreateForm,
-  };
+  return { library, anchorApi, activeCharacter, activeAnchor, lockedSeeds, setLockedSeeds, actions };
 }
 
 /**
- * Coordinates the three standalone Voice Studio workspaces and shared Character Catalog.
+ * Coordinates the top-level Voice Studio function workspaces (`Text to speech`, `Video to subtitle`) and shared character data.
  * Inputs: none (consumes Studio services via hooks).
  * Outputs: complete Voice Studio application shell.
- * Side effects: mounts TTS, Video-to-Subtitle, and Character Library workspaces plus update/engine monitors.
+ * Side effects: mounts function workspaces plus update and engine monitors.
  * Failure modes: per-workspace errors surface cleanly inside each workspace's status bar/banner.
  * @returns {React.ReactElement} Studio application root.
  */
@@ -128,10 +109,10 @@ export function Studio() {
   const ttsRef = useRef(null);
   const [activeWorkspace, setActiveWorkspace] = useState('tts');
   const [externalScript, setExternalScript] = useState('');
-  const [ttsState, setTtsState] = useState({ busy: false, hasScript: false });
+  const [ttsState, setTtsState] = useState({ busy: false, hasScript: false, libraryOpen: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
   const handleTtsStateChange = useCallback(next => {
-    setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript ? prev : next));
+    setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
   }, []);
   const handleSubtitleStateChange = useCallback(next => {
     setSubtitleState(prev => (prev.busy === next.busy && prev.hasVideo === next.hasVideo ? prev : next));
@@ -142,22 +123,11 @@ export function Studio() {
   }, []);
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
-  const catalog = useSharedCharacterCatalog({ ttsRef, setActiveWorkspace });
-  const canAutoReload = !catalog.formState.open && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
+  const catalog = useSharedCharacterCatalog({ ttsRef });
+  const canAutoReload = !ttsState.libraryOpen && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
   const versionCheck = useAppVersionCheck({ canAutoReload });
   const ttsNotices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
   const updateBanner = <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />;
-
-  const handleSelectWorkspace = useCallback(id => {
-    if (id === 'characters') catalog.setFormState(prev => ({ ...prev, open: false, returnTo: '' }));
-    selectWorkspace(id, setActiveWorkspace, ttsRef);
-  }, [catalog]);
-
-  const handleOpenNewFromTts = useCallback(() => {
-    catalog.setFormState({ open: true, returnTo: 'tts' });
-    setActiveWorkspace('characters');
-  }, [catalog]);
-
   const sharedTts = {
     library: catalog.library,
     anchorApi: catalog.anchorApi,
@@ -167,35 +137,18 @@ export function Studio() {
     setLockedSeeds: catalog.setLockedSeeds,
     characterActions: catalog.actions,
     refreshEngine,
-    onOpenNewCharacter: handleOpenNewFromTts,
     onTtsStateChange: handleTtsStateChange,
   };
 
   return (
     <div className="studio-window">
-      <Sidebar activeWorkspace={activeWorkspace} workspaces={DEFAULT_WORKSPACES} onSelectWorkspace={handleSelectWorkspace} />
+      <Sidebar activeWorkspace={activeWorkspace} workspaces={DEFAULT_WORKSPACES}
+        onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)} />
       <main className="studio-workspace">
         <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
           externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
         <VideoSubtitleWorkspace notices={updateBanner} hidden={activeWorkspace !== 'subtitles'}
           onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange} />
-        <CharacterLibraryWorkspace
-          hidden={activeWorkspace !== 'characters'}
-          showSaveForm={catalog.formState.open}
-          activeCharacter={catalog.activeCharacter}
-          selectedCharacterId={catalog.selectedCharacterId}
-          library={catalog.library}
-          anchors={catalog.anchorApi.anchors}
-          busy={ttsState.busy}
-          status={catalog.characterStatus}
-          notices={updateBanner}
-          onOpenSave={() => catalog.setFormState({ open: true, returnTo: '' })}
-          onCancelSave={catalog.closeCreateForm}
-          onSelectVoice={voice => catalog.actions.handleSelectCharacter(voice, { fromLibrary: true })}
-          onCreateCharacter={input => catalog.actions.handleCreateCharacter(input)}
-          onDeleteCharacter={id => void catalog.actions.handleDeleteCharacter(id)}
-          onUnpinAnchor={id => void catalog.actions.handleResetVoice(id)}
-        />
       </main>
     </div>
   );

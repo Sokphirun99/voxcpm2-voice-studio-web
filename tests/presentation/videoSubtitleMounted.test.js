@@ -99,6 +99,8 @@ function createDomShim() {
       return true;
     }
     focus() { globalThis.document.activeElement = this; }
+    showModal() { this.open = true; }
+    close() { this.open = false; this.dispatchEvent({ type: 'close' }); }
     click() {
       if (this.tagName === 'A') return;
       this.dispatchEvent({ type: 'click', bubbles: true });
@@ -321,28 +323,28 @@ test('mounted Studio switches to Video to subtitle, extracts speakers, burns MP4
     assert.equal(subPanel.hasAttribute('hidden'), true);
     assert.equal(dom.container.querySelector('#script').value, 'សួស្តីពេលល្ងាច។ សូមស្វាគមន៍ការត្រឡប់មកវិញ។');
 
-    // Switch to standalone Character library workspace, pick Sovath, and auto-return to TTS
-    const charBtn = dom.container.querySelector('#open-voice-library');
-    await act(async () => { charBtn.click(); });
-    const charPanel = dom.container.querySelector('.character-workspace');
-    assert.equal(charPanel.hasAttribute('hidden'), false);
-    assert.equal(dom.container.querySelector('#nav-tts').getAttribute('aria-current'), null);
-    assert.equal(charBtn.getAttribute('aria-current'), 'page');
+    // Verify Sidebar contains only Text to speech and Video to subtitle, while Character library lives inside TTS Voice pane
+    const sidebar = dom.container.querySelector('.studio-sidebar');
+    assert.equal(sidebar.querySelector('#open-voice-library'), null);
+    assert.equal(subPanel.querySelector('#open-voice-library'), null);
+    const charBtn = dom.container.querySelector('.voice-inspector').querySelector('#open-voice-library');
+    assert.ok(charBtn);
 
-    const useButtons = dom.container.querySelectorAll('.library-use');
+    await act(async () => { charBtn.click(); });
+    const dialog = dom.container.querySelector('#voice-library');
+    assert.equal(dialog.open, true);
+
+    const useButtons = dialog.querySelectorAll('.library-use');
     assert.ok(useButtons.length >= 2);
     await act(async () => { useButtons[1].click(); });
-    assert.equal(charPanel.hasAttribute('hidden'), true);
-    assert.equal(dom.container.querySelector('#nav-tts').getAttribute('aria-current'), 'page');
+    assert.equal(dialog.open, false);
     assert.notEqual(dom.container.querySelector('#character-select').value, 'char-nisa');
 
-    // Trigger + New character from TTS -> opens Character library create form cleanly and Cancel returns to TTS
     await act(async () => { dom.container.querySelector('#new-character-button').click(); });
-    assert.equal(charPanel.hasAttribute('hidden'), false);
-    assert.ok(dom.container.querySelector('#save-voice-name'));
-    await act(async () => { dom.container.querySelector('#cancel-create-character').click(); });
-    assert.equal(charPanel.hasAttribute('hidden'), true);
-    assert.equal(dom.container.querySelector('#nav-tts').getAttribute('aria-current'), 'page');
+    assert.equal(dialog.open, true);
+    assert.ok(dialog.querySelector('#save-voice-name'));
+    await act(async () => { dialog.querySelector('#close-voice-library').click(); });
+    assert.equal(dialog.open, false);
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();
