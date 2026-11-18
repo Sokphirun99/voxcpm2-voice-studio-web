@@ -27,7 +27,7 @@ function SpeakerBadgeSelect({ speakerId, speakers, speakerNames, busy, onChangeS
 
 /**
  * Renders one editable subtitle utterance attributed to a speaker.
- * Inputs: `{ segment, speakers, speakerNames, showTranslationInput, busy, onSeek, onUpdate }`.
+ * Inputs: `{ segment, speakers, speakerNames, useTranslation, busy, onSeek, onUpdate }`.
  * Outputs: `<article className="subtitle-segment-row">`.
  * Side effects: triggers seek or segment state mutation callbacks.
  * Failure modes: none.
@@ -38,12 +38,16 @@ export function SubtitleSegmentRow({
   segment,
   speakers,
   speakerNames,
-  showTranslationInput,
+  useTranslation = false,
   busy,
   onSeek,
   onUpdate,
 }) {
-  const hasTranslation = showTranslationInput || Boolean(segment.translatedText);
+  const activeText = useTranslation ? (segment.translatedText || segment.text || '') : (segment.text || '');
+  const handleTextChange = e => {
+    const val = e.target.value;
+    onUpdate(segment.id, useTranslation ? { translatedText: val } : { text: val });
+  };
   return (
     <article className="subtitle-segment-row" data-segment-id={segment.id}>
       <header className="subtitle-segment-head">
@@ -64,25 +68,14 @@ export function SubtitleSegmentRow({
         </button>
       </header>
       <textarea
-        className="subtitle-line-input"
+        className={useTranslation ? 'subtitle-line-input subtitle-line-khmer' : 'subtitle-line-input'}
         rows={2}
-        aria-label="Original subtitle text"
-        value={segment.text}
+        lang="km"
+        aria-label={useTranslation ? 'Khmer subtitle translation' : 'Subtitle text'}
+        value={activeText}
         disabled={busy}
-        onChange={e => onUpdate(segment.id, { text: e.target.value })}
+        onChange={handleTextChange}
       />
-      {hasTranslation && (
-        <textarea
-          className="subtitle-line-input subtitle-line-khmer"
-          rows={2}
-          lang="km"
-          placeholder="Khmer translation..."
-          aria-label="Khmer subtitle translation"
-          value={segment.translatedText || ''}
-          disabled={busy}
-          onChange={e => onUpdate(segment.id, { translatedText: e.target.value })}
-        />
-      )}
     </article>
   );
 }

@@ -3,11 +3,14 @@
  */
 
 import React from 'react';
+import { Blocks } from 'loading-dev';
 import { SOURCE_LANGUAGE_OPTIONS, getSpeakerColor, resolveSpeakerLabel } from '../../domain/subtitles.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
 import { SubtitleExportDock } from './SubtitleExportDock.jsx';
 import { SubtitleSegmentRow } from './SubtitleSegmentRow.jsx';
+
+const GENERATE_SPINNER_SIZE_PX = 16;
 
 const SPEAKER_COUNT_OPTIONS = Object.freeze([
   { id: '0', label: 'Auto-detect speakers' },
@@ -23,15 +26,20 @@ function SubtitleToolbar({ busy, hasFile, hasSegments, onClear, onCancel, onExtr
     <header className="studio-toolbar">
       <h1>Video to subtitle</h1>
       <div className="toolbar-actions">
-        <button type="button" id="subtitle-clear-btn" className="button cancel-button"
-          disabled={(!hasFile && !hasSegments) || busy} onClick={onClear}>Clear</button>
-        {busy ? (
-          <button type="button" id="subtitle-cancel-btn" className="button cancel-button" onClick={onCancel}>Cancel</button>
-        ) : (
-          <button type="button" id="subtitle-extract-btn" className="button generate" disabled={!hasFile} onClick={onExtract}>
-            <Icon name="subtitles" /><span>Extract subtitles</span>
+        {!busy && (
+          <button type="button" id="subtitle-clear-btn" className="button subtle-button cancel-button"
+            disabled={!hasFile && !hasSegments} onClick={onClear}>Clear</button>
+        )}
+        {busy && (
+          <button type="button" id="subtitle-cancel-btn" className="button subtle-button cancel-button" onClick={onCancel}>
+            <Icon name="stop_fill" /><span>Cancel</span>
           </button>
         )}
+        <button type="button" id="subtitle-extract-btn" className={busy ? 'button generate is-generating' : 'button generate'}
+          disabled={!hasFile || busy} aria-busy={busy || undefined} onClick={onExtract}>
+          {busy ? <Blocks size={GENERATE_SPINNER_SIZE_PX} className="generate-spinner" /> : <Icon name="subtitles" />}
+          <span>{busy ? 'Extracting…' : 'Extract subtitles'}</span>
+        </button>
       </div>
     </header>
   );
@@ -103,9 +111,10 @@ function SpeakerRosterCard({ speakers, speakerNames, busy, onRename }) {
 }
 
 function SubtitleSettingsForm({ ctrl }) {
-  const { options, segments, busyAction } = ctrl.state;
+  const { options, segments, detectedLanguage, busyAction } = ctrl.state;
   const busy = Boolean(busyAction);
   const hasTranslation = segments.some(s => Boolean(s?.translatedText?.trim()));
+  const canTranslateToKhmer = options.sourceLanguage !== 'km' && detectedLanguage !== 'km';
   return (
     <div className="subtitle-settings-stack">
       <div className="subtitle-option-grid">
@@ -131,12 +140,14 @@ function SubtitleSettingsForm({ ctrl }) {
         </div>
       </div>
       <div className="field-row-toggles">
-        <label className="locked-checkbox subtitle-toggle" htmlFor="subtitle-auto-translate">
-          <span>Translate to Khmer</span>
-          <input id="subtitle-auto-translate" type="checkbox"
-            checked={options.translateToKhmer} disabled={busy}
-            onChange={e => ctrl.updateOption('translateToKhmer', e.target.checked)} />
-        </label>
+        {options.sourceLanguage !== 'km' && (
+          <label className="locked-checkbox subtitle-toggle" htmlFor="subtitle-auto-translate">
+            <span>Translate to Khmer</span>
+            <input id="subtitle-auto-translate" type="checkbox"
+              checked={options.translateToKhmer} disabled={busy}
+              onChange={e => ctrl.updateOption('translateToKhmer', e.target.checked)} />
+          </label>
+        )}
         <label className="locked-checkbox subtitle-toggle" htmlFor="subtitle-include-speaker">
           <span>Speaker tags</span>
           <input id="subtitle-include-speaker" type="checkbox"
@@ -144,11 +155,13 @@ function SubtitleSettingsForm({ ctrl }) {
             onChange={e => ctrl.updateOption('includeSpeaker', e.target.checked)} />
         </label>
       </div>
-      {segments.length > 0 && (
+      {segments.length > 0 && (canTranslateToKhmer || hasTranslation) && (
         <div className="subtitle-translate-bar">
-          <button type="button" id="subtitle-translate-btn" className="button button-secondary" disabled={busy} onClick={() => void ctrl.translateNow()}>
-            {busyAction === 'translate' ? 'Translating...' : hasTranslation ? 'Re-translate Khmer' : 'Translate to Khmer'}
-          </button>
+          {canTranslateToKhmer && (
+            <button type="button" id="subtitle-translate-btn" className="button button-secondary" disabled={busy} onClick={() => void ctrl.translateNow()}>
+              {busyAction === 'translate' ? 'Translating…' : hasTranslation ? 'Re-translate Khmer' : 'Translate to Khmer'}
+            </button>
+          )}
           {hasTranslation && (
             <div className="select-field select-field--plain">
               <select aria-label="Preview language" value={options.previewMode} disabled={busy}
@@ -166,14 +179,14 @@ function SubtitleSettingsForm({ ctrl }) {
 }
 
 function SubtitleCueList({ ctrl }) {
-  const { segments, speakerNames, options, detectedLanguage, busyAction } = ctrl.state;
+  const { segments, speakerNames, detectedLanguage, busyAction } = ctrl.state;
   const busy = Boolean(busyAction);
   if (!segments.length) {
     return (
       <div className="subtitle-empty-state">
         <Icon name="subtitles" />
         <strong>No dialogue extracted yet</strong>
-        <p>Upload any multi-speaker video (stories, news, interviews) and click Extract subtitles to split speakers, preview live captions, translate to Khmer, or burn subtitles into MP4.</p>
+        <p>Upload a video or dialogue clip and click Extract subtitles to generate speaker-labeled subtitles.</p>
       </div>
     );
   }
@@ -185,7 +198,7 @@ function SubtitleCueList({ ctrl }) {
       </div>
       {segments.map(seg => (
         <SubtitleSegmentRow key={seg.id} segment={seg} speakers={ctrl.speakers} speakerNames={speakerNames}
-          showTranslationInput={options.translateToKhmer} busy={busy}
+          useTranslation={ctrl.useTranslation} busy={busy}
           onSeek={ctrl.seekToSegment} onUpdate={ctrl.updateSegment} />
       ))}
     </div>

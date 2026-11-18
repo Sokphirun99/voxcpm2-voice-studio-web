@@ -13,15 +13,46 @@ import {
 import { createMediaSubtitleGateway } from '../../data/mediaSubtitleGateway.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
+const LIVE_TIMER_TICK_MS = 100;
 const MAX_CLIENT_VIDEO_BYTES = 500 * 1024 * 1024;
 const ALLOWED_EXT_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi|mp3|wav|m4a)$/i;
 const DEFAULT_OPTIONS = Object.freeze({
-  sourceLanguage: 'auto',
+  sourceLanguage: 'km',
   speakerCount: '0',
-  translateToKhmer: true,
+  translateToKhmer: false,
   includeSpeaker: true,
-  previewMode: 'translated',
+  previewMode: 'original',
 });
+
+function startStatusTimer(setState, baseMessage) {
+  const startedAt = Date.now();
+  const elapsedSecs = () => ((Date.now() - startedAt) / 1000).toFixed(1);
+  const timer = globalThis.setInterval(() => {
+    setState(prev => ({ ...prev, status: { message: `${baseMessage} (${elapsedSecs()}s)`, error: false } }));
+  }, LIVE_TIMER_TICK_MS);
+  return { timer, elapsedSecs };
+}
+
+async function runTimedSubtitleAction({ abortRef, setState, busyAction, baseMessage, cancelMessage, fallbackError, onError, run }) {
+  abortRef.current?.abort();
+  const controller = new AbortController();
+  abortRef.current = controller;
+  setState(prev => ({ ...prev, busyAction, status: { message: `${baseMessage} (0.0s)`, error: false } }));
+  const { timer, elapsedSecs } = startStatusTimer(setState, baseMessage);
+  try {
+    await run(controller.signal, elapsedSecs);
+  } catch (err) {
+    if (err?.name === 'SynthesisCancelledError') {
+      setState(prev => ({ ...prev, busyAction: '', status: { message: cancelMessage, error: false } }));
+      return;
+    }
+    onError?.();
+    setState(prev => ({ ...prev, busyAction: '', status: { message: err?.message || fallbackError, error: true } }));
+  } finally {
+    globalThis.clearInterval(timer);
+    if (abortRef.current === controller) abortRef.current = null;
+  }
+}
 
 function revokeUrl(url) {
   if (url && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
@@ -85,6 +116,23 @@ function useVttPreviewUrl({ segments, speakerNames, includeSpeaker, useTranslati
   return vttUrl;
 }
 
+function applyExtractedSubtitleResult(prev, res, shouldTranslate, elapsed) {
+  const detectedLanguage = res.language || prev.options.sourceLanguage;
+  const segments = Array.isArray(res.segments) ? res.segments : [];
+  const hasTranslated = shouldTranslate && detectedLanguage !== 'km' && segments.some(s => Boolean(s?.translatedText?.trim()));
+  return {
+    ...prev,
+    jobId: res.jobId || '',
+    detectedLanguage,
+    videoSize: res.videoSize || null,
+    segments,
+    speakerNames: {},
+    options: { ...prev.options, previewMode: hasTranslated ? 'translated' : 'original' },
+    busyAction: '',
+    status: { message: `Extracted ${segments.length} subtitle segments (${res.speakers?.length || 1} speaker(s)) in ${elapsed}s.`, error: false },
+  };
+}
+
 function useSubtitleAsyncActions({ state, setState, gateway, abortRef, refreshHealth }) {
   const cancel = useCallback(() => {
     abortRef.current?.abort();
@@ -92,89 +140,75 @@ function useSubtitleAsyncActions({ state, setState, gateway, abortRef, refreshHe
 
   const extractSubtitles = useCallback(async () => {
     if (!state.videoFile) return;
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setState(prev => ({ ...prev, busyAction: 'extract', status: { message: 'Extracting audio, speech, and speaker turns...', error: false } }));
-    try {
-      const res = await gateway.transcribeVideo({
-        file: state.videoFile,
-        language: state.options.sourceLanguage,
-        numSpeakers: Number(state.options.speakerCount) || 0,
-        diarize: true,
-        translateToKhmer: state.options.translateToKhmer,
-        signal: controller.signal,
-      });
-      setState(prev => ({
-        ...prev,
-        jobId: res.jobId || '',
-        detectedLanguage: res.language || prev.options.sourceLanguage,
-        videoSize: res.videoSize || null,
-        segments: Array.isArray(res.segments) ? res.segments : [],
-        speakerNames: {},
-        busyAction: '',
-        status: { message: `Extracted ${res.segments?.length || 0} subtitle segments (${res.speakers?.length || 1} speaker(s)).`, error: false },
-      }));
-    } catch (err) {
-      if (err?.name === 'SynthesisCancelledError') {
-        setState(prev => ({ ...prev, busyAction: '', status: { message: 'Subtitle extraction cancelled.', error: false } }));
-        return;
-      }
-      void refreshHealth();
-      setState(prev => ({ ...prev, busyAction: '', status: { message: err?.message || 'Subtitle extraction failed.', error: true } }));
-    }
+    const shouldTranslate = state.options.sourceLanguage !== 'km' && Boolean(state.options.translateToKhmer);
+    await runTimedSubtitleAction({
+      abortRef, setState, busyAction: 'extract',
+      baseMessage: 'Extracting subtitles & speaker turns…',
+      cancelMessage: 'Subtitle extraction cancelled.',
+      fallbackError: 'Subtitle extraction failed.',
+      onError: () => void refreshHealth(),
+      run: async (signal, elapsedSecs) => {
+        const res = await gateway.transcribeVideo({
+          file: state.videoFile,
+          language: state.options.sourceLanguage,
+          numSpeakers: Number(state.options.speakerCount) || 0,
+          diarize: true,
+          translateToKhmer: shouldTranslate,
+          signal,
+        });
+        setState(prev => applyExtractedSubtitleResult(prev, res, shouldTranslate, elapsedSecs()));
+      },
+    });
   }, [state.videoFile, state.options, gateway, abortRef, setState, refreshHealth]);
 
   const translateNow = useCallback(async () => {
     if (!state.segments.length) return;
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setState(prev => ({ ...prev, busyAction: 'translate', status: { message: 'Translating subtitles into Khmer offline...', error: false } }));
-    try {
-      const sourceLang = state.detectedLanguage && state.detectedLanguage !== 'auto' ? state.detectedLanguage : state.options.sourceLanguage;
-      const res = await gateway.translateSegments({
-        segments: state.segments,
-        sourceLanguage: sourceLang === 'auto' ? 'en' : sourceLang,
-        targetLanguage: 'km',
-        signal: controller.signal,
-      });
-      setState(prev => ({
-        ...prev,
-        segments: Array.isArray(res.segments) ? res.segments : prev.segments,
-        options: { ...prev.options, previewMode: 'translated', translateToKhmer: true },
-        busyAction: '',
-        status: { message: 'Translated dialogue lines to Khmer.', error: false },
-      }));
-    } catch (err) {
-      const msg = err?.name === 'SynthesisCancelledError' ? 'Translation cancelled.' : err?.message || 'Translation failed.';
-      setState(prev => ({ ...prev, busyAction: '', status: { message: msg, error: err?.name !== 'SynthesisCancelledError' } }));
-    }
+    await runTimedSubtitleAction({
+      abortRef, setState, busyAction: 'translate',
+      baseMessage: 'Translating subtitles into Khmer offline…',
+      cancelMessage: 'Translation cancelled.',
+      fallbackError: 'Translation failed.',
+      run: async (signal, elapsedSecs) => {
+        const sourceLang = state.detectedLanguage && state.detectedLanguage !== 'auto' ? state.detectedLanguage : state.options.sourceLanguage;
+        const res = await gateway.translateSegments({
+          segments: state.segments,
+          sourceLanguage: sourceLang === 'auto' ? 'en' : sourceLang,
+          targetLanguage: 'km',
+          signal,
+        });
+        setState(prev => ({
+          ...prev,
+          segments: Array.isArray(res.segments) ? res.segments : prev.segments,
+          options: { ...prev.options, previewMode: 'translated', translateToKhmer: true },
+          busyAction: '',
+          status: { message: `Translated dialogue lines to Khmer in ${elapsedSecs()}s.`, error: false },
+        }));
+      },
+    });
   }, [state.segments, state.detectedLanguage, state.options.sourceLanguage, gateway, abortRef, setState]);
 
   const burnVideo = useCallback(async () => {
     if (!state.jobId || !state.segments.length) return;
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setState(prev => ({ ...prev, busyAction: 'burn', status: { message: 'Rendering MP4 with speaker-colored subtitles...', error: false } }));
-    try {
-      const useTranslation = resolveUseTranslation(state.segments, state.options.previewMode);
-      const blob = await gateway.burnSubtitles({
-        jobId: state.jobId,
-        segments: state.segments,
-        speakerNames: state.speakerNames,
-        includeSpeaker: state.options.includeSpeaker,
-        useTranslation,
-        videoSize: state.videoSize || undefined,
-        signal: controller.signal,
-      });
-      downloadBlobOrText({ data: blob, mimeType: 'video/mp4', filename: buildExportName(state.videoFile, '-subtitled.mp4') });
-      setState(prev => ({ ...prev, busyAction: '', status: { message: 'Exported MP4 with burned-in subtitles.', error: false } }));
-    } catch (err) {
-      const msg = err?.name === 'SynthesisCancelledError' ? 'MP4 export cancelled.' : err?.message || 'Video subtitle burn-in failed.';
-      setState(prev => ({ ...prev, busyAction: '', status: { message: msg, error: err?.name !== 'SynthesisCancelledError' } }));
-    }
+    await runTimedSubtitleAction({
+      abortRef, setState, busyAction: 'burn',
+      baseMessage: 'Rendering MP4 with speaker-colored subtitles…',
+      cancelMessage: 'MP4 export cancelled.',
+      fallbackError: 'Video subtitle burn-in failed.',
+      run: async (signal, elapsedSecs) => {
+        const useTranslation = resolveUseTranslation(state.segments, state.options.previewMode);
+        const blob = await gateway.burnSubtitles({
+          jobId: state.jobId,
+          segments: state.segments,
+          speakerNames: state.speakerNames,
+          includeSpeaker: state.options.includeSpeaker,
+          useTranslation,
+          videoSize: state.videoSize || undefined,
+          signal,
+        });
+        downloadBlobOrText({ data: blob, mimeType: 'video/mp4', filename: buildExportName(state.videoFile, '-subtitled.mp4') });
+        setState(prev => ({ ...prev, busyAction: '', status: { message: `Exported MP4 with burned-in subtitles in ${elapsedSecs()}s.`, error: false } }));
+      },
+    });
   }, [state, gateway, abortRef, setState]);
 
   return { cancel, extractSubtitles, translateNow, burnVideo };
@@ -266,7 +300,17 @@ export function useVideoSubtitles({ onStateChange } = {}) {
   }, []);
 
   const updateOption = useCallback((key, value) => {
-    setState(prev => ({ ...prev, options: { ...prev.options, [key]: value } }));
+    setState(prev => {
+      const next = { ...prev.options, [key]: value };
+      if (key === 'sourceLanguage') {
+        const isKhmer = value === 'km';
+        next.translateToKhmer = !isKhmer;
+        next.previewMode = isKhmer ? 'original' : 'translated';
+      } else if (key === 'translateToKhmer') {
+        next.previewMode = value ? 'translated' : 'original';
+      }
+      return { ...prev, options: next };
+    });
   }, []);
 
   const updateSpeakerName = useCallback((speakerId, name) => {

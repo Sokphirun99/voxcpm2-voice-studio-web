@@ -12,10 +12,10 @@ export const SUBTITLE_SPEAKER_COLORS = Object.freeze([
 ]);
 
 export const SOURCE_LANGUAGE_OPTIONS = Object.freeze([
+  { id: 'km', label: 'Khmer (ខ្មែរ)' },
   { id: 'auto', label: 'Auto-detect language' },
   { id: 'en', label: 'English' },
   { id: 'zh', label: 'Chinese (Mandarin)' },
-  { id: 'km', label: 'Khmer' },
   { id: 'th', label: 'Thai' },
   { id: 'vi', label: 'Vietnamese' },
   { id: 'ja', label: 'Japanese' },

@@ -12,14 +12,11 @@ function ExportFormatButtons({ hasSegments, busy, onExportFile, onCopyDialogue }
         disabled={!hasSegments || busy} onClick={onCopyDialogue}>
         <Icon name="copy" /><span>Copy</span>
       </button>
-      <button type="button" className="button button-secondary" disabled={!hasSegments || busy} onClick={() => onExportFile('txt')}>
-        <span>.txt</span>
-      </button>
       <button type="button" className="button button-secondary" disabled={!hasSegments || busy} onClick={() => onExportFile('srt')}>
-        <span>.srt</span>
+        <Icon name="arrow_down_to_line" /><span>Download .srt</span>
       </button>
-      <button type="button" className="button button-secondary" disabled={!hasSegments || busy} onClick={() => onExportFile('vtt')}>
-        <span>.vtt</span>
+      <button type="button" className="button button-secondary" disabled={!hasSegments || busy} onClick={() => onExportFile('txt')}>
+        <Icon name="arrow_down_to_line" /><span>Download .txt</span>
       </button>
     </div>
   );
@@ -46,7 +43,7 @@ export function SubtitleExportDock({
   onSendToTts,
 }) {
   return (
-    <section className="playback subtitle-dock" aria-label="Subtitle export" data-idle={hasSegments ? 'false' : 'true'}>
+    <section className="playback subtitle-dock" aria-label="Subtitle export" data-idle={hasSegments || busy ? 'false' : 'true'}>
       <div className="subtitle-dock-actions">
         <ExportFormatButtons hasSegments={hasSegments} busy={busy} onExportFile={onExportFile} onCopyDialogue={onCopyDialogue} />
         <div className="subtitle-export-primary">

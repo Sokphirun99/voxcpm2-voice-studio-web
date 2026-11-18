@@ -61,6 +61,7 @@ function createDomShim() {
       if (k === 'id') this.id = String(v);
       if (k === 'class') this.className = String(v);
       if (k === 'type') this.type = String(v);
+      if (k === 'value') this._value = String(v);
       if (k === 'hidden') this.hidden = true;
       if (k.startsWith('on')) this[k] = () => {};
     }
@@ -151,6 +152,18 @@ function createDomShim() {
     set defaultValue(v) {
       this._defaultValue = String(v);
       if (!this._dirtyValue) this._value = this._defaultValue;
+    }
+    get selected() { return Boolean(this._selected); }
+    set selected(v) {
+      this._selected = Boolean(v);
+      if (this._selected && this.tagName === 'OPTION') {
+        let p = this.parentNode;
+        while (p && p.tagName !== 'SELECT') p = p.parentNode;
+        if (p) {
+          p._value = this._value;
+          for (const o of p.options) if (o !== this) o._selected = false;
+        }
+      }
     }
     get value() { return this._value; }
     set value(v) {
@@ -291,6 +304,15 @@ test('mounted Studio switches to Video to subtitle, extracts speakers, burns MP4
 
     const subPanel = dom.container.querySelector('.subtitle-workspace');
     assert.equal(subPanel.hasAttribute('hidden'), false);
+    assert.equal(subPanel.querySelector('#subtitle-source-lang').value, 'km');
+    assert.equal(subPanel.querySelector('#subtitle-auto-translate'), null);
+
+    const langSelect = subPanel.querySelector('#subtitle-source-lang');
+    await act(async () => {
+      langSelect.value = 'en';
+      langSelect.dispatchEvent({ type: 'change', bubbles: true, target: langSelect });
+    });
+    assert.ok(subPanel.querySelector('#subtitle-auto-translate'));
 
     const fileInput = dom.container.querySelector('#subtitle-video-input');
     await act(async () => {
@@ -303,6 +325,7 @@ test('mounted Studio switches to Video to subtitle, extracts speakers, burns MP4
 
     const rows = dom.container.querySelectorAll('.subtitle-segment-row');
     assert.equal(rows.length, 2);
+    assert.equal(rows[0].querySelectorAll('textarea').length, 1);
     assert.ok(dom.container.querySelector('track'));
 
     const renameInput = dom.container.querySelector('.subtitle-roster-input');
