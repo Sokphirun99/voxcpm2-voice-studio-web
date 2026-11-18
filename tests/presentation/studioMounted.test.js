@@ -735,3 +735,74 @@ test('mounted Studio pops up top offline banner with root cause and hides automa
     await vite.close();
   }
 });
+
+test('mounted Studio surfaces invalid TTS reference sample validation errors via status, toast, and sound', async () => {
+  const dom = installTestDom();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const { ValidationError } = await import('../../src/domain/errors.js');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+
+    const soundEvents = [];
+    const services = {
+      speechGateway: { checkAvailability: async () => true, uploadReferenceAudio: async () => ({}), synthesize: async () => ({}) },
+      notificationSound: {
+        isMuted: () => false,
+        setMuted: () => false,
+        unlock: () => soundEvents.push('unlock'),
+        play: async kind => { soundEvents.push(`play:${kind}`); return true; },
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: { execute: async () => ({}) },
+      lockReferenceAudio: {
+        execute: async () => {
+          throw new ValidationError('The selected file does not appear to be valid audio.', 'referenceAudio', 'INVALID_AUDIO_CONTENT');
+        },
+      },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+
+    const refInput = container.querySelector('#reference-audio-input');
+    refInput.files = [new File(['bad-bytes'], 'spoof.wav', { type: 'audio/wav' })];
+    await act(async () => {
+      refInput.dispatchEvent({ type: 'change', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+
+    assert.match(container.querySelector('#generation-status').textContent, /does not appear to be valid audio/);
+    const errToast = container.querySelectorAll('.studio-toast').find(el => String(el.className || '').includes('is-error'));
+    assert.ok(errToast);
+    assert.match(errToast.textContent, /Invalid audio file/);
+    assert.match(errToast.textContent, /does not appear to be valid audio/);
+    assert.ok(soundEvents.includes('unlock'));
+    assert.ok(soundEvents.includes('play:error'));
+  } finally {
+    if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});

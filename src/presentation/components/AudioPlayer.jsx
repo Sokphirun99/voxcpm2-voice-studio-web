@@ -7,6 +7,7 @@ import { formatTime, readPlaybackDuration, readPlaybackSeconds } from '../../dom
 import { useStudioServices } from '../StudioContext.jsx';
 import { useRecordingMedia } from '../hooks/useRecordingMedia.js';
 import { Icon } from './Icon.jsx';
+import { LiveStatusText } from './LiveStatusText.jsx';
 
 const BAR_STEP_PX = 5;
 const BAR_WIDTH_PX = 2.5;
@@ -91,16 +92,21 @@ function Waveform({ peaks, progress }) {
  * @param {{ status: { message: string, error: boolean } }} props - Status props.
  * @returns {React.ReactElement} Status block.
  */
-function PlaybackInfo({ status }) {
+function PlaybackInfo({ status, busyMeta }) {
   return (
     <div className="playback-info">
       <div className="playback-heading">
         <h2 id="playback-title">Generated audio</h2>
         <span className="audio-format">WAV · 48 kHz</span>
       </div>
-      <p id="generation-status" className={status.error ? 'generation-status is-error' : 'generation-status'} role="status">
-        {status.message}
-      </p>
+      <LiveStatusText
+        id="generation-status"
+        className={status.error ? 'generation-status is-error' : 'generation-status'}
+        role="status"
+        status={status}
+        busyStartedAt={busyMeta?.startedAt || null}
+        busyMessage={busyMeta?.message || ''}
+      />
     </div>
   );
 }
@@ -308,7 +314,7 @@ function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError
  * @param {object} props - Player props.
  * @returns {React.ReactElement} Audio player dock.
  */
-export function AudioPlayer({ recording, activeCharacter, activeAnchor, status, onPinTake, onPlaybackError }) {
+export function AudioPlayer({ recording, activeCharacter, activeAnchor, status, busyMeta = null, onPinTake, onPlaybackError }) {
   const { logger } = useStudioServices();
   const audio = useRef(null);
   const [media, setMedia] = useRecordingMedia(recording);
@@ -324,7 +330,7 @@ export function AudioPlayer({ recording, activeCharacter, activeAnchor, status, 
 
   return (
     <section className="playback" data-has-audio={media.url ? 'true' : 'false'} aria-labelledby="playback-title">
-      <PlaybackInfo status={status} />
+      <PlaybackInfo status={status} busyMeta={busyMeta} />
       <PlaybackControls media={media} recording={recording} activeCharacter={activeCharacter}
         activeAnchor={activeAnchor} onSeek={handleSeek} onPinTake={onPinTake}
         onTogglePlay={() => void toggleAudioElement({ element: audio.current, logger, onPlaybackError })} />

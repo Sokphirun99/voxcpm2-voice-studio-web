@@ -7,24 +7,25 @@ import { formatGenerationMetrics } from '../../domain/audioValidation.js';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
-const LIVE_TIMER_TICK_MS = 100;
-
 /**
- * Translates synthesis or validation exceptions into status messages and field focus callbacks.
+ * Translates synthesis or validation exceptions into status messages, popup notifications, and field focus callbacks.
  * @param {unknown} error - Caught exception.
  * @param {object} ctx - Error handling callbacks.
  */
-function handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError }) {
+function handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify }) {
   if (error instanceof ValidationError) {
     onValidationFieldError?.(error.field);
     setStatus({ message: error.message, error: true });
+    onNotify?.({ kind: 'error', title: 'Check input', message: error.message });
     return;
   }
   if (error instanceof SynthesisCancelledError) {
     setStatus({ message: error.message, error: false });
     return;
   }
-  setStatus({ message: error.message || 'Could not generate speech. Try again.', error: true });
+  const message = error?.message || 'Could not generate speech. Try again.';
+  setStatus({ message, error: true });
+  onNotify?.({ kind: 'error', title: 'Speech generation failed', message });
   onFailure();
 }
 
@@ -67,7 +68,7 @@ function formatCompletedStatus({ customMessage, character, recording }) {
  * @param {object} spec - Execution callbacks and services.
  * @returns {Promise<void>} Completion promise.
  */
-async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, setRecording, setLastSeed }) {
+async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, setRecording, setLastSeed, onNotify }) {
   const result = await synthesizeSpeech.execute({
     ...request,
     signal,
@@ -77,56 +78,39 @@ async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onRe
   setRecording(result.recording);
   if (result.recording.seed != null) setLastSeed(result.recording.seed);
   const customMessage = await onCompleted?.(result);
-  setStatus({ message: formatCompletedStatus({ customMessage, character: request.character, recording: result.recording }), error: false });
+  const finalMessage = formatCompletedStatus({ customMessage, character: request.character, recording: result.recording });
+  setStatus({ message: finalMessage, error: false });
+  onNotify?.({ kind: 'success', title: 'Speech ready', message: finalMessage });
 }
 
 /**
- * Manages AbortController, busy state, live timer, and failure translation around one synthesis run.
+ * Manages AbortController, busy state, isolated elapsed-timer metadata, and failure translation around one synthesis run.
  * @param {object} spec - Lifecycle state setters and runner.
  * @returns {Promise<void>} Completion promise.
  */
-async function runSynthesisLifecycle({ abortController, request, setBusy, setActiveCharacterId, setStatus, onFailure, onValidationFieldError, run }) {
+async function runSynthesisLifecycle({ abortController, request, setBusy, setBusyMeta, setActiveCharacterId, setStatus, onFailure, onValidationFieldError, onNotify, onUnlockSound, run }) {
+  onUnlockSound?.();
   const controller = new AbortController();
   abortController.current = controller;
   const startedAt = Date.now();
-  let baseMessage = 'Preparing speech generation…';
-  const syncTimerStatus = () => {
-    const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
-    setStatus({ message: `${baseMessage} (${secs}s)`, error: false });
-  };
+  const initialMessage = 'Preparing speech generation…';
   const updateProgress = nextMsg => {
-    baseMessage = nextMsg;
-    syncTimerStatus();
+    setBusyMeta({ startedAt, message: nextMsg });
+    setStatus({ message: nextMsg, error: false });
   };
   setBusy(true);
+  setBusyMeta({ startedAt, message: initialMessage });
   setActiveCharacterId(request?.character?.id || null);
-  setStatus({ message: baseMessage, error: false });
-  const timer = globalThis.setInterval(syncTimerStatus, LIVE_TIMER_TICK_MS);
+  setStatus({ message: initialMessage, error: false });
   try {
     await run(controller.signal, updateProgress);
   } catch (error) {
-    handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError });
+    handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify });
   } finally {
-    globalThis.clearInterval(timer);
     if (abortController.current === controller) abortController.current = null;
+    setBusyMeta(null);
     setActiveCharacterId(null);
     setBusy(false);
-  }
-}
-
-/**
- * Validates an audio clip via `lockReferenceAudio`, surfacing validation errors into `setStatus`.
- * @param {object} lockReferenceAudio - Audio validation use case.
- * @param {Function} setStatus - Status setter callback.
- * @param {File} file - Candidate audio file.
- * @returns {Promise<object|null>} Validated clip metadata or null on error.
- */
-async function validateAudioClipWithStatus(lockReferenceAudio, setStatus, file) {
-  try {
-    return await lockReferenceAudio.execute(file);
-  } catch (error) {
-    setStatus({ message: error.message, error: true });
-    return null;
   }
 }
 
@@ -138,42 +122,43 @@ async function validateAudioClipWithStatus(lockReferenceAudio, setStatus, file) 
 function startSynthesisGeneration(ctx) {
   if (ctx.busy || ctx.abortController.current) return Promise.resolve();
   return runSynthesisLifecycle({
-    abortController: ctx.abortController, request: ctx.request, setBusy: ctx.setBusy,
+    abortController: ctx.abortController, request: ctx.request, setBusy: ctx.setBusy, setBusyMeta: ctx.setBusyMeta,
     setActiveCharacterId: ctx.setActiveCharacterId, setStatus: ctx.setStatus,
     onFailure: ctx.onFailure, onValidationFieldError: ctx.onValidationFieldError,
+    onNotify: ctx.onNotify, onUnlockSound: ctx.onUnlockSound,
     run: (signal, updateProgress) => executeSynthesisRequest({
       synthesizeSpeech: ctx.synthesizeSpeech, request: ctx.request, signal,
       onReferenceUploaded: ctx.onReferenceUploaded, onCompleted: ctx.onCompleted,
-      updateProgress, setStatus: ctx.setStatus, setRecording: ctx.setRecording, setLastSeed: ctx.setLastSeed,
+      updateProgress, setStatus: ctx.setStatus, setRecording: ctx.setRecording, setLastSeed: ctx.setLastSeed, onNotify: ctx.onNotify,
     }),
   });
 }
 
 /**
  * Coordinates abortable single-character speech synthesis and status reporting.
- * Inputs: `{ onFailure, onValidationFieldError }`.
- * Outputs: `{ busy, activeCharacterId, recording, lastSeed, status, setStatus, runGeneration, validateAudioClip, cancel }`.
+ * Inputs: `{ onFailure, onValidationFieldError, onNotify, onUnlockSound }`.
+ * Outputs: `{ busy, busyMeta, activeCharacterId, recording, lastSeed, status, setStatus, runGeneration, cancel }`.
  * Side effects: invokes injected domain use cases and aborts pending calls on unmount.
  * Failure modes: translates ValidationError, SynthesisCancelledError, and SynthesisError into status state.
- * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void }} params - Hook callbacks.
+ * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void, onNotify?: Function, onUnlockSound?: Function }} params - Hook callbacks.
  * @returns {object} Synthesis state and actions.
  */
-export function useSpeechSynthesis({ onFailure, onValidationFieldError }) {
-  const { synthesizeSpeech, lockReferenceAudio } = useStudioServices();
+export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify, onUnlockSound }) {
+  const { synthesizeSpeech } = useStudioServices();
   const abortController = useRef(null);
   const [busy, setBusy] = useState(false);
+  const [busyMeta, setBusyMeta] = useState(null);
   const [activeCharacterId, setActiveCharacterId] = useState(null);
   const [recording, setRecording] = useState(null);
   const [lastSeed, setLastSeed] = useState(null);
   const [status, setStatus] = useState({ message: 'No audio generated yet.', error: false });
   useEffect(() => () => abortController.current?.abort(), []);
   return {
-    busy, activeCharacterId, recording, lastSeed, status, setStatus,
+    busy, busyMeta, activeCharacterId, recording, lastSeed, status, setStatus,
     runGeneration: args => startSynthesisGeneration({
-      ...args, busy, abortController, synthesizeSpeech, setBusy, setActiveCharacterId,
-      setStatus, setRecording, setLastSeed, onFailure, onValidationFieldError,
+      ...args, busy, abortController, synthesizeSpeech, setBusy, setBusyMeta, setActiveCharacterId,
+      setStatus, setRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound,
     }),
-    validateAudioClip: file => validateAudioClipWithStatus(lockReferenceAudio, setStatus, file),
     cancel: () => abortController.current?.abort(),
   };
 }

@@ -1,15 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { countGraphemes } from '../../src/domain/presets.js';
 import {
+  adjustSubtitleSegmentTiming,
+  buildBoundedTtsHandoff,
   buildDialogueText,
   buildSrt,
   buildTtsScriptFromSegments,
   buildVtt,
   collectUniqueSpeakers,
+  countTextMatchesInSegments,
+  deleteSubtitleSegment,
+  findActiveSegmentId,
+  formatEditableTimestamp,
   formatShortClock,
   formatSubtitleTime,
   getSpeakerColor,
+  isAudioOnlyFile,
+  mergeSubtitleSegmentWithNext,
+  parseEditableTimestamp,
+  replaceTextInSegments,
   resolveSpeakerLabel,
+  splitSubtitleSegment,
 } from '../../src/domain/subtitles.js';
 
 const SAMPLE_SEGMENTS = [
@@ -46,4 +58,140 @@ test('buildSrt, buildVtt, buildDialogueText, and buildTtsScriptFromSegments supp
 
   const ttsOnlySpeaker2 = buildTtsScriptFromSegments({ segments: SAMPLE_SEGMENTS, useTranslation: true, speakerId: 'speaker-2' });
   assert.equal(ttsOnlySpeaker2, 'អរគុណដែលបានអញ្ជើញខ្ញុំ។');
+});
+
+test('isAudioOnlyFile, bilingual exports, and includeSpeaker=false dialogue formatting', () => {
+  assert.equal(isAudioOnlyFile({ name: 'podcast.mp3', type: 'audio/mpeg' }), true);
+  assert.equal(isAudioOnlyFile({ name: 'voice.WAV', type: '' }), true);
+  assert.equal(isAudioOnlyFile({ name: 'clip.mp4', type: 'video/mp4' }), false);
+  assert.equal(isAudioOnlyFile(null), false);
+
+  const vttBilingual = buildVtt({ segments: SAMPLE_SEGMENTS.slice(0, 1), includeSpeaker: false, useTranslation: true, bilingual: true });
+  assert.equal(vttBilingual.includes('Speaker 1:'), false);
+  assert.ok(vttBilingual.includes('Welcome to the evening news.\nសូមស្វាគមន៍មកកាន់ព័ត៌មានពេលល្ងាច។'));
+
+  const dialogueNoSpeaker = buildDialogueText({ segments: SAMPLE_SEGMENTS, includeTimestamps: false, useTranslation: true, includeSpeaker: false });
+  assert.equal(dialogueNoSpeaker.includes('Speaker'), false);
+  assert.ok(dialogueNoSpeaker.startsWith('សូមស្វាគមន៍មកកាន់ព័ត៌មានពេលល្ងាច។ ព័ត៌មានសំខាន់ចាប់ផ្តើមពីភ្នំពេញ។\n'));
+
+  const dialogueBilingual = buildDialogueText({
+    segments: SAMPLE_SEGMENTS.slice(0, 1),
+    includeTimestamps: false,
+    useTranslation: true,
+    includeSpeaker: false,
+    bilingual: true,
+  });
+  assert.equal(dialogueBilingual, 'Welcome to the evening news.\nសូមស្វាគមន៍មកកាន់ព័ត៌មានពេលល្ងាច។');
+});
+
+test('buildBoundedTtsHandoff caps length safely at segment or grapheme boundaries', () => {
+  const short = buildBoundedTtsHandoff({ segments: SAMPLE_SEGMENTS, useTranslation: true, speakerId: 'speaker-2', maxGraphemes: 200 });
+  assert.equal(short.truncated, false);
+  assert.equal(short.includedSegments, 1);
+
+  const manySegments = Array.from({ length: 30 }, (_, i) => ({
+    id: `seg-${i}`,
+    start: i,
+    end: i + 1,
+    speakerId: 'speaker-1',
+    text: `Sentence number ${i + 1} with plenty of words to push well past a tiny limit.`,
+    translatedText: 'សួស្តីកម្ពុជាប្រជាធិបតេយ្យរុងរឿងជានិច្ច។',
+  }));
+  const bounded = buildBoundedTtsHandoff({ segments: manySegments, useTranslation: true, maxGraphemes: 120 });
+  assert.equal(bounded.truncated, true);
+  assert.ok(bounded.includedSegments > 0 && bounded.includedSegments < 30);
+  assert.ok(countGraphemes(bounded.text) <= 120);
+
+  const giantKhmer = [{ id: 'g-1', start: 0, end: 5, speakerId: 'speaker-1', text: 'ស្ត្រីខ្ញុំ'.repeat(40), translatedText: '' }];
+  const sliced = buildBoundedTtsHandoff({ segments: giantKhmer, useTranslation: false, maxGraphemes: 15 });
+  assert.equal(sliced.truncated, true);
+  assert.equal(countGraphemes(sliced.text), 15);
+  assert.equal(sliced.text.endsWith('\u17d2'), false);
+});
+
+test('active cue lookup, timestamp editing, split/merge/delete, and find-and-replace work cleanly', () => {
+  const segments = SAMPLE_SEGMENTS.map((seg, i) => ({ ...seg, id: `seg-${i + 1}` }));
+  assert.equal(findActiveSegmentId(segments, 4.0), 'seg-2');
+  assert.equal(findActiveSegmentId(segments, 99.0), '');
+  assert.equal(findActiveSegmentId(segments, Number.NaN), '');
+
+  assert.equal(formatEditableTimestamp(65.4), '01:05.4');
+  assert.equal(formatEditableTimestamp(3661.2), '1:01:01.2');
+  assert.equal(parseEditableTimestamp('01:05.4'), 65.4);
+  assert.equal(parseEditableTimestamp('1:01:01.2'), 3661.2);
+  assert.equal(parseEditableTimestamp('42.5'), 42.5);
+  assert.equal(parseEditableTimestamp('01:75'), null);
+  assert.equal(parseEditableTimestamp('abc'), null);
+
+  const retimed = adjustSubtitleSegmentTiming(segments, 'seg-1', { start: 2.0, end: 1.0 });
+  assert.equal(retimed[0].start, 2.0);
+  assert.equal(retimed[0].end, 2.1);
+
+  const split = splitSubtitleSegment(segments, 'seg-1', { ratio: 0.5 });
+  assert.equal(split.length, 4);
+  assert.equal(split[0].end, split[1].start);
+  assert.ok(split[0].text.length > 0 && split[1].text.length > 0);
+
+  const merged = mergeSubtitleSegmentWithNext(split, 'seg-1');
+  assert.equal(merged.length, 3);
+  assert.equal(merged[0].start, 0.5);
+  assert.equal(merged[0].end, 3.2);
+
+  const deleted = deleteSubtitleSegment(merged, 'seg-2');
+  assert.equal(deleted.length, 2);
+
+  const replaced = replaceTextInSegments({
+    segments: [{ id: 'r1', text: 'Price is $25 ($25)', translatedText: '' }],
+    findText: '$25',
+    replaceText: '$30',
+    useTranslation: false,
+  });
+  assert.equal(replaced.matchCount, 2);
+  assert.equal(replaced.segmentCount, 1);
+  assert.equal(replaced.segments[0].text, 'Price is $30 ($30)');
+
+  // Literal $-sequences ($&, $$, $1) must not be expanded as regex replacement patterns
+  const dollarSafe = replaceTextInSegments({
+    segments: [{ id: 'r2', text: 'Total USD and USD', translatedText: '' }],
+    findText: 'USD',
+    replaceText: '$& $$50',
+    useTranslation: false,
+  });
+  assert.equal(dollarSafe.segments[0].text, 'Total $& $$50 and $& $$50');
+  assert.deepEqual(
+    countTextMatchesInSegments({ segments: [{ id: 'r2', text: 'Total USD and usd', translatedText: '' }], findText: 'USD', caseSensitive: true }),
+    { matchCount: 1, segmentCount: 1 }
+  );
+
+  // Splitting a sub-0.2s cue still produces two strictly positive-duration cues
+  const shortSplit = splitSubtitleSegment([{ id: 's1', start: 1.0, end: 1.15, text: 'Hello world', translatedText: '' }], 's1');
+  assert.equal(shortSplit.length, 2);
+  assert.ok(shortSplit[0].end > shortSplit[0].start);
+  assert.ok(shortSplit[1].end > shortSplit[1].start);
+  assert.equal(shortSplit[0].end, shortSplit[1].start);
+
+  // Translated-mode find/replace never leaks or replaces original `text` when `translatedText` is empty
+  const emptyTrSegs = [{ id: 'tr-1', text: 'English only', translatedText: '' }];
+  assert.deepEqual(countTextMatchesInSegments({ segments: emptyTrSegs, findText: 'English', useTranslation: true }), { matchCount: 0, segmentCount: 0 });
+  const untouchedTr = replaceTextInSegments({ segments: emptyTrSegs, findText: 'English', replaceText: 'Khmer', useTranslation: true });
+  assert.equal(untouchedTr.matchCount, 0);
+  assert.equal(untouchedTr.segments[0].translatedText, '');
+
+  // CRLF and multiple consecutive whitespace-only blank lines collapse cleanly so SRT/VTT cue parsing never breaks
+  const multiBlankSegments = [
+    {
+      start: 0.0,
+      end: 2.0,
+      speakerId: 'speaker-1',
+      text: 'Line one\r\n\r\nLine two\n  \n\t\n  \nLine three',
+      translatedText: 'បន្ទាត់ទី១\r\n\r\n\t\n\nបន្ទាត់ទី២',
+    },
+  ];
+  const cleanSrt = buildSrt({ segments: multiBlankSegments, includeSpeaker: false, useTranslation: false });
+  assert.equal(cleanSrt, '1\n00:00:00,000 --> 00:00:02,000\nLine one\nLine two\nLine three\n');
+  const cleanVtt = buildVtt({ segments: multiBlankSegments, includeSpeaker: false, useTranslation: true, bilingual: true });
+  assert.equal(
+    cleanVtt,
+    'WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nLine one\nLine two\nLine three\nបន្ទាត់ទី១\nបន្ទាត់ទី២\n'
+  );
 });

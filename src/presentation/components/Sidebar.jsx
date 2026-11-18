@@ -39,7 +39,14 @@ function WorkspaceNavButton({ item, isActive, onSelect }) {
  * @param {object} props - Sidebar props.
  * @returns {React.ReactElement} Sidebar element.
  */
-export function Sidebar({ activeWorkspace = 'tts', workspaces = DEFAULT_WORKSPACES, onSelectWorkspace, onFocusScript }) {
+export function Sidebar({
+  activeWorkspace = 'tts',
+  workspaces = DEFAULT_WORKSPACES,
+  onSelectWorkspace,
+  onFocusScript,
+  soundMuted = false,
+  onToggleSoundMuted,
+}) {
   const handleSelect = id => {
     onSelectWorkspace?.(id);
     if (id === 'tts') onFocusScript?.();
@@ -55,6 +62,21 @@ export function Sidebar({ activeWorkspace = 'tts', workspaces = DEFAULT_WORKSPAC
           <WorkspaceNavButton key={item.id} item={item} isActive={activeWorkspace === item.id} onSelect={handleSelect} />
         ))}
       </nav>
+      {onToggleSoundMuted && (
+        <div className="sidebar-footer">
+          <button
+            type="button"
+            id="notification-sound-toggle"
+            className="button sidebar-item sound-toggle-button"
+            aria-pressed={!soundMuted}
+            title={soundMuted ? 'Unmute completion alert sound' : 'Mute completion alert sound'}
+            onClick={onToggleSoundMuted}
+          >
+            <Icon name={soundMuted ? 'volume_off' : 'volume_on'} />
+            <span>{soundMuted ? 'Sound muted' : 'Sound alerts'}</span>
+          </button>
+        </div>
+      )}
     </aside>
   );
 }

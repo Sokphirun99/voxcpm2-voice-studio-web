@@ -187,7 +187,7 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
   );
 }
 
-function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume }) {
+function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume }) {
   const {
     library, anchorApi, activeCharacter, activeAnchor,
     lockedSeeds, setLockedSeeds, characterActions,
@@ -198,6 +198,7 @@ function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExte
   const { logger } = useStudioServices();
   const scriptRef = useRef(null);
   const transcriptRef = useRef(null);
+  const prevHiddenRef = useRef(hidden);
   const [script, setScript] = useState('');
   const [options, setOptions] = useState(INITIAL_OPTIONS);
   const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
@@ -210,7 +211,19 @@ function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExte
     onConsumeExternalScript?.();
   }, [externalScript, onConsumeExternalScript]);
 
-  const synthesis = useSpeechSynthesis({ onFailure: shared.refreshEngine, onValidationFieldError: field => focusValidationField({ scriptRef, transcriptRef }, field) });
+  useEffect(() => {
+    if (prevHiddenRef.current && !hidden) {
+      scriptRef.current?.focus();
+    }
+    prevHiddenRef.current = hidden;
+  }, [hidden]);
+
+  const synthesis = useSpeechSynthesis({
+    onFailure: shared.refreshEngine,
+    onValidationFieldError: field => focusValidationField({ scriptRef, transcriptRef }, field),
+    onNotify: shared.onNotify,
+    onUnlockSound: shared.onUnlockSound,
+  });
   const hasScript = Boolean(script.trim());
   useEffect(() => {
     onTtsStateChange?.({ busy: synthesis.busy, hasScript, libraryOpen: libraryModal.open });
@@ -242,7 +255,7 @@ function useTextToSpeechWorkspace({ shared, actionsRef, externalScript: propExte
  * @returns {React.ReactElement} Text-to-Speech function workspace.
  */
 export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef, externalScript = '', onConsumeExternalScript }) {
-  const { state, ctrl } = useTextToSpeechWorkspace({ shared, actionsRef, externalScript, onConsumeExternalScript });
+  const { state, ctrl } = useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript, onConsumeExternalScript });
   const voiceActions = buildVoiceActions({
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
     setLibraryModal: state.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
@@ -255,7 +268,7 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
         onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
       <AudioPlayer recording={ctrl.synthesis.recording} activeCharacter={ctrl.activeCharacter} activeAnchor={ctrl.activeAnchor}
-        status={ctrl.synthesis.status} onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
+        status={ctrl.synthesis.status} busyMeta={ctrl.synthesis.busyMeta} onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
         onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
       <VoiceLibrary open={state.libraryModal.open} openSaveForm={state.libraryModal.openForm}
         busy={ctrl.synthesis.busy} library={state.library} anchors={state.anchorApi.anchors}

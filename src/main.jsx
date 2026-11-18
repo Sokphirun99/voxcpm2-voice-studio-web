@@ -16,6 +16,7 @@ import { createHttpVoiceRepository } from './data/httpVoiceRepository.js';
 import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepository.js';
 import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
 import { createMediaSubtitleGateway } from './data/mediaSubtitleGateway.js';
+import { createNotificationSoundPlayer } from './data/notificationSound.js';
 import { createWebAudioDecoder } from './data/webAudioDecoder.js';
 import {
   createLockReferenceAudioUseCase,
@@ -47,10 +48,12 @@ function createStudioServices() {
   const audioDecoder = createWebAudioDecoder();
   const versionChecker = createHttpVersionChecker({ logger });
   const mediaSubtitleGateway = createMediaSubtitleGateway({ logger });
+  const notificationSound = createNotificationSoundPlayer({ logger });
 
   return {
     speechGateway,
     mediaSubtitleGateway,
+    notificationSound,
     audioDecoder,
     versionChecker,
     logger,

@@ -9,6 +9,12 @@ const TRANSCRIBE_ENDPOINT = '/media_api/transcribe';
 const TRANSLATE_ENDPOINT = '/media_api/translate';
 const BURN_ENDPOINT = '/media_api/burn';
 const HEALTH_TIMEOUT_MS = 3000;
+const HTML_ERROR_MESSAGES = Object.freeze({
+  413: 'Media file exceeds the server upload limit (HTTP 413).',
+  502: 'Could not reach the local video subtitle service (HTTP 502). Check that media service is running.',
+  503: 'The local video subtitle service is temporarily unavailable (HTTP 503).',
+  504: 'Video subtitle processing timed out via proxy (HTTP 504).',
+});
 
 /**
  * Checks whether an error reflects an aborted Fetch call.
@@ -20,21 +26,36 @@ function isAbortError(error) {
 }
 
 /**
- * Reads a readable JSON `detail` or text error message from a failed HTTP response.
+ * Checks whether a response payload looks like an HTML error page from Nginx/proxy.
+ * @param {string} raw - Trimmed response body.
+ * @param {string} contentType - Normalized Content-Type header.
+ * @returns {boolean} True when response is HTML.
+ */
+function isHtmlErrorPayload(raw, contentType) {
+  return raw.startsWith('<') || contentType.includes('text/html');
+}
+
+/**
+ * Reads a readable JSON `detail` or text error message from a failed HTTP response, hiding raw proxy HTML.
  * @param {Response} response - Non-OK HTTP response.
  * @param {string} fallback - Fallback error text.
  * @returns {Promise<string>} Safe error description.
  */
 async function readHttpErrorDetail(response, fallback) {
   const raw = await response.text().catch(() => '');
-  if (!raw) return `${fallback} (HTTP ${response.status}).`;
+  const trimmed = raw.trim();
+  if (!trimmed) return `${fallback} (HTTP ${response.status}).`;
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(trimmed);
     if (typeof parsed?.detail === 'string' && parsed.detail.trim()) return parsed.detail.trim();
   } catch {
-    // plain text fallback below
+    // non-JSON fallback below
   }
-  return raw.slice(0, 220).trim();
+  const contentType = String(response.headers?.get?.('content-type') || '').toLowerCase();
+  if (isHtmlErrorPayload(trimmed, contentType)) {
+    return HTML_ERROR_MESSAGES[response.status] || `${fallback} (HTTP ${response.status}).`;
+  }
+  return trimmed.slice(0, 220);
 }
 
 /**
@@ -114,12 +135,22 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       }
     },
 
-    async burnSubtitles({ jobId, segments, speakerNames, includeSpeaker = true, useTranslation = false, videoSize, signal }) {
+    async burnSubtitles({
+      jobId,
+      segments,
+      speakerNames,
+      includeSpeaker = false,
+      useTranslation = false,
+      bilingual = false,
+      subtitleStyle,
+      videoSize,
+      signal,
+    }) {
       try {
         const res = await fetchImpl(BURN_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jobId, segments, speakerNames, includeSpeaker, useTranslation, videoSize }),
+          body: JSON.stringify({ jobId, segments, speakerNames, includeSpeaker, useTranslation, bilingual, subtitleStyle, videoSize }),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not burn subtitles onto video'), { status: res.status });

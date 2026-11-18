@@ -43,4 +43,20 @@ test('mediaSubtitleGateway surfaces HTTP error details and cancellation cleanly'
     fetchImpl: async () => { throw new DOMException('Aborted', 'AbortError'); },
   });
   await assert.rejects(() => abortGw.transcribeVideo({ file: new Blob(['v']) }), SynthesisCancelledError);
+
+  const htmlStatuses = [
+    { status: 502, html: '<html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>', match: /HTTP 502/ },
+    { status: 504, html: '<!DOCTYPE html><html><head><title>504 Gateway Time-out</title></head></html>', match: /timed out.*HTTP 504/i },
+    { status: 413, html: '<html><head><title>413 Request Entity Too Large</title></head></html>', match: /upload limit.*HTTP 413/i },
+    { status: 500, html: '<div>Internal Error</div>', headers: { 'content-type': 'text/html' }, match: /HTTP 500/ },
+  ];
+  for (const item of htmlStatuses) {
+    const htmlGw = createMediaSubtitleGateway({
+      fetchImpl: async () => new Response(item.html, { status: item.status, headers: item.headers || { 'content-type': 'text/html' } }),
+    });
+    await assert.rejects(
+      () => htmlGw.transcribeVideo({ file: new Blob(['v']) }),
+      err => err instanceof SynthesisError && item.match.test(err.message) && !/[<>]/.test(err.message)
+    );
+  }
 });

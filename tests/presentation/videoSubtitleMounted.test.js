@@ -99,7 +99,16 @@ function createDomShim() {
       event.currentTarget = null;
       return true;
     }
-    focus() { globalThis.document.activeElement = this; }
+    focus() {
+      globalThis.document.activeElement = this;
+      this.dispatchEvent({ type: 'focus', bubbles: false });
+      this.dispatchEvent({ type: 'focusin', bubbles: true });
+    }
+    blur() {
+      if (globalThis.document.activeElement === this) globalThis.document.activeElement = null;
+      this.dispatchEvent({ type: 'blur', bubbles: false });
+      this.dispatchEvent({ type: 'focusout', bubbles: true });
+    }
     showModal() { this.open = true; }
     close() { this.open = false; this.dispatchEvent({ type: 'close' }); }
     click() {
@@ -145,6 +154,7 @@ function createDomShim() {
       this.checked = false;
       this.selectionStart = 0;
       this.selectionEnd = 0;
+      if (this.tagName === 'TRACK') this.track = { mode: 'disabled' };
     }
     get options() { return this.querySelectorAll('option'); }
     get length() { return this.tagName === 'SELECT' ? this.options.length : 0; }
@@ -368,6 +378,1189 @@ test('mounted Studio switches to Video to subtitle, extracts speakers, burns MP4
     assert.ok(dialog.querySelector('#save-voice-name'));
     await act(async () => { dialog.querySelector('#close-voice-library').click(); });
     assert.equal(dialog.open, false);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted Studio handles speaker ON/OFF, audio-only burn guard, playback sync, cue edits, find-replace, and toast+sound cues across TTS & subtitles', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+
+    const soundEvents = [];
+    let muted = false;
+    let transcribeCalls = [];
+    let shouldFailTranscribe = false;
+    let shouldFailTts = false;
+
+    const services = {
+      speechGateway: {
+        checkAvailability: async () => true,
+        checkHealth: async () => ({ online: true, detail: null }),
+        uploadReferenceAudio: async () => ({}),
+        synthesize: async () => ({}),
+      },
+      notificationSound: {
+        isMuted: () => muted,
+        setMuted: next => { muted = Boolean(next); return muted; },
+        unlock: () => soundEvents.push('unlock'),
+        play: async kind => {
+          if (muted) return false;
+          soundEvents.push(`play:${kind}`);
+          return true;
+        },
+      },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        transcribeVideo: async params => {
+          transcribeCalls.push({
+            name: params.file.name,
+            diarize: params.diarize,
+            numSpeakers: params.numSpeakers,
+          });
+          if (shouldFailTranscribe) throw new Error('Whisper crashed');
+          if (!params.diarize) {
+            return {
+              jobId: '1111222233334444',
+              language: 'km',
+              isAudioOnly: params.file.name.endsWith('.mp3'),
+              speakers: ['speaker-1'],
+              videoSize: params.file.name.endsWith('.mp3') ? null : { width: 1080, height: 1920 },
+              segments: [
+                { id: 'seg-1', start: 0.0, end: 2.0, speakerId: 'speaker-1', text: 'សួស្តី មិត្តភក្តិ', translatedText: '' },
+                { id: 'seg-2', start: 2.2, end: 4.5, speakerId: 'speaker-1', text: 'សូមស្វាគមន៍ មិត្តភក្តិ', translatedText: '' },
+              ],
+            };
+          }
+          return {
+            jobId: '5555666677778888',
+            language: 'en',
+            isAudioOnly: false,
+            speakers: ['speaker-1', 'speaker-2'],
+            videoSize: { width: 1920, height: 1080 },
+            segments: [
+              { id: 'seg-1', start: 0.0, end: 1.5, speakerId: 'speaker-1', text: 'Hello host.', translatedText: 'សួស្តី ពិធីករ។' },
+              { id: 'seg-2', start: 1.6, end: 3.5, speakerId: 'speaker-2', text: 'Hello guest.', translatedText: 'សួស្តី ភ្ញៀវ។' },
+            ],
+          };
+        },
+        translateSegments: async ({ segments }) => ({ segments }),
+        burnSubtitles: async () => new Blob(['ftypmp4'], { type: 'video/mp4' }),
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: {
+        execute: async ({ script }) => {
+          if (shouldFailTts) throw new Error('TTS timeout');
+          return {
+            recording: { id: 'take-1', seed: 42, characterId: 'char-nisa', characterName: 'Nisa', transcript: script, blob: new Blob(['RIFF']), audioDurationSeconds: 1.0, elapsedMs: 120, sizeBytes: 100 },
+            uploadedFileData: null,
+          };
+        },
+      },
+      lockReferenceAudio: { execute: async file => ({ blob: file }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+
+    const findToast = kindClass =>
+      dom.container.querySelectorAll('.studio-toast').find(el => String(el.className || '').includes(kindClass));
+
+    // 1. TTS generation success triggers popup toast + success sound cue
+    const scriptInput = dom.container.querySelector('#script');
+    await act(async () => {
+      scriptInput._value = 'សួស្តីអ្នកទាំងអស់គ្នា';
+      scriptInput.dispatchEvent({ type: 'input', bubbles: true, target: scriptInput });
+    });
+    await act(async () => {
+      dom.container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.ok(dom.container.querySelector('#studio-toast-region'));
+    assert.ok(findToast('is-success'));
+    assert.ok(soundEvents.includes('unlock'));
+    assert.ok(soundEvents.includes('play:success'));
+
+    // Dismiss toast cleanly
+    await act(async () => {
+      dom.container.querySelector('.studio-toast-dismiss').click();
+    });
+    assert.equal(dom.container.querySelector('#studio-toast-region'), null);
+
+    // 2. TTS failure triggers error toast + error sound cue
+    shouldFailTts = true;
+    await act(async () => {
+      dom.container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.ok(findToast('is-error'));
+    assert.ok(soundEvents.includes('play:error'));
+
+    // 3. Switch to Video to subtitle: speaker detection starts OFF, Video language uses 1-col full width, and clicking label text never toggles switches
+    await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
+    const subPanel = dom.container.querySelector('.subtitle-workspace');
+    const optionGrid = subPanel.querySelector('.subtitle-option-grid');
+    const detectToggle = subPanel.querySelector('#subtitle-detect-speakers');
+    const detectLabel = subPanel.querySelector('#subtitle-detect-speakers-label');
+    const detectRow = detectToggle.parentNode;
+    assert.equal(optionGrid.getAttribute('data-columns'), '1');
+    assert.equal(detectToggle.checked, false);
+    assert.equal(detectToggle.getAttribute('role'), 'switch');
+    assert.equal(detectToggle.getAttribute('aria-labelledby'), 'subtitle-detect-speakers-label');
+    assert.notEqual(detectRow.tagName, 'LABEL');
+    assert.equal(detectLabel.tagName, 'SPAN');
+    assert.equal(subPanel.querySelectorAll('label').some(el => el.getAttribute('for') === 'subtitle-detect-speakers'), false);
+    assert.equal(subPanel.querySelector('#subtitle-speaker-count').parentNode.parentNode.hasAttribute('hidden'), true);
+    assert.equal(subPanel.querySelector('#subtitle-include-speaker').parentNode.hasAttribute('hidden'), true);
+
+    await act(async () => {
+      detectLabel.click();
+      detectRow.click();
+    });
+    assert.equal(detectToggle.checked, false);
+    assert.equal(optionGrid.getAttribute('data-columns'), '1');
+
+    // Upload audio-only .mp3 -> diarize=false, single speaker hidden, burn button disabled
+    const fileInput = subPanel.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp3'], 'podcast.mp3', { type: 'audio/mpeg' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    assert.equal(transcribeCalls.at(-1).diarize, false);
+    assert.equal(subPanel.querySelector('.subtitle-roster'), null);
+    assert.equal(subPanel.querySelector('.subtitle-speaker-badge'), null);
+    assert.equal(subPanel.querySelector('#subtitle-burn-btn').disabled || subPanel.querySelector('#subtitle-burn-btn').hasAttribute('disabled'), true);
+
+    // Playback sync highlights matching active cue row
+    const videoEl = subPanel.querySelector('video');
+    await act(async () => {
+      videoEl.currentTime = 2.8;
+      videoEl.dispatchEvent({ type: 'timeupdate', currentTarget: videoEl });
+    });
+    const activeRows = subPanel.querySelectorAll('.subtitle-segment-row');
+    assert.equal(activeRows[0].className.includes('is-active'), false);
+    assert.equal(activeRows[1].className.includes('is-active'), true);
+
+    // Inline timing editor opens and adjusts cue timestamps
+    const firstTimeBtn = subPanel.querySelectorAll('button').find(b => b.textContent.includes('Time'));
+    await act(async () => { firstTimeBtn.click(); });
+    assert.ok(subPanel.querySelector('.subtitle-timing-bar'));
+    await act(async () => {
+      subPanel.querySelectorAll('.subtitle-nudge-btn')[1].click();
+    });
+    assert.match(subPanel.querySelector('.subtitle-time-jump').textContent, /00:00 - 00:02/);
+
+    // Find & replace updates all matching segments cleanly
+    await act(async () => { subPanel.querySelector('#subtitle-find-toggle').click(); });
+    const findInput = subPanel.querySelector('#subtitle-find-input');
+    const replaceInput = subPanel.querySelector('#subtitle-replace-input');
+    await act(async () => {
+      findInput._value = 'មិត្តភក្តិ';
+      findInput.dispatchEvent({ type: 'input', bubbles: true, target: findInput });
+      replaceInput._value = 'បងប្អូន';
+      replaceInput.dispatchEvent({ type: 'input', bubbles: true, target: replaceInput });
+    });
+    await act(async () => {
+      subPanel.querySelector('.subtitle-find-bar').dispatchEvent({ type: 'submit', bubbles: true });
+    });
+    assert.match(subPanel.querySelectorAll('textarea')[0].value, /បងប្អូន/);
+    assert.match(subPanel.querySelectorAll('textarea')[1].value, /បងប្អូន/);
+
+    // Split + Merge + Delete edit operations work on segments
+    const firstSplit = subPanel.querySelectorAll('button').find(b => b.textContent.includes('Split'));
+    await act(async () => { firstSplit.click(); });
+    assert.equal(subPanel.querySelectorAll('.subtitle-segment-row').length, 3);
+
+    const firstMerge = subPanel.querySelectorAll('button').find(b => b.textContent.includes('Merge'));
+    await act(async () => { firstMerge.click(); });
+    assert.equal(subPanel.querySelectorAll('.subtitle-segment-row').length, 2);
+
+    const firstDelete = subPanel.querySelector('.subtitle-cue-delete');
+    await act(async () => { firstDelete.click(); });
+    assert.equal(subPanel.querySelectorAll('.subtitle-segment-row').length, 1);
+
+    // 4. Turn speaker detection ON, switch to portrait/landscape video -> expands option grid to 2 columns, resets videoSize cleanly, sends diarize=true, filters TTS speaker
+    await act(async () => {
+      detectToggle.checked = true;
+      detectToggle.dispatchEvent({ type: 'click', bubbles: true, target: detectToggle });
+    });
+    assert.equal(detectToggle.checked, true);
+    assert.equal(optionGrid.getAttribute('data-columns'), '2');
+    assert.equal(subPanel.querySelector('#subtitle-speaker-count').parentNode.parentNode.hasAttribute('hidden'), false);
+    const includeSpeakerToggle = subPanel.querySelector('#subtitle-include-speaker');
+    const includeSpeakerLabel = subPanel.querySelector('#subtitle-include-speaker-label');
+    const includeSpeakerRow = includeSpeakerToggle.parentNode;
+    assert.equal(includeSpeakerRow.hasAttribute('hidden'), false);
+    assert.notEqual(includeSpeakerRow.tagName, 'LABEL');
+    assert.equal(includeSpeakerLabel.tagName, 'SPAN');
+    assert.equal(includeSpeakerToggle.getAttribute('role'), 'switch');
+    assert.equal(includeSpeakerToggle.getAttribute('aria-labelledby'), 'subtitle-include-speaker-label');
+    assert.equal(subPanel.querySelectorAll('label').some(el => el.getAttribute('for') === 'subtitle-include-speaker'), false);
+    await act(async () => {
+      includeSpeakerLabel.click();
+      includeSpeakerRow.click();
+    });
+    assert.equal(includeSpeakerToggle.checked, false);
+
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'interview.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    assert.ok(subPanel.querySelector('#subtitle-style-position'));
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    assert.equal(transcribeCalls.at(-1).diarize, true);
+    assert.equal(subPanel.querySelectorAll('.subtitle-speaker-badge').length, 2);
+
+    const ttsSpeakerSel = subPanel.querySelector('#subtitle-tts-speaker');
+    assert.ok(ttsSpeakerSel);
+    await act(async () => {
+      ttsSpeakerSel.value = 'speaker-2';
+      ttsSpeakerSel.dispatchEvent({ type: 'change', bubbles: true, target: ttsSpeakerSel });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-send-tts-btn').click(); });
+    assert.equal(dom.container.querySelector('#script').value, 'Hello guest.');
+
+    // 5. Mute toggle suppresses audio cues while still displaying error popup on failed extraction
+    const muteBtn = dom.container.querySelector('#notification-sound-toggle');
+    await act(async () => { muteBtn.click(); });
+    assert.equal(muted, true);
+    const prevPlayCount = soundEvents.filter(e => e.startsWith('play:')).length;
+
+    await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
+    shouldFailTranscribe = true;
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    assert.equal(soundEvents.filter(e => e.startsWith('play:')).length, prevPlayCount);
+    assert.match(findToast('is-error').textContent, /Whisper crashed/);
+
+    // 6. Selecting a new file after portrait extraction resets videoSize (data-orientation reverts to landscape)
+    shouldFailTranscribe = false;
+    await act(async () => {
+      detectToggle.checked = false;
+      detectToggle.dispatchEvent({ type: 'click', bubbles: true, target: detectToggle });
+      fileInput.files = [new File(['mp4'], 'portrait.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    assert.equal(subPanel.querySelector('.subtitle-video-frame').getAttribute('data-orientation'), 'portrait');
+
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'next.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-video-frame').getAttribute('data-orientation'), 'landscape');
+
+    // 7. Cancelling an in-flight extraction emits neither an error toast nor an error sound
+    while (dom.container.querySelector('.studio-toast-dismiss')) {
+      await act(async () => { dom.container.querySelector('.studio-toast-dismiss').click(); });
+    }
+    const prevErrPlays = soundEvents.filter(e => e === 'play:error').length;
+    services.mediaSubtitleGateway.transcribeVideo = async ({ signal }) => {
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const err = new Error('Subtitle extraction cancelled.');
+          err.name = 'SynthesisCancelledError';
+          reject(err);
+        });
+      });
+    };
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    assert.ok(subPanel.querySelector('#subtitle-cancel-btn'));
+    assert.equal(detectRow.getAttribute('data-disabled'), 'true');
+    assert.equal(detectToggle.hasAttribute('disabled') || detectToggle.disabled, true);
+    await act(async () => { subPanel.querySelector('#subtitle-cancel-btn').click(); });
+    assert.equal(detectRow.getAttribute('data-disabled'), null);
+    assert.equal(detectToggle.hasAttribute('disabled') || Boolean(detectToggle.disabled), false);
+    assert.equal(Boolean(findToast('is-error')), false);
+    assert.equal(soundEvents.filter(e => e === 'play:error').length, prevErrPlays);
+    assert.match(subPanel.querySelector('.status').textContent, /Subtitle extraction cancelled/);
+
+    // 8. Turning Detect speakers ON -> Show speaker names ON -> Detect speakers OFF resets hidden includeSpeaker so Speaker 1 never leaks
+    await act(async () => { muteBtn.click(); });
+    services.mediaSubtitleGateway.transcribeVideo = async params => {
+      transcribeCalls.push({ name: params.file.name, diarize: params.diarize, numSpeakers: params.numSpeakers });
+      return {
+        jobId: '9999000011112222',
+        language: 'km',
+        isAudioOnly: false,
+        speakers: ['speaker-1'],
+        videoSize: { width: 1280, height: 720 },
+        segments: [
+          { id: 'seg-1', start: 0.1, end: 2.0, speakerId: 'speaker-1', text: 'សួស្តី កំពុងសាកល្បង', translatedText: '' },
+        ],
+      };
+    };
+    let capturedBurnIncludeSpeaker = null;
+    services.mediaSubtitleGateway.burnSubtitles = async payload => {
+      capturedBurnIncludeSpeaker = payload.includeSpeaker;
+      return new Blob(['ftypmp4'], { type: 'video/mp4' });
+    };
+
+    await act(async () => {
+      detectToggle.checked = true;
+      detectToggle.dispatchEvent({ type: 'click', bubbles: true, target: detectToggle });
+    });
+    const showSpeakerToggle = subPanel.querySelector('#subtitle-include-speaker');
+    await act(async () => {
+      showSpeakerToggle.checked = true;
+      showSpeakerToggle.dispatchEvent({ type: 'click', bubbles: true, target: showSpeakerToggle });
+    });
+    assert.equal(showSpeakerToggle.checked, true);
+
+    await act(async () => {
+      detectToggle.checked = false;
+      detectToggle.dispatchEvent({ type: 'click', bubbles: true, target: detectToggle });
+    });
+    assert.equal(showSpeakerToggle.checked, false);
+    assert.equal(optionGrid.getAttribute('data-columns'), '1');
+
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'solo.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    assert.equal(capturedBurnIncludeSpeaker, false);
+
+    // 9. Find & replace live match count + safe $ replacement + left-nudge duration preservation
+    if (!subPanel.querySelector('#subtitle-find-input')) {
+      await act(async () => { subPanel.querySelector('#subtitle-find-toggle').click(); });
+    }
+    const fInput = subPanel.querySelector('#subtitle-find-input');
+    const rInput = subPanel.querySelector('#subtitle-replace-input');
+    await act(async () => {
+      fInput._value = 'សួស្តី';
+      fInput.dispatchEvent({ type: 'input', bubbles: true, target: fInput });
+    });
+    assert.match(subPanel.querySelector('.subtitle-find-count').textContent, /1 match/);
+    await act(async () => {
+      rInput._value = '$& ១';
+      rInput.dispatchEvent({ type: 'input', bubbles: true, target: rInput });
+    });
+    await act(async () => {
+      subPanel.querySelector('.subtitle-find-bar').dispatchEvent({ type: 'submit', bubbles: true });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-line-input').value, '$& ១ កំពុងសាកល្បង');
+    assert.match(subPanel.querySelector('.subtitle-find-count').textContent, /Replaced 1/);
+
+    const timeToggleBtn = subPanel.querySelectorAll('button').find(b => b.textContent.includes('Time'));
+    await act(async () => { timeToggleBtn.click(); });
+    await act(async () => { subPanel.querySelectorAll('.subtitle-nudge-btn')[0].click(); });
+    const timingInputs = subPanel.querySelectorAll('.subtitle-timing-input');
+    assert.equal(timingInputs[0].value, '00:00.0');
+    assert.equal(timingInputs[1].value, '00:01.9');
+
+    // 10. Single giant segment (>2,000 chars) shows accurate single-segment trim toast and bounds TTS script
+    services.mediaSubtitleGateway.transcribeVideo = async () => ({
+      jobId: 'aaabbbcccdddeeee',
+      language: 'km',
+      isAudioOnly: false,
+      speakers: ['speaker-1'],
+      videoSize: { width: 1280, height: 720 },
+      segments: [{ id: 'seg-big', start: 0, end: 5, speakerId: 'speaker-1', text: 'ក'.repeat(2500), translatedText: '' }],
+    });
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'long.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-send-tts-btn').click(); });
+    assert.equal(dom.container.querySelector('#script').value.length, 2000);
+    assert.match(dom.container.querySelectorAll('.studio-toast').at(-1).textContent, /2,000-character TTS limit/);
+
+    // 11. Detect speakers ON + Show speaker names ON + 1 speaker extracted shows SpeakerRosterCard for renaming
+    await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
+    services.mediaSubtitleGateway.transcribeVideo = async () => ({
+      jobId: '1234567890abcdef',
+      language: 'km',
+      isAudioOnly: false,
+      speakers: ['speaker-1'],
+      videoSize: { width: 1280, height: 720 },
+      segments: [{ id: 'seg-solo', start: 1.0, end: 2.0, speakerId: 'speaker-1', text: 'សួស្តី ពិភពលោក', translatedText: '' }],
+    });
+    let soloBurnPayload = null;
+    services.mediaSubtitleGateway.burnSubtitles = async payload => {
+      soloBurnPayload = payload;
+      return new Blob(['ftypmp4'], { type: 'video/mp4' });
+    };
+    await act(async () => {
+      detectToggle.checked = true;
+      detectToggle.dispatchEvent({ type: 'click', bubbles: true, target: detectToggle });
+    });
+    await act(async () => {
+      showSpeakerToggle.checked = true;
+      showSpeakerToggle.dispatchEvent({ type: 'click', bubbles: true, target: showSpeakerToggle });
+    });
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'monologue.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    const soloRosterInput = subPanel.querySelector('.subtitle-roster-input');
+    assert.ok(soloRosterInput);
+    await act(async () => {
+      soloRosterInput._value = 'អ្នកអត្ថាធិប្បាយ';
+      soloRosterInput.dispatchEvent({ type: 'input', bubbles: true, target: soloRosterInput });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    assert.equal(soloBurnPayload.includeSpeaker, true);
+    assert.equal(soloBurnPayload.speakerNames['speaker-1'], 'អ្នកអត្ថាធិប្បាយ');
+
+    await act(async () => {
+      showSpeakerToggle.checked = false;
+      showSpeakerToggle.dispatchEvent({ type: 'click', bubbles: true, target: showSpeakerToggle });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-roster'), null);
+
+    // 12. TimingInlineEditor normalizes equivalent numeric input ('00:01.00' -> '00:01.0'), clamps invalid short end, and cancels on Escape
+    const soloTimeBtn = subPanel.querySelectorAll('button').find(b => b.textContent.includes('Time'));
+    await act(async () => { soloTimeBtn.click(); });
+    const [startInput, endInput] = subPanel.querySelectorAll('.subtitle-timing-input');
+    assert.equal(startInput.value, '00:01.0');
+    assert.equal(endInput.value, '00:02.0');
+
+    await act(async () => {
+      startInput.focus();
+      startInput._value = '00:01.00';
+      startInput.dispatchEvent({ type: 'input', bubbles: true, target: startInput });
+    });
+    await act(async () => {
+      startInput.blur();
+    });
+    assert.equal(startInput.value, '00:01.0');
+
+    await act(async () => {
+      endInput.focus();
+      endInput._value = '00:02.000';
+      endInput.dispatchEvent({ type: 'input', bubbles: true, target: endInput });
+    });
+    await act(async () => {
+      endInput.dispatchEvent({ type: 'keydown', key: 'Enter', bubbles: true, target: endInput });
+    });
+    assert.equal(endInput.value, '00:02.0');
+
+    await act(async () => {
+      endInput.focus();
+      endInput._value = '00:00.2';
+      endInput.dispatchEvent({ type: 'input', bubbles: true, target: endInput });
+    });
+    await act(async () => {
+      endInput.blur();
+    });
+    assert.equal(endInput.value, '00:01.1');
+
+    await act(async () => {
+      startInput.focus();
+      startInput._value = '00:09.0';
+      startInput.dispatchEvent({ type: 'input', bubbles: true, target: startInput });
+    });
+    await act(async () => {
+      startInput.dispatchEvent({ type: 'keydown', key: 'Escape', bubbles: true, target: startInput });
+    });
+    assert.equal(startInput.value, '00:01.0');
+    assert.equal(endInput.value, '00:01.1');
+    assert.match(subPanel.querySelector('.subtitle-time-jump').textContent, /00:01 - 00:01/);
+
+    // 13. Export guard blocks empty/whitespace-only SRT, VTT, TXT downloads and surfaces error status
+    const cueTextarea = subPanel.querySelector('.subtitle-line-input');
+    await act(async () => {
+      cueTextarea._value = '   \n  ';
+      cueTextarea.dispatchEvent({ type: 'input', bubbles: true, target: cueTextarea });
+    });
+    const origCreateObjectURL = URL.createObjectURL;
+    let exportBlobCalls = 0;
+    URL.createObjectURL = blob => {
+      exportBlobCalls += 1;
+      return origCreateObjectURL(blob);
+    };
+    try {
+      for (const label of ['Download .srt', 'Download .vtt', 'Download .txt']) {
+        const btn = subPanel.querySelectorAll('button').find(b => b.textContent.includes(label));
+        await act(async () => { btn.click(); });
+        assert.equal(exportBlobCalls, 0);
+        const statusEl = subPanel.querySelector('.status');
+        assert.ok(statusEl.className.includes('is-error'));
+        assert.match(statusEl.textContent, /No subtitle text to export/);
+      }
+      const copyBtn = subPanel.querySelectorAll('button').find(b => b.getAttribute('aria-label') === 'Copy dialogue');
+      await act(async () => { copyBtn.click(); });
+      const copyStatusEl = subPanel.querySelector('.status');
+      assert.ok(copyStatusEl.className.includes('is-error'));
+      assert.match(copyStatusEl.textContent, /No subtitle text to copy/);
+    } finally {
+      URL.createObjectURL = origCreateObjectURL;
+    }
+    // 14. Translated-mode textarea stays empty when cleared (never snaps original text back) and preserves sub-tenth ASR timing on untouched blur
+    services.mediaSubtitleGateway.transcribeVideo = async () => ({
+      jobId: 'fedcba9876543210',
+      language: 'en',
+      isAudioOnly: false,
+      speakers: ['speaker-1'],
+      videoSize: { width: 1280, height: 720 },
+      segments: [
+        { id: 'seg-a', start: 0.123, end: 2.456, speakerId: 'speaker-1', text: 'Good evening.', translatedText: 'សួស្តីពេលល្ងាច។' },
+        { id: 'seg-b', start: 3.0, end: 5.0, speakerId: 'speaker-1', text: 'Stay tuned.', translatedText: 'សូមរង់ចាំទស្សនា។' },
+      ],
+    });
+    let precisionBurnPayload = null;
+    services.mediaSubtitleGateway.burnSubtitles = async payload => {
+      precisionBurnPayload = payload;
+      return new Blob(['ftypmp4'], { type: 'video/mp4' });
+    };
+    const langSel = subPanel.querySelector('#subtitle-source-lang');
+    await act(async () => {
+      langSel.value = 'en';
+      langSel.dispatchEvent({ type: 'change', bubbles: true, target: langSel });
+    });
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'precision.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+
+    const trTextarea = subPanel.querySelectorAll('.subtitle-line-input')[0];
+    await act(async () => {
+      trTextarea._value = '';
+      trTextarea.dispatchEvent({ type: 'input', bubbles: true, target: trTextarea });
+    });
+    assert.equal(subPanel.querySelectorAll('.subtitle-line-input')[0].value, '');
+    assert.match(subPanel.querySelectorAll('.subtitle-source-ref')[0].textContent, /Good evening/);
+
+    const firstRowTimeBtn = subPanel.querySelectorAll('button').find(b => b.textContent.includes('Time'));
+    await act(async () => { firstRowTimeBtn.click(); });
+    const [pStartInput, pEndInput] = subPanel.querySelectorAll('.subtitle-timing-input');
+    // Untouched focus + blur preserves 0.123s precision
+    await act(async () => { pStartInput.focus(); });
+    await act(async () => { pStartInput.blur(); });
+    // Escape on Start does not suppress subsequent End commit
+    await act(async () => {
+      pStartInput.focus();
+      pStartInput._value = '00:08.0';
+      pStartInput.dispatchEvent({ type: 'input', bubbles: true, target: pStartInput });
+    });
+    await act(async () => {
+      pStartInput.dispatchEvent({ type: 'keydown', key: 'Escape', bubbles: true, target: pStartInput });
+    });
+    await act(async () => {
+      pEndInput.focus();
+      pEndInput._value = '00:02.7';
+      pEndInput.dispatchEvent({ type: 'input', bubbles: true, target: pEndInput });
+    });
+    await act(async () => { pEndInput.blur(); });
+    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    assert.equal(precisionBurnPayload.segments[0].start, 0.123);
+    assert.equal(precisionBurnPayload.segments[0].end, 2.7);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('VideoSubtitleWorkspace polls while offline, clears offline state on action success, debounces <track> VTT preview, sets track.mode=showing, and disables burn on blank cues', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
+  const origCreateObjectURL = URL.createObjectURL;
+  const origRevokeObjectURL = URL.revokeObjectURL;
+  const intervalCallbacks = new Map();
+  let intervalSeq = 0;
+  globalThis.setInterval = fn => {
+    const id = ++intervalSeq;
+    intervalCallbacks.set(id, fn);
+    return id;
+  };
+  globalThis.clearInterval = id => {
+    intervalCallbacks.delete(id);
+  };
+
+  let createdVtts = [];
+  let revokedUrls = [];
+  let blobId = 0;
+  URL.createObjectURL = blob => {
+    const url = `blob:vtt/${++blobId}`;
+    if (String(blob?.type || '').includes('text/vtt')) createdVtts.push({ url, blob });
+    return url;
+  };
+  URL.revokeObjectURL = url => {
+    revokedUrls.push(url);
+  };
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    let healthState = { online: false, reason: 'Cannot reach local video subtitle service on port 8810.' };
+    let healthChecks = 0;
+    const services = {
+      speechGateway: { checkAvailability: async () => true, uploadReferenceAudio: async () => ({}), synthesize: async () => ({}) },
+      mediaSubtitleGateway: {
+        checkHealth: async () => {
+          healthChecks += 1;
+          return { ...healthState };
+        },
+        transcribeVideo: async () => ({
+          jobId: '0123456789abcdef',
+          language: 'en',
+          isAudioOnly: false,
+          speakers: ['speaker-1'],
+          videoSize: { width: 1280, height: 720 },
+          segments: [{ id: 'seg-1', start: 0, end: 2, speakerId: 'speaker-1', text: 'First line', translatedText: '' }],
+        }),
+        translateSegments: async ({ segments }) => ({
+          segments: segments.map(s => ({ ...s, translatedText: 'បន្ទាត់ដំបូង' })),
+        }),
+        burnSubtitles: async () => new Blob(['ftypmp4'], { type: 'video/mp4' }),
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: { execute: async () => ({}) },
+      lockReferenceAudio: { execute: async f => ({ blob: f }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { notices: null })));
+      await new Promise(r => setTimeout(r, 15));
+    });
+
+    // 1. Offline banner shown on mount & polling interval registered while offline
+    assert.ok(dom.container.querySelector('.engine-alert-popup'));
+    assert.equal(intervalCallbacks.size, 1);
+    const pollFn = Array.from(intervalCallbacks.values())[0];
+
+    // Polling recovers online automatically and stops the offline interval
+    healthState = { online: true, burnInSupported: true, diarizationReady: true };
+    const checksBeforePoll = healthChecks;
+    await act(async () => {
+      pollFn();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(healthChecks, checksBeforePoll + 1);
+    assert.equal(dom.container.querySelector('.engine-alert-popup'), null);
+    assert.equal(intervalCallbacks.size, 0);
+
+    // Force offline again via Refresh -> successful extractSubtitles clears offline banner immediately
+    healthState = { online: false, reason: 'Temporarily offline' };
+    // Trigger failed extraction to invoke refreshHealth() -> surfaces offline banner
+    const origTranscribe = services.mediaSubtitleGateway.transcribeVideo;
+    services.mediaSubtitleGateway.transcribeVideo = async () => { throw new Error('Network error'); };
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'clip.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.ok(dom.container.querySelector('.engine-alert-popup'));
+    assert.equal(intervalCallbacks.size, 1);
+
+    // Even if checkHealth still returned offline, successful extractSubtitles clears offline state
+    services.mediaSubtitleGateway.transcribeVideo = origTranscribe;
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(dom.container.querySelector('.engine-alert-popup'), null);
+    assert.equal(intervalCallbacks.size, 0);
+
+    // 2. Programmatic track.mode === 'showing', debounced VTT updates without replacing <track>, and immediate clear on empty
+    const trackEl = dom.container.querySelector('track');
+    assert.ok(trackEl);
+    assert.equal(trackEl.track.mode, 'showing');
+    assert.equal(createdVtts.length, 1);
+
+    const textarea = dom.container.querySelector('.subtitle-line-input');
+    const burnBtn = dom.container.querySelector('#subtitle-burn-btn');
+    assert.equal(burnBtn.disabled || burnBtn.hasAttribute('disabled'), false);
+
+    // Rapid edits within 200ms do NOT regenerate VTT synchronously on every keystroke
+    await act(async () => {
+      textarea._value = 'Edited one';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    await act(async () => {
+      textarea._value = 'Edited two';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    assert.equal(createdVtts.length, 1);
+    assert.equal(dom.container.querySelector('track'), trackEl);
+
+    // After ~240ms debounce settles, VTT regenerates once and preserves track.mode === 'showing'
+    await act(async () => {
+      await new Promise(r => setTimeout(r, 240));
+    });
+    assert.equal(createdVtts.length, 2);
+    assert.equal(dom.container.querySelector('track'), trackEl);
+    assert.equal(trackEl.track.mode, 'showing');
+    const latestVttText = await createdVtts[1].blob.text();
+    assert.match(latestVttText, /Edited two/);
+
+    // Clearing text to whitespace immediately removes <track> and disables #subtitle-burn-btn
+    await act(async () => {
+      textarea._value = '   \n  ';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    assert.equal(dom.container.querySelector('track'), null);
+    assert.equal(burnBtn.disabled || burnBtn.hasAttribute('disabled'), true);
+
+    // Restoring text re-enables #subtitle-burn-btn and restores <track> with mode === 'showing'
+    await act(async () => {
+      textarea._value = 'Restored caption';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    assert.equal(burnBtn.disabled || burnBtn.hasAttribute('disabled'), false);
+    const restoredTrack = dom.container.querySelector('track');
+    assert.ok(restoredTrack);
+    assert.equal(restoredTrack.track.mode, 'showing');
+
+    // 3. Successful translateNow and burnVideo also clear offline state
+    const origTranslate = services.mediaSubtitleGateway.translateSegments;
+    services.mediaSubtitleGateway.translateSegments = async () => { throw new Error('502'); };
+    const langSel = dom.container.querySelector('#subtitle-source-lang');
+    await act(async () => {
+      langSel.value = 'en';
+      langSel.dispatchEvent({ type: 'change', bubbles: true, target: langSel });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-translate-btn').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.ok(dom.container.querySelector('.engine-alert-popup'));
+
+    services.mediaSubtitleGateway.translateSegments = origTranslate;
+    await act(async () => {
+      dom.container.querySelector('#subtitle-translate-btn').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(dom.container.querySelector('.engine-alert-popup'), null);
+
+    const origBurn = services.mediaSubtitleGateway.burnSubtitles;
+    services.mediaSubtitleGateway.burnSubtitles = async () => { throw new Error('502'); };
+    await act(async () => {
+      burnBtn.click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.ok(dom.container.querySelector('.engine-alert-popup'));
+
+    services.mediaSubtitleGateway.burnSubtitles = origBurn;
+    await act(async () => {
+      burnBtn.click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(dom.container.querySelector('.engine-alert-popup'), null);
+
+    // 4. Active <track> src URL is NOT revoked prematurely while still displayed; previous VTT URLs ARE revoked
+    const activeTrackSrc = dom.container.querySelector('track').getAttribute('src');
+    assert.ok(activeTrackSrc);
+    assert.equal(activeTrackSrc, createdVtts.at(-1).url);
+    assert.equal(revokedUrls.includes(activeTrackSrc), false);
+    assert.ok(createdVtts.length >= 2);
+    for (const oldVtt of createdVtts.slice(0, -1)) {
+      assert.ok(revokedUrls.includes(oldVtt.url));
+    }
+
+    // 5. React.StrictMode double-invocation never leaves <track> pointing to a revoked blob URL
+    const strictContainer = globalThis.document.createElement('div');
+    globalThis.document.body.appendChild(strictContainer);
+    const strictRoot = createRoot(strictContainer);
+    try {
+      await act(async () => {
+        strictRoot.render(
+          React.createElement(
+            React.StrictMode,
+            null,
+            React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { notices: null }))
+          )
+        );
+        await new Promise(r => setTimeout(r, 15));
+      });
+      const strictFileInput = strictContainer.querySelector('#subtitle-video-input');
+      await act(async () => {
+        strictFileInput.files = [new File(['mp4'], 'strict.mp4', { type: 'video/mp4' })];
+        strictFileInput.dispatchEvent({ type: 'change', bubbles: true });
+      });
+      await act(async () => {
+        strictContainer.querySelector('#subtitle-extract-btn').click();
+        await new Promise(r => setTimeout(r, 15));
+      });
+      const strictTrack = strictContainer.querySelector('track');
+      assert.ok(strictTrack);
+      const strictSrc = strictTrack.getAttribute('src');
+      assert.ok(strictSrc);
+      assert.equal(revokedUrls.includes(strictSrc), false);
+      assert.equal(strictTrack.track.mode, 'showing');
+    } finally {
+      await act(async () => { strictRoot.unmount(); });
+      strictContainer.remove();
+    }
+  } finally {
+    globalThis.setInterval = origSetInterval;
+    globalThis.clearInterval = origClearInterval;
+    URL.createObjectURL = origCreateObjectURL;
+    URL.revokeObjectURL = origRevokeObjectURL;
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('clearing the only Khmer translation textarea keeps translation mode sticky, preserves English original, and formats singular extract summary', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+
+    let returnTranslation = true;
+    let capturedBurn = null;
+    const services = {
+      speechGateway: {
+        checkAvailability: async () => true,
+        checkHealth: async () => ({ online: true, detail: null }),
+        uploadReferenceAudio: async () => ({}),
+        synthesize: async () => ({}),
+      },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        transcribeVideo: async () => ({
+          jobId: 'singlecue12345678',
+          language: 'en',
+          isAudioOnly: false,
+          speakers: ['speaker-1'],
+          videoSize: { width: 1280, height: 720 },
+          segments: [
+            {
+              id: 'seg-only',
+              start: 0.0,
+              end: 2.5,
+              speakerId: 'speaker-1',
+              text: 'Good evening.',
+              translatedText: returnTranslation ? 'សួស្តីពេលល្ងាច។' : '',
+            },
+          ],
+        }),
+        translateSegments: async ({ segments }) => ({
+          segments: segments.map(s => ({ ...s, translatedText: 'សួស្តីពេលល្ងាចថ្មី។' })),
+        }),
+        burnSubtitles: async payload => {
+          capturedBurn = payload;
+          return new Blob(['ftypmp4'], { type: 'video/mp4' });
+        },
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: { execute: async () => ({}) },
+      lockReferenceAudio: { execute: async f => ({ blob: f }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+    await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
+
+    const subPanel = dom.container.querySelector('.subtitle-workspace');
+    const findPreviewSelect = () =>
+      subPanel.querySelectorAll('select').find(el => el.getAttribute('aria-label') === 'Preview language') || null;
+
+    const langSelect = subPanel.querySelector('#subtitle-source-lang');
+    await act(async () => {
+      langSelect.value = 'en';
+      langSelect.dispatchEvent({ type: 'change', bubbles: true, target: langSelect });
+    });
+
+    const fileInput = subPanel.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'single-line.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+
+    // Singular pluralization in status + toast when exactly 1 segment is extracted
+    assert.match(subPanel.querySelector('.status').textContent, /^Extracted 1 subtitle segment in /);
+    assert.match(dom.container.querySelector('.studio-toast').textContent, /Extracted 1 subtitle segment in /);
+
+    assert.ok(findPreviewSelect());
+    assert.equal(findPreviewSelect().value, 'translated');
+    assert.equal(subPanel.querySelector('#subtitle-translate-btn').textContent, 'Re-translate Khmer');
+    assert.equal(subPanel.querySelector('track').getAttribute('label'), 'Khmer');
+
+    // Clearing the only cue's Khmer translation to '' must NOT flip out of translation mode
+    const textarea = subPanel.querySelector('.subtitle-line-input');
+    await act(async () => {
+      textarea._value = '';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    assert.ok(findPreviewSelect());
+    assert.equal(findPreviewSelect().value, 'translated');
+    assert.equal(subPanel.querySelector('#subtitle-translate-btn').textContent, 'Re-translate Khmer');
+    assert.equal(subPanel.querySelector('track').getAttribute('label'), 'Khmer');
+    assert.equal(subPanel.querySelector('.subtitle-line-input').value, '');
+    assert.equal(subPanel.querySelector('.subtitle-line-input').getAttribute('aria-label'), 'Khmer subtitle translation');
+    assert.match(subPanel.querySelector('.subtitle-source-ref').textContent, /Good evening\./);
+
+    // Typing new Khmer text writes into translatedText while preserving English segment.text
+    await act(async () => {
+      textarea._value = 'សួស្តីកម្ពុជា';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-line-input').value, 'សួស្តីកម្ពុជា');
+    assert.match(subPanel.querySelector('.subtitle-source-ref').textContent, /Good evening\./);
+
+    await act(async () => {
+      findPreviewSelect().value = 'original';
+      findPreviewSelect().dispatchEvent({ type: 'change', bubbles: true, target: findPreviewSelect() });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-line-input').value, 'Good evening.');
+
+    await act(async () => {
+      findPreviewSelect().value = 'translated';
+      findPreviewSelect().dispatchEvent({ type: 'change', bubbles: true, target: findPreviewSelect() });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-line-input').value, 'សួស្តីកម្ពុជា');
+
+    // Clear translation to '' and verify burnSubtitles sends translatedText='' while keeping text='Good evening.'
+    await act(async () => {
+      textarea._value = '';
+      textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    assert.equal(capturedBurn.useTranslation, true);
+    assert.equal(capturedBurn.segments[0].text, 'Good evening.');
+    assert.equal(capturedBurn.segments[0].translatedText, '');
+
+    // Re-extracting without translation resets sticky hasTranslation to false
+    returnTranslation = false;
+    const autoTranslateToggle = subPanel.querySelector('#subtitle-auto-translate');
+    const autoTranslateLabel = subPanel.querySelector('#subtitle-auto-translate-label');
+    assert.notEqual(autoTranslateToggle.parentNode.tagName, 'LABEL');
+    assert.equal(autoTranslateLabel.tagName, 'SPAN');
+    assert.equal(subPanel.querySelectorAll('label').some(el => el.getAttribute('for') === 'subtitle-auto-translate'), false);
+    assert.equal(autoTranslateToggle.getAttribute('role'), 'switch');
+    assert.equal(autoTranslateToggle.getAttribute('aria-labelledby'), 'subtitle-auto-translate-label');
+    await act(async () => { autoTranslateLabel.click(); autoTranslateToggle.parentNode.click(); });
+    assert.equal(autoTranslateToggle.checked, true);
+    await act(async () => {
+      autoTranslateToggle.checked = false;
+      autoTranslateToggle.dispatchEvent({ type: 'click', bubbles: true, target: autoTranslateToggle });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+    assert.equal(findPreviewSelect(), null);
+    assert.equal(subPanel.querySelector('#subtitle-translate-btn').textContent, 'Translate to Khmer');
+
+    // Manual translation restores sticky translation mode; clearing textarea again preserves English
+    await act(async () => { subPanel.querySelector('#subtitle-translate-btn').click(); });
+    assert.ok(findPreviewSelect());
+    const translatedArea = subPanel.querySelector('.subtitle-line-input');
+    assert.equal(translatedArea.value, 'សួស្តីពេលល្ងាចថ្មី។');
+    await act(async () => {
+      translatedArea._value = '';
+      translatedArea.dispatchEvent({ type: 'input', bubbles: true, target: translatedArea });
+    });
+    assert.ok(findPreviewSelect());
+    await act(async () => {
+      translatedArea._value = 'ជំរាបសួរ';
+      translatedArea.dispatchEvent({ type: 'input', bubbles: true, target: translatedArea });
+    });
+    await act(async () => {
+      findPreviewSelect().value = 'original';
+      findPreviewSelect().dispatchEvent({ type: 'change', bubbles: true, target: findPreviewSelect() });
+    });
+    assert.equal(subPanel.querySelector('.subtitle-line-input').value, 'Good evening.');
+
+    // Clear workspace and new file load reset sticky translation cleanly
+    await act(async () => { subPanel.querySelector('#subtitle-clear-btn').click(); });
+    assert.equal(findPreviewSelect(), null);
+    assert.equal(subPanel.querySelectorAll('.subtitle-segment-row').length, 0);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('multi-cue Khmer clearing, failed/cancelled re-extract restore, post-clear stale resolve guard, and segment deletion preserve sticky translation semantics', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    let resolveLateTranscribe = null;
+    const services = {
+      speechGateway: { checkAvailability: async () => true, uploadReferenceAudio: async () => ({}), synthesize: async () => ({}) },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        transcribeVideo: async () => ({
+          jobId: 'multicue123456789',
+          language: 'en',
+          isAudioOnly: false,
+          speakers: ['speaker-1'],
+          videoSize: { width: 1280, height: 720 },
+          segments: [
+            { id: 'cue-1', start: 0.0, end: 2.0, speakerId: 'speaker-1', text: 'First line.', translatedText: 'បន្ទាត់ទី១។' },
+            { id: 'cue-2', start: 2.1, end: 4.0, speakerId: 'speaker-1', text: 'Second line.', translatedText: 'បន្ទាត់ទី២។' },
+          ],
+        }),
+        translateSegments: async ({ segments }) => ({ segments }),
+        burnSubtitles: async () => new Blob(['ftypmp4'], { type: 'video/mp4' }),
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: { execute: async () => ({}) },
+      lockReferenceAudio: { execute: async f => ({ blob: f }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { notices: null })));
+      await new Promise(r => setTimeout(r, 15));
+    });
+
+    const findPreviewSelect = () =>
+      dom.container.querySelectorAll('select').find(el => el.getAttribute('aria-label') === 'Preview language') || null;
+    const langSel = dom.container.querySelector('#subtitle-source-lang');
+    await act(async () => {
+      langSel.value = 'en';
+      langSel.dispatchEvent({ type: 'change', bubbles: true, target: langSel });
+    });
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'multi.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { dom.container.querySelector('#subtitle-extract-btn').click(); });
+
+    // 1. Clearing ALL Khmer translation textareas across 2 cues preserves English originals & translation mode
+    let inputs = dom.container.querySelectorAll('.subtitle-line-input');
+    assert.equal(inputs.length, 2);
+    for (const area of inputs) {
+      await act(async () => {
+        area._value = '';
+        area.dispatchEvent({ type: 'input', bubbles: true, target: area });
+      });
+    }
+    assert.ok(findPreviewSelect());
+    assert.equal(findPreviewSelect().value, 'translated');
+    assert.equal(dom.container.querySelector('track').getAttribute('label'), 'Khmer');
+    assert.equal(dom.container.querySelectorAll('.subtitle-source-ref')[0].textContent, 'First line.');
+    assert.equal(dom.container.querySelectorAll('.subtitle-source-ref')[1].textContent, 'Second line.');
+
+    // 2. Deleting 1 of 2 cues while remaining cue has empty translatedText keeps hasTranslation sticky
+    await act(async () => { dom.container.querySelector('.subtitle-cue-delete').click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 1);
+    assert.ok(findPreviewSelect());
+    assert.equal(dom.container.querySelector('.subtitle-line-input').getAttribute('aria-label'), 'Khmer subtitle translation');
+
+    // Typing new Khmer writes into translatedText while keeping English original intact
+    const remainingArea = dom.container.querySelector('.subtitle-line-input');
+    await act(async () => {
+      remainingArea._value = 'ជួរទី២ថ្មី';
+      remainingArea.dispatchEvent({ type: 'input', bubbles: true, target: remainingArea });
+    });
+    assert.equal(dom.container.querySelector('.subtitle-source-ref').textContent, 'Second line.');
+
+    // 3. Failed re-extraction restores sticky hasTranslation when prior segments remain
+    services.mediaSubtitleGateway.transcribeVideo = () => Promise.reject(new Error('503 offline'));
+    await act(async () => { dom.container.querySelector('#subtitle-extract-btn').click(); });
+    assert.ok(findPreviewSelect());
+    assert.equal(findPreviewSelect().value, 'translated');
+    assert.equal(dom.container.querySelector('.subtitle-line-input').value, 'ជួរទី២ថ្មី');
+
+    // 4. Deleting the last remaining cue resets sticky hasTranslation to false
+    await act(async () => { dom.container.querySelector('.subtitle-cue-delete').click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 0);
+    assert.equal(findPreviewSelect(), null);
+
+    // 5. Cancelling in-flight extraction when gateway resolves late resets busy state cleanly without applying stale segments or hasTranslation
+    services.mediaSubtitleGateway.transcribeVideo = () => new Promise(resolve => { resolveLateTranscribe = resolve; });
+    await act(async () => { dom.container.querySelector('#subtitle-extract-btn').click(); });
+    await act(async () => { dom.container.querySelector('#subtitle-cancel-btn').click(); });
+    await act(async () => {
+      resolveLateTranscribe({
+        jobId: 'stale12345678901',
+        language: 'en',
+        segments: [{ id: 'stale-1', start: 0, end: 1, speakerId: 'speaker-1', text: 'Stale', translatedText: 'ចាស់' }],
+      });
+      await new Promise(r => setTimeout(r, 10));
+    });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 0);
+    assert.equal(findPreviewSelect(), null);
+    assert.match(dom.container.querySelector('.status').textContent, /Subtitle extraction cancelled/);
+    assert.ok(dom.container.querySelector('#subtitle-clear-btn'));
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();

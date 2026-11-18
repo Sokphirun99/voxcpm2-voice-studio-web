@@ -136,6 +136,76 @@ const ICON_PATHS = {
       <path d="M16 8V6C16 4.89543 15.1046 4 14 4H6C4.89543 4 4 4.89543 4 6V14C4 15.1046 4.89543 16 6 16H8" />
     </g>
   ),
+  // Iconoir: check-circle
+  check_circle: (
+    <g {...STROKE_STYLE}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M8.5 12.5L10.8 14.8L15.5 9.5" />
+    </g>
+  ),
+  // Iconoir: warning-circle
+  alert_circle: (
+    <g {...STROKE_STYLE}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7.5V13" />
+      <path d="M12 16.5L12.01 16.49" />
+    </g>
+  ),
+  // Iconoir: sound-high
+  volume_on: (
+    <g {...STROKE_STYLE}>
+      <path d="M3 10V14H7L12 18V6L7 10H3Z" />
+      <path d="M16 9.5C16.8 10.3 17.2 11.1 17.2 12C17.2 12.9 16.8 13.7 16 14.5" />
+      <path d="M18.8 7C20.2 8.4 21 10.1 21 12C21 13.9 20.2 15.6 18.8 17" />
+    </g>
+  ),
+  // Iconoir: sound-off
+  volume_off: (
+    <g {...STROKE_STYLE}>
+      <path d="M3 10V14H7L12 18V6L7 10H3Z" />
+      <path d="M16 9.5L21 14.5" />
+      <path d="M21 9.5L16 14.5" />
+    </g>
+  ),
+  // Iconoir: search
+  search: (
+    <g {...STROKE_STYLE}>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M16 16L20.5 20.5" />
+    </g>
+  ),
+  // Iconoir: scissor
+  scissors: (
+    <g {...STROKE_STYLE}>
+      <circle cx="6.5" cy="7.5" r="2.5" />
+      <circle cx="6.5" cy="16.5" r="2.5" />
+      <path d="M8.7 8.9L19 16" />
+      <path d="M8.7 15.1L19 8" />
+    </g>
+  ),
+  // Iconoir: merge / arrow-down-to-row
+  merge: (
+    <g {...STROKE_STYLE}>
+      <path d="M12 4V14" />
+      <path d="M8.5 10.5L12 14L15.5 10.5" />
+      <path d="M5 19H19" />
+    </g>
+  ),
+  // Iconoir: trash
+  trash: (
+    <g {...STROKE_STYLE}>
+      <path d="M4 7H20" />
+      <path d="M10 4H14" />
+      <path d="M6 7L7 19C7.1 19.6 7.5 20 8.1 20H15.9C16.5 20 16.9 19.6 17 19L18 7" />
+    </g>
+  ),
+  // Iconoir: clock
+  clock: (
+    <g {...STROKE_STYLE}>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12L15 13.5" />
+    </g>
+  ),
 };
 
 /**

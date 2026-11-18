@@ -7,11 +7,13 @@ import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibra
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
 import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
+import { useNotifications } from '../hooks/useNotifications.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { Icon } from './Icon.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
+import { ToastRegion } from './ToastRegion.jsx';
 import { VideoSubtitleWorkspace } from './VideoSubtitleWorkspace.jsx';
 
 export { buildVoiceActions, finalizeCharacterGeneration };
@@ -72,7 +74,7 @@ function selectWorkspace(id, setActiveWorkspace, ttsRef) {
   if (id === 'tts') ttsRef.current?.focusScript?.();
 }
 
-function useSharedCharacterCatalog({ ttsRef }) {
+function useSharedCharacterCatalog({ ttsRef, onNotify, onUnlockSound }) {
   const library = useVoiceLibrary();
   const anchorApi = useVoiceAnchors();
   const [selectedCharacterId, setSelectedCharacterId] = useState(DEFAULT_CHARACTER_ID);
@@ -92,6 +94,8 @@ function useSharedCharacterCatalog({ ttsRef }) {
     onCancelCharacterSynthesis: id => ttsRef.current?.cancelIfCharacter?.(id),
     onCloseLibrary: () => ttsRef.current?.closeLibrary?.(),
     onStatus: next => ttsRef.current?.setStatus?.(next),
+    onNotify,
+    onUnlockSound,
   });
 
   return { library, anchorApi, activeCharacter, activeAnchor, lockedSeeds, setLockedSeeds, actions };
@@ -111,6 +115,7 @@ export function Studio() {
   const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false, libraryOpen: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
+  const notifications = useNotifications();
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
   }, []);
@@ -123,7 +128,11 @@ export function Studio() {
   }, []);
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
-  const catalog = useSharedCharacterCatalog({ ttsRef });
+  const catalog = useSharedCharacterCatalog({
+    ttsRef,
+    onNotify: notifications.notify,
+    onUnlockSound: notifications.unlockSound,
+  });
   const canAutoReload = !ttsState.libraryOpen && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
   const versionCheck = useAppVersionCheck({ canAutoReload });
   const ttsNotices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
@@ -138,18 +147,27 @@ export function Studio() {
     characterActions: catalog.actions,
     refreshEngine,
     onTtsStateChange: handleTtsStateChange,
+    onNotify: notifications.notify,
+    onUnlockSound: notifications.unlockSound,
   };
 
   return (
     <div className="studio-window">
-      <Sidebar activeWorkspace={activeWorkspace} workspaces={DEFAULT_WORKSPACES}
-        onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)} />
+      <Sidebar
+        activeWorkspace={activeWorkspace}
+        workspaces={DEFAULT_WORKSPACES}
+        onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
+        soundMuted={notifications.soundMuted}
+        onToggleSoundMuted={notifications.toggleSoundMuted}
+      />
       <main className="studio-workspace">
         <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
           externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
         <VideoSubtitleWorkspace notices={updateBanner} hidden={activeWorkspace !== 'subtitles'}
-          onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange} />
+          onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange}
+          onNotify={notifications.notify} onUnlockSound={notifications.unlockSound} />
       </main>
+      <ToastRegion toasts={notifications.toasts} onDismiss={notifications.dismiss} />
     </div>
   );
 }

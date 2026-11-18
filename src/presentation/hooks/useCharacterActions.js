@@ -44,12 +44,12 @@ function cancelIfSynthesizing(ctx, characterId) {
 }
 
 async function validateClipForCharacter(file, ctx, reportStatus) {
-  if (ctx.validateAudioClip) return ctx.validateAudioClip(file);
-  if (ctx.synthesis?.validateAudioClip) return ctx.synthesis.validateAudioClip(file);
   try {
     return await ctx.lockReferenceAudio.execute(file);
   } catch (error) {
-    reportStatus({ message: error.message || 'Could not validate voice sample.', error: true });
+    const message = error?.message || 'Could not validate voice sample.';
+    reportStatus({ message, error: true });
+    ctx.onNotify?.({ kind: 'error', title: 'Invalid audio file', message });
     return null;
   }
 }
@@ -68,6 +68,7 @@ async function uploadSampleForCharacter(file, characterId, ctx) {
   const targetId = characterId || activeCharacter?.id;
   const targetVoice = library.allVoices.find(v => v.id === targetId) || activeCharacter;
   if (!targetVoice) return;
+  ctx.onUnlockSound?.();
   const reportStatus = resolveStatusReporter(ctx);
   const validated = await validateClipForCharacter(file, ctx, reportStatus);
   if (!validated) return;
@@ -243,7 +244,7 @@ export function createCharacterActionHandlers(ctx) {
 
 /**
  * Provides cohesive shared character catalog mutation callbacks independent of any single workspace.
- * Inputs: `{ activeCharacter, library, anchorApi, onCharacterSelected, onClearLockedSeed, onCancelCharacterSynthesis, onCharacterUsed, onCloseLibrary, onStatus }`.
+ * Inputs: `{ activeCharacter, library, anchorApi, onCharacterSelected, onClearLockedSeed, onCancelCharacterSynthesis, onCharacterUsed, onCloseLibrary, onStatus, onNotify, onUnlockSound }`.
  * Outputs: `{ uploadedRefsRef, rerolledIdsRef, setCachedUpload, handleSelectCharacter, ... }`.
  * Side effects: updates persistent voice library and IndexedDB/Docker anchors.
  * Failure modes: logs errors via `logger` and surfaces messages via `onStatus`.

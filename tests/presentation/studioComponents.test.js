@@ -531,7 +531,6 @@ test('character actions handle onUpdateAnchor errors, prevent false delete succe
         recording: null,
         cancel: () => { cancelled = true; },
         setStatus: status => statuses.push(status),
-        validateAudioClip: async () => null,
       },
       anchorApi: {
         updateCharacterAnchor: async () => { throw new StorageError('IDB write failed'); },
@@ -847,9 +846,194 @@ test('VideoSubtitleWorkspace SSR renders uploader, options, empty cue state, and
     assert.ok(html.includes('id="subtitle-video-input"'));
     assert.ok(html.includes('id="subtitle-source-lang"'));
     assert.ok(html.includes('id="subtitle-speaker-count"'));
+    assert.ok(html.includes('id="subtitle-detect-speakers"'));
+    assert.ok(html.includes('class="subtitle-option-grid" data-columns="1"'));
+    assert.ok(html.includes('id="subtitle-detect-speakers-label"'));
+    assert.match(html, /id="subtitle-detect-speakers"[^>]*role="switch"[^>]*aria-labelledby="subtitle-detect-speakers-label"/);
+    assert.match(html, /id="subtitle-include-speaker"[^>]*role="switch"[^>]*aria-labelledby="subtitle-include-speaker-label"/);
+    assert.equal(html.includes('for="subtitle-detect-speakers"'), false);
+    assert.equal(html.includes('for="subtitle-include-speaker"'), false);
     assert.ok(html.includes('id="subtitle-extract-btn"'));
     assert.ok(html.includes('id="subtitle-burn-btn"'));
     assert.ok(html.includes('id="subtitle-send-tts-btn"'));
+    assert.ok(html.includes('Download .vtt'));
     assert.ok(html.includes('No dialogue extracted yet'));
   });
+});
+
+test('ToastRegion, LiveStatusText, and Sidebar sound toggle SSR render accessible markup', async () => {
+  await withViteSsr(async vite => {
+    const { ToastRegion } = await vite.ssrLoadModule('/src/presentation/components/ToastRegion.jsx');
+    const { LiveStatusText } = await vite.ssrLoadModule('/src/presentation/components/LiveStatusText.jsx');
+    const { Sidebar } = await vite.ssrLoadModule('/src/presentation/components/Sidebar.jsx');
+
+    assert.equal(renderToStaticMarkup(React.createElement(ToastRegion, { toasts: [] })), '');
+
+    const toastHtml = renderToStaticMarkup(
+      React.createElement(ToastRegion, {
+        toasts: [
+          { id: 't1', kind: 'success', title: 'Speech ready', message: 'Audio generated in 1.2s.' },
+          { id: 't2', kind: 'error', title: 'Extraction failed', message: 'Service offline.' },
+        ],
+        onDismiss() {},
+      })
+    );
+    assert.ok(toastHtml.includes('id="studio-toast-region"'));
+    assert.ok(toastHtml.includes('role="status"'));
+    assert.ok(toastHtml.includes('role="alert"'));
+    assert.ok(toastHtml.includes('Speech ready'));
+    assert.ok(toastHtml.includes('Extraction failed'));
+
+    const statusHtml = renderToStaticMarkup(
+      React.createElement(LiveStatusText, {
+        id: 'st',
+        status: { message: 'Done', error: false },
+        busyStartedAt: 1000,
+        busyMessage: 'Working',
+      })
+    );
+    assert.ok(statusHtml.includes('Working ('));
+
+    const sidebarHtml = renderToStaticMarkup(
+      React.createElement(Sidebar, {
+        activeWorkspace: 'tts',
+        onSelectWorkspace() {},
+        soundMuted: true,
+        onToggleSoundMuted() {},
+      })
+    );
+    assert.ok(sidebarHtml.includes('id="notification-sound-toggle"'));
+    assert.ok(sidebarHtml.includes('Sound muted'));
+  });
+});
+
+test('createCharacterActionHandlers wires invalid TTS reference sample errors to toast and sound unlock', async () => {
+  await withViteSsr(async vite => {
+    const { createCharacterActionHandlers } = await vite.ssrLoadModule('/src/presentation/hooks/useCharacterActions.js');
+    const { ValidationError } = await vite.ssrLoadModule('/src/domain/errors.js');
+    const statuses = [];
+    const notices = [];
+    let unlocks = 0;
+
+    const handlers = createCharacterActionHandlers({
+      activeCharacter: CHAR_NISA,
+      library: { allVoices: BUILT_IN_VOICES },
+      anchorApi: { pinCharacterAnchor: async () => { throw new Error('Should not pin invalid sample'); } },
+      lockReferenceAudio: {
+        execute: async () => {
+          throw new ValidationError('The selected file does not appear to be valid audio.', 'referenceAudio', 'INVALID_AUDIO_CONTENT');
+        },
+      },
+      logger: { error() {} },
+      uploadedRefsRef: { current: {} },
+      rerolledIdsRef: { current: new Set() },
+      onStatus: next => statuses.push(next),
+      onNotify: notice => notices.push(notice),
+      onUnlockSound: () => { unlocks += 1; },
+    });
+
+    await handlers.handleUploadSample(new File(['not-audio'], 'fake.mp3', { type: 'audio/mpeg' }));
+    assert.equal(unlocks, 1);
+    assert.deepEqual(statuses, [{ message: 'The selected file does not appear to be valid audio.', error: true }]);
+    assert.deepEqual(notices, [{
+      kind: 'error',
+      title: 'Invalid audio file',
+      message: 'The selected file does not appear to be valid audio.',
+    }]);
+  });
+});
+
+test('buildExtractSummary pluralizes segment count cleanly and resolveTranslationFlags honors sticky translation flag', async () => {
+  await withViteSsr(async vite => {
+    const { buildExtractSummary, resolveTranslationFlags } = await vite.ssrLoadModule('/src/presentation/hooks/useVideoSubtitles.js');
+    assert.equal(buildExtractSummary(1, 1, '0.8'), 'Extracted 1 subtitle segment in 0.8s.');
+    assert.equal(buildExtractSummary(1, 2, '1.4'), 'Extracted 1 subtitle segment (2 speakers) in 1.4s.');
+    assert.equal(buildExtractSummary(0, 0, '0.2'), 'Extracted 0 subtitle segments in 0.2s.');
+    assert.equal(buildExtractSummary(4, 3, '2.1'), 'Extracted 4 subtitle segments (3 speakers) in 2.1s.');
+
+    assert.deepEqual(resolveTranslationFlags(true, 'translated'), { hasTranslated: true, bilingual: false, useTranslation: true });
+    assert.deepEqual(resolveTranslationFlags(true, 'bilingual'), { hasTranslated: true, bilingual: true, useTranslation: true });
+    assert.deepEqual(resolveTranslationFlags(true, 'original'), { hasTranslated: true, bilingual: false, useTranslation: false });
+    assert.deepEqual(resolveTranslationFlags(false, 'translated'), { hasTranslated: false, bilingual: false, useTranslation: false });
+  });
+});
+
+test('studio.css keeps toasts off top toolbar and configures independent scroll + bottom breathing room for left subtitle pane', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const css = await readFile(path.join(WEB_ROOT, 'src/presentation/styles/studio.css'), 'utf8');
+
+  const desktopToastMatch = css.match(/\.studio-toast-region\s*\{([^}]+)\}/);
+  assert.ok(desktopToastMatch);
+  assert.match(desktopToastMatch[1], /bottom:\s*108px/);
+  assert.doesNotMatch(desktopToastMatch[1], /\btop\s*:/);
+
+  const wrappedDockToastSection = css.slice(css.indexOf('@media (max-width: 1320px)'), css.lastIndexOf('@media (max-width: 860px)'));
+  assert.match(wrappedDockToastSection, /\.studio-toast-region\s*\{[^}]*bottom:\s*148px/);
+  assert.match(css, /\.subtitle-tts-speaker-wrap select\s*\{[^}]*max-width:\s*180px/);
+
+  const mobileToastSection = css.slice(css.lastIndexOf('@media (max-width: 640px)'));
+  const mobileToastMatch = mobileToastSection.match(/\.studio-toast-region\s*\{([^}]+)\}/);
+  assert.ok(mobileToastMatch);
+  assert.match(mobileToastMatch[1], /bottom:\s*auto/);
+  assert.match(mobileToastMatch[1], /top:\s*calc\(114px/);
+  assert.match(mobileToastSection, /\.subtitle-left-pane,\s*\.subtitle-right-pane\s*\{[^}]*flex:\s*0\s+0\s+auto/);
+  assert.match(mobileToastSection, /\.subtitle-left-pane,\s*\.subtitle-right-pane\s*\{[^}]*min-height:\s*auto/);
+  assert.match(mobileToastSection, /\.subtitle-tts-speaker-wrap select\s*\{[^}]*max-width:\s*none/);
+
+  const subtitleGridMatch = css.match(/\.subtitle-grid\s*\{([^}]+)\}/);
+  assert.ok(subtitleGridMatch);
+  assert.match(subtitleGridMatch[1], /grid-template-rows:\s*minmax\(0,\s*1fr\)/);
+  assert.match(subtitleGridMatch[1], /overflow:\s*hidden/);
+
+  const tabletSection = css.slice(css.lastIndexOf('@media (max-width: 860px)'));
+  const tabletGridMatch = tabletSection.match(/\.subtitle-grid\s*\{([^}]+)\}/);
+  assert.ok(tabletGridMatch);
+  assert.match(tabletGridMatch[1], /grid-template-rows:\s*auto/);
+  assert.match(tabletSection, /\.subtitle-left-pane,\s*\.subtitle-right-pane\s*\{[^}]*min-height:\s*auto/);
+
+  const leftPaneMatch = css.match(/\.subtitle-left-pane\s*\{([^}]+)\}/);
+  assert.ok(leftPaneMatch);
+  assert.match(leftPaneMatch[1], /min-height:\s*0/);
+  assert.match(leftPaneMatch[1], /overflow-y:\s*auto/);
+  assert.match(css, /\.subtitle-left-pane\s*>\s*\*\s*\{[^}]*flex-shrink:\s*0/);
+  assert.match(css, /\.subtitle-left-pane::after\s*\{[^}]*flex:\s*0\s+0\s+10px/);
+
+  // Video-to-subtitle option grid expands full-width when Detect speakers is off and uses grouped switch-only setting card rows
+  const optionGridMatch = css.match(/\.subtitle-option-grid\s*\{([^}]+)\}/);
+  assert.ok(optionGridMatch);
+  assert.match(optionGridMatch[1], /grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+  assert.match(css, /\.subtitle-option-grid\[data-columns="2"\]\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(mobileToastSection, /\.subtitle-option-grid,\s*\.subtitle-option-grid\[data-columns="2"\],\s*\.subtitle-style-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+
+  const toggleCardMatch = css.match(/\.field-row-toggles\s*\{([^}]+)\}/);
+  assert.ok(toggleCardMatch);
+  assert.match(toggleCardMatch[1], /border:\s*1px solid var\(--line\)/);
+  assert.match(toggleCardMatch[1], /border-radius:\s*10px/);
+  assert.match(toggleCardMatch[1], /background:\s*var\(--control\)/);
+
+  const toggleRowMatch = css.match(/\.subtitle-toggle-row\s*\{([^}]+)\}/);
+  assert.ok(toggleRowMatch);
+  assert.match(toggleRowMatch[1], /user-select:\s*none/);
+  assert.match(toggleRowMatch[1], /cursor:\s*default/);
+  assert.match(css, /\.subtitle-toggle-row:not\(\[hidden\]\)\s*~\s*\.subtitle-toggle-row:not\(\[hidden\]\)\s*\{[^}]*border-top:\s*1px solid var\(--line\)/);
+
+  const toggleLabelMatch = css.match(/(?:^|\n)\.subtitle-toggle-label\s*\{([^}]+)\}/);
+  assert.ok(toggleLabelMatch);
+  assert.match(toggleLabelMatch[1], /user-select:\s*none/);
+  assert.match(toggleLabelMatch[1], /cursor:\s*default/);
+
+  const switchMatch = css.match(/\.subtitle-switch\s*\{([^}]+)\}/);
+  assert.ok(switchMatch);
+  assert.match(switchMatch[1], /cursor:\s*pointer/);
+  assert.match(css, /\.subtitle-switch:checked:not\(:disabled\):hover\s*\{/);
+
+  const mobileOnlySection = css.slice(css.lastIndexOf('@media (max-width: 640px)'), css.lastIndexOf('@media (pointer: coarse)'));
+  assert.match(mobileOnlySection, /\.subtitle-switch\s*\{[^}]*width:\s*42px/);
+  assert.match(mobileOnlySection, /\.subtitle-switch\s*\{[^}]*height:\s*24px/);
+  assert.match(mobileOnlySection, /\.subtitle-switch:not\(:disabled\)::before\s*\{[^}]*inset:\s*-11px -8px/);
+
+  const coarseSection = css.slice(css.lastIndexOf('@media (pointer: coarse)'));
+  assert.match(coarseSection, /\.subtitle-toggle-row\s*\{[^}]*min-height:\s*46px/);
+  assert.match(coarseSection, /\.subtitle-switch\s*\{[^}]*width:\s*42px/);
+  assert.match(coarseSection, /\.subtitle-switch:not\(:disabled\)::before\s*\{[^}]*inset:\s*-11px -8px/);
 });
