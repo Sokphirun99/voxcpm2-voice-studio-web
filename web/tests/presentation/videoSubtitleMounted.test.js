@@ -22,6 +22,10 @@ function createDomShim() {
       this.attributes = new Map();
       this.listeners = new Map();
     }
+    [Symbol.for('nodejs.util.inspect.custom')]() {
+      const id = this.id ? `#${this.id}` : '';
+      return `<${this.nodeName}${id}>`;
+    }
     get ownerDocument() { return globalThis.document; }
     get children() { return this.childNodes.filter(n => n.nodeType === 1); }
     get firstChild() { return this.childNodes[0] || null; }
@@ -57,21 +61,26 @@ function createDomShim() {
     }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     setAttribute(k, v) {
-      this.attributes.set(k, String(v));
-      if (k === 'id') this.id = String(v);
-      if (k === 'class') this.className = String(v);
-      if (k === 'type') this.type = String(v);
-      if (k === 'value') this._value = String(v);
-      if (k === 'hidden') this.hidden = true;
-      if (k.startsWith('on')) this[k] = () => {};
+      const name = String(k).toLowerCase();
+      this.attributes.set(name, String(v));
+      if (name === 'id') this.id = String(v);
+      if (name === 'class') this.className = String(v);
+      if (name === 'type') this.type = String(v);
+      if (name === 'value') this._value = String(v);
+      if (name === 'hidden') this.hidden = true;
+      if (name.startsWith('on')) this[name] = () => {};
     }
-    getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+    getAttribute(k) {
+      const name = String(k).toLowerCase();
+      return this.attributes.has(name) ? this.attributes.get(name) : null;
+    }
     removeAttribute(k) {
-      this.attributes.delete(k);
-      if (k === 'id') this.id = '';
-      if (k === 'hidden') this.hidden = false;
+      const name = String(k).toLowerCase();
+      this.attributes.delete(name);
+      if (name === 'id') this.id = '';
+      if (name === 'hidden') this.hidden = false;
     }
-    hasAttribute(k) { return this.attributes.has(k); }
+    hasAttribute(k) { return this.attributes.has(String(k).toLowerCase()); }
     addEventListener(type, fn, cap) {
       const key = `${cap ? 'cap' : 'bub'}:${type}`;
       if (!this.listeners.has(key)) this.listeners.set(key, []);
@@ -181,6 +190,8 @@ function createDomShim() {
       this._value = next;
       this._dirtyValue = true;
     }
+    get srclang() { return this.getAttribute('srclang') || ''; }
+    set srclang(v) { this.setAttribute('srclang', v == null ? '' : String(v)); }
   }
   const prev = {
     window: globalThis.window,
@@ -314,15 +325,23 @@ test('mounted Studio switches to Video to subtitle, extracts speakers, burns MP4
 
     const subPanel = dom.container.querySelector('.subtitle-workspace');
     assert.equal(subPanel.hasAttribute('hidden'), false);
-    assert.equal(subPanel.querySelector('#subtitle-source-lang').value, 'km');
-    assert.equal(subPanel.querySelector('#subtitle-auto-translate'), null);
-
     const langSelect = subPanel.querySelector('#subtitle-source-lang');
+    assert.equal(langSelect.value, 'km');
+    assert.equal(langSelect.options.length, 101);
+    const initialAutoTranslate = subPanel.querySelector('#subtitle-auto-translate');
+    assert.ok(initialAutoTranslate);
+    assert.equal(initialAutoTranslate.checked, false);
+    assert.equal(subPanel.querySelector('#subtitle-target-lang'), null);
+
     await act(async () => {
       langSelect.value = 'en';
       langSelect.dispatchEvent({ type: 'change', bubbles: true, target: langSelect });
     });
-    assert.ok(subPanel.querySelector('#subtitle-auto-translate'));
+    assert.equal(subPanel.querySelector('#subtitle-auto-translate').checked, true);
+    const targetLangSelect = subPanel.querySelector('#subtitle-target-lang');
+    assert.ok(targetLangSelect);
+    assert.equal(targetLangSelect.value, 'khm_Khmr');
+    assert.equal(targetLangSelect.options.length, 202);
 
     const fileInput = dom.container.querySelector('#subtitle-video-input');
     await act(async () => {
@@ -1561,6 +1580,341 @@ test('multi-cue Khmer clearing, failed/cancelled re-extract restore, post-clear 
     assert.equal(findPreviewSelect(), null);
     assert.match(dom.container.querySelector('.status').textContent, /Subtitle extraction cancelled/);
     assert.ok(dom.container.querySelector('#subtitle-clear-btn'));
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace supports Khmer-to-any and any-to-any multilingual translation across all 202 target languages', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    let capturedTranscribe = null;
+    let capturedTranslate = null;
+    const services = {
+      speechGateway: { checkAvailability: async () => true, uploadReferenceAudio: async () => ({}), synthesize: async () => ({}) },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        transcribeVideo: async params => {
+          capturedTranscribe = params;
+          return {
+            jobId: 'multilang12345678',
+            language: 'km',
+            translatedLanguage: params.translateTo,
+            isAudioOnly: false,
+            speakers: ['speaker-1'],
+            videoSize: { width: 1280, height: 720 },
+            segments: [
+              { id: 'seg-1', start: 0.0, end: 2.0, speakerId: 'speaker-1', text: 'សួស្តីកម្ពុជា', translatedText: 'こんにちはカンボジア' },
+            ],
+          };
+        },
+        translateSegments: async params => {
+          capturedTranslate = params;
+          return {
+            segments: params.segments.map(s => ({ ...s, translatedText: 'مرحبا كمبوديا' })),
+            targetLanguage: params.targetLanguage,
+          };
+        },
+        burnSubtitles: async () => new Blob(['ftypmp4'], { type: 'video/mp4' }),
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: { execute: async () => ({}) },
+      lockReferenceAudio: { execute: async f => ({ blob: f }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { notices: null })));
+      await new Promise(r => setTimeout(r, 15));
+    });
+
+    const findPreviewSelect = () =>
+      dom.container.querySelectorAll('select').find(el => el.getAttribute('aria-label') === 'Preview language') || null;
+
+    // 1. Default Khmer source can enable translation and pick any of 202 target languages (starting at English)
+    const autoToggle = dom.container.querySelector('#subtitle-auto-translate');
+    assert.equal(autoToggle.checked, false);
+    await act(async () => {
+      autoToggle.checked = true;
+      autoToggle.dispatchEvent({ type: 'click', bubbles: true, target: autoToggle });
+    });
+    const targetSel = dom.container.querySelector('#subtitle-target-lang');
+    assert.ok(targetSel);
+    assert.equal(targetSel.value, 'eng_Latn');
+    assert.equal(targetSel.options.length, 202);
+
+    // 2. Switch target to Japanese (jpn_Jpan) and extract Khmer video
+    await act(async () => {
+      targetSel.value = 'jpn_Jpan';
+      targetSel.dispatchEvent({ type: 'change', bubbles: true, target: targetSel });
+    });
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'khmer-news.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { dom.container.querySelector('#subtitle-extract-btn').click(); });
+
+    assert.equal(capturedTranscribe.language, 'km');
+    assert.equal(capturedTranscribe.translateTo, 'jpn_Jpan');
+    assert.equal(dom.container.querySelector('#subtitle-translate-btn').textContent, 'Re-translate Japanese');
+    assert.equal(findPreviewSelect().options[0].textContent, 'Japanese subtitles');
+    assert.equal(findPreviewSelect().options[2].textContent, 'Bilingual (Original + Japanese)');
+    const jaTrack = dom.container.querySelector('track');
+    assert.equal(jaTrack.getAttribute('srclang'), 'ja');
+    assert.equal(jaTrack.getAttribute('label'), 'Japanese');
+    const jaArea = dom.container.querySelector('.subtitle-line-input');
+    assert.equal(jaArea.getAttribute('dir'), 'auto');
+    assert.equal(jaArea.getAttribute('lang'), 'ja');
+    assert.equal(jaArea.getAttribute('aria-label'), 'Japanese subtitle translation');
+    assert.equal(String(jaArea.className).includes('subtitle-line-khmer'), false);
+
+    // 3. Changing target dropdown to Arabic updates button copy immediately without mislabeling existing Japanese preview
+    await act(async () => {
+      targetSel.value = 'arb_Arab';
+      targetSel.dispatchEvent({ type: 'change', bubbles: true, target: targetSel });
+    });
+    assert.equal(dom.container.querySelector('#subtitle-translate-btn').textContent, 'Translate to Arabic');
+    assert.equal(findPreviewSelect().options[0].textContent, 'Japanese subtitles');
+
+    // 4. Translating into Arabic updates preview, track, and RTL-ready textarea attributes
+    await act(async () => { dom.container.querySelector('#subtitle-translate-btn').click(); });
+    assert.equal(capturedTranslate.sourceLanguage, 'km');
+    assert.equal(capturedTranslate.targetLanguage, 'arb_Arab');
+    assert.equal(dom.container.querySelector('#subtitle-translate-btn').textContent, 'Re-translate Arabic');
+    assert.equal(findPreviewSelect().options[0].textContent, 'Arabic subtitles');
+    assert.equal(dom.container.querySelector('track').getAttribute('srclang'), 'ar');
+    assert.equal(dom.container.querySelector('track').getAttribute('label'), 'Arabic');
+    const arArea = dom.container.querySelector('.subtitle-line-input');
+    assert.equal(arArea.getAttribute('dir'), 'auto');
+    assert.equal(arArea.getAttribute('lang'), 'ar');
+    assert.equal(arArea.value, 'مرحبا كمبوديا');
+
+    // 5. Selecting the same target language as the detected source disables the translate button
+    await act(async () => {
+      targetSel.value = 'khm_Khmr';
+      targetSel.dispatchEvent({ type: 'change', bubbles: true, target: targetSel });
+    });
+    const translateBtn = dom.container.querySelector('#subtitle-translate-btn');
+    assert.equal(translateBtn.disabled || translateBtn.hasAttribute('disabled'), true);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+function createValidTestWavBlob(durationMs = 120, sampleRate = 16000) {
+  const numSamples = Math.round((sampleRate * durationMs) / 1000);
+  const dataSize = numSamples * 2;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+  const writeTag = (off, tag) => { for (let i = 0; i < 4; i++) view.setUint8(off + i, tag.charCodeAt(i)); };
+  writeTag(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeTag(8, 'WAVE');
+  writeTag(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeTag(36, 'data');
+  view.setUint32(40, dataSize, true);
+  for (let i = 0; i < numSamples; i++) {
+    view.setInt16(44 + i * 2, Math.round(Math.sin(i / 8) * 10000), true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Speech, combined WAV output below subtitles, staleness badges, and selection-scoped TTS handoff', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+
+    const synthCalls = [];
+    const services = {
+      speechGateway: {
+        checkAvailability: async () => true,
+        checkHealth: async () => ({ online: true, detail: null }),
+        uploadReferenceAudio: async () => ({}),
+        synthesize: async () => ({}),
+      },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        transcribeVideo: async () => ({
+          jobId: 'voiceover1234567',
+          language: 'en',
+          translatedLanguage: '',
+          isAudioOnly: false,
+          speakers: ['speaker-1'],
+          videoSize: { width: 1280, height: 720 },
+          segments: [
+            { id: 'seg-1', start: 0.0, end: 2.0, speakerId: 'speaker-1', text: 'First frame line.', translatedText: '' },
+            { id: 'seg-2', start: 2.1, end: 4.0, speakerId: 'speaker-1', text: 'Second frame line.', translatedText: '' },
+            { id: 'seg-3', start: 4.1, end: 6.0, speakerId: 'speaker-1', text: 'Third frame line.', translatedText: '' },
+          ],
+        }),
+        translateSegments: async ({ segments }) => ({ segments }),
+        burnSubtitles: async () => new Blob(['ftypmp4'], { type: 'video/mp4' }),
+      },
+      audioDecoder: { decodePeaks: async () => [] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: {
+        execute: async cmd => {
+          synthCalls.push({ script: cmd.script, characterId: cmd.character.id, autoFormatKhmer: cmd.autoFormatKhmer });
+          const blob = createValidTestWavBlob(140);
+          return {
+            recording: {
+              id: `take-${synthCalls.length}`,
+              characterId: cmd.character.id,
+              characterName: cmd.character.name,
+              transcript: cmd.script,
+              blob,
+              anchorBlob: blob,
+              seed: 100 + synthCalls.length,
+              audioDurationSeconds: 1.4,
+            },
+            uploadedFileData: null,
+          };
+        },
+      },
+      lockReferenceAudio: { execute: async f => ({ blob: f }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+    await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
+
+    const subPanel = dom.container.querySelector('.subtitle-workspace');
+    const fileInput = subPanel.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'song.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+
+    // 1. Voiceover toolbar + per-frame checkboxes & Generate voice buttons render cleanly; batch button disabled until selection
+    const rows = subPanel.querySelectorAll('.subtitle-segment-row');
+    assert.equal(rows.length, 3);
+    assert.ok(subPanel.querySelector('#subtitle-tts-voice'));
+    const batchBtn = subPanel.querySelector('#subtitle-generate-voice-btn');
+    assert.equal(batchBtn.disabled || batchBtn.hasAttribute('disabled'), true);
+    assert.equal(subPanel.querySelector('#subtitle-voice-output'), null);
+
+    // 2. Generate voice on a single frame (#2) -> renders inline play/download + bottom #subtitle-voice-output card
+    const row2VoiceBtn = rows[1].querySelector('.subtitle-cue-voice-btn');
+    assert.match(row2VoiceBtn.textContent, /Generate voice/);
+    await act(async () => {
+      row2VoiceBtn.click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(synthCalls.length, 1);
+    assert.equal(synthCalls[0].script, 'Second frame line.');
+    assert.equal(synthCalls[0].characterId, 'char-nisa');
+    assert.equal(synthCalls[0].autoFormatKhmer, false);
+    assert.match(rows[1].querySelector('.subtitle-cue-voice-btn').textContent, /Regenerate/);
+    assert.ok(rows[1].querySelector('.subtitle-cue-play-btn'));
+    assert.ok(subPanel.querySelector('#subtitle-voice-output'));
+    assert.ok(subPanel.querySelector('#subtitle-voice-output').querySelector('audio'));
+
+    // 3. Editing frame #2 marks its generated voice clip with the Edited badge
+    const row2Area = rows[1].querySelector('.subtitle-line-input');
+    await act(async () => {
+      row2Area._value = 'Second frame edited.';
+      row2Area.dispatchEvent({ type: 'input', bubbles: true, target: row2Area });
+    });
+    assert.ok(rows[1].querySelector('.subtitle-cue-stale-badge'));
+
+    // 4. Select frames #1 and #3, switch voice to Sovath, and generate batch voiceover
+    const row1Check = rows[0].querySelector('.subtitle-select-checkbox');
+    const row3Check = rows[2].querySelector('.subtitle-select-checkbox');
+    await act(async () => {
+      row1Check.checked = true;
+      row1Check.dispatchEvent({ type: 'click', bubbles: true, target: row1Check });
+    });
+    await act(async () => {
+      row3Check.checked = true;
+      row3Check.dispatchEvent({ type: 'click', bubbles: true, target: row3Check });
+    });
+    assert.equal(rows[0].getAttribute('data-selected'), 'true');
+    assert.equal(rows[2].getAttribute('data-selected'), 'true');
+    assert.match(subPanel.querySelector('#subtitle-generate-voice-btn').textContent, /Generate voice \(2\)/);
+    assert.match(subPanel.querySelector('#subtitle-send-tts-btn').textContent, /Send selected to TTS \(2\)/);
+
+    const voiceSelect = subPanel.querySelector('#subtitle-tts-voice');
+    await act(async () => {
+      voiceSelect.value = 'char-sovath';
+      voiceSelect.dispatchEvent({ type: 'change', bubbles: true, target: voiceSelect });
+    });
+    await act(async () => {
+      subPanel.querySelector('#subtitle-generate-voice-btn').click();
+      await new Promise(r => setTimeout(r, 30));
+    });
+
+    assert.equal(synthCalls.length, 3);
+    assert.equal(synthCalls[1].script, 'First frame line.');
+    assert.equal(synthCalls[1].characterId, 'char-sovath');
+    assert.equal(synthCalls[2].script, 'Third frame line.');
+    assert.equal(synthCalls[2].characterId, 'char-sovath');
+
+    const outputCard = subPanel.querySelector('#subtitle-voice-output');
+    assert.ok(outputCard);
+    assert.match(outputCard.textContent, /Selected voiceover · 2 frames/);
+    assert.match(outputCard.textContent, /Sovath/);
+    assert.ok(outputCard.querySelector('#subtitle-download-voice-btn'));
+
+    // 5. Send selected to TTS sends ONLY selected frames (#1 and #3), skipping unselected #2
+    await act(async () => { subPanel.querySelector('#subtitle-send-tts-btn').click(); });
+    assert.equal(dom.container.querySelector('#script').value, 'First frame line. Third frame line.');
+
+    // 6. Returning and clicking Clear removes generated clips and hides #subtitle-voice-output cleanly
+    await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-clear-btn').click(); });
+    assert.equal(subPanel.querySelector('#subtitle-voice-output'), null);
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();

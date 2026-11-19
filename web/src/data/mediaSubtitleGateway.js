@@ -63,13 +63,14 @@ async function readHttpErrorDetail(response, fallback) {
  * @param {object} spec - Upload file and analysis options.
  * @returns {FormData} Multipart form payload.
  */
-function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, diarize = true, translateToKhmer = false }) {
+function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, diarize = true, translateTo = '', translateToKhmer = false }) {
   const form = new FormData();
+  const target = String(translateTo || '').trim() || (translateToKhmer ? 'km' : '');
   form.append('file', file, file?.name || 'video.mp4');
   form.append('language', language || 'auto');
   form.append('num_speakers', String(Number.isFinite(Number(numSpeakers)) ? Number(numSpeakers) : 0));
   form.append('diarize', String(Boolean(diarize)));
-  form.append('translate_to', translateToKhmer ? 'km' : '');
+  form.append('translate_to', target);
   return form;
 }
 

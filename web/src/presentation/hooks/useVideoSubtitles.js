@@ -5,6 +5,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createMediaSubtitleGateway } from '../../data/mediaSubtitleGateway.js';
 import {
+  DEFAULT_ENGLISH_TARGET,
+  DEFAULT_KHMER_TARGET,
   SUBTITLE_STYLE_DEFAULTS,
   adjustSubtitleSegmentTiming,
   buildBoundedTtsHandoff,
@@ -16,9 +18,13 @@ import {
   deleteSubtitleSegment,
   findActiveSegmentId,
   isAudioOnlyFile,
+  isSameSubtitleLanguage,
   mergeSubtitleSegmentWithNext,
+  normalizeTargetLanguageCode,
+  pickDefaultTargetLanguage,
   pickSegmentText,
   replaceTextInSegments,
+  resolveTargetLanguageMeta,
   splitSubtitleSegment,
 } from '../../domain/subtitles.js';
 import { useStudioServices } from '../StudioContext.jsx';
@@ -29,6 +35,7 @@ const MEDIA_OFFLINE_POLL_MS = 10000;
 const VTT_PREVIEW_DEBOUNCE_MS = 200;
 const DEFAULT_OPTIONS = Object.freeze({
   sourceLanguage: 'km',
+  targetLanguage: DEFAULT_ENGLISH_TARGET,
   detectSpeakers: false,
   speakerCount: '0',
   translateToKhmer: false,
@@ -50,12 +57,18 @@ function restoreTaskTranslation(prev, resetTranslationOnStart, hadTranslation) {
   return prev.segments.length > 0 ? hadTranslation : false;
 }
 
-function handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTranslation, cancelMessage, errorTitle, fallbackError, onError, onNotify }) {
+function restoreTaskTranslatedLang(prev, resetTranslationOnStart, hadTranslatedLanguage) {
+  if (!resetTranslationOnStart) return prev.translatedLanguage;
+  return prev.segments.length > 0 ? hadTranslatedLanguage : '';
+}
+
+function handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTranslation, hadTranslatedLanguage = '', cancelMessage, errorTitle, fallbackError, onError, onNotify }) {
   if (err?.name === 'SynthesisCancelledError') {
     setState(prev => ({
       ...prev,
       busyAction: '',
       hasTranslation: restoreTaskTranslation(prev, resetTranslationOnStart, hadTranslation),
+      translatedLanguage: restoreTaskTranslatedLang(prev, resetTranslationOnStart, hadTranslatedLanguage),
       status: { message: cancelMessage, error: false },
     }));
     return;
@@ -66,6 +79,7 @@ function handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTr
     ...prev,
     busyAction: '',
     hasTranslation: restoreTaskTranslation(prev, resetTranslationOnStart, hadTranslation),
+    translatedLanguage: restoreTaskTranslatedLang(prev, resetTranslationOnStart, hadTranslatedLanguage),
     status: { message: errMsg, error: true },
   }));
   onNotify?.({ kind: 'error', title: errorTitle, message: errMsg });
@@ -87,12 +101,13 @@ function beginSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMe
     ...prev,
     busyAction,
     hasTranslation: resetTranslationOnStart ? false : prev.hasTranslation,
+    translatedLanguage: resetTranslationOnStart ? '' : prev.translatedLanguage,
     status: { message: baseMessage, error: false },
   }));
   return controller;
 }
 
-async function runSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMessage, cancelMessage, errorTitle, fallbackError, resetTranslationOnStart = false, hadTranslation = false, onError, onNotify, onUnlockSound, run }) {
+async function runSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMessage, cancelMessage, errorTitle, fallbackError, resetTranslationOnStart = false, hadTranslation = false, hadTranslatedLanguage = '', onError, onNotify, onUnlockSound, run }) {
   onUnlockSound?.();
   const startedAt = Date.now();
   const controller = beginSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMessage, resetTranslationOnStart });
@@ -100,7 +115,7 @@ async function runSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, ba
     await run(controller.signal, () => formatElapsedSec(startedAt));
   } catch (err) {
     if (abortRef.current !== controller) return;
-    handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTranslation, cancelMessage, errorTitle, fallbackError, onError, onNotify });
+    handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTranslation, hadTranslatedLanguage, cancelMessage, errorTitle, fallbackError, onError, onNotify });
   } finally {
     if (abortRef.current === controller) {
       setBusyMeta(null);
@@ -310,13 +325,15 @@ export function buildExtractSummary(segmentCount, speakerCount, elapsed) {
   return `Extracted ${segmentCount} subtitle ${segmentLabel}${spkNote} in ${elapsed}s.`;
 }
 
-function applyExtractedSubtitleResult(prev, res, shouldTranslate, elapsed) {
+function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
   const detectedLanguage = res.language || prev.options.sourceLanguage;
   const segments = Array.isArray(res.segments) ? res.segments : [];
   const hasSegmentTranslation = hasAnyTranslatedText(segments);
-  const hasTranslated = shouldTranslate && detectedLanguage !== 'km' && hasSegmentTranslation;
+  const resolvedTarget = targetLanguage ? normalizeTargetLanguageCode(res.translatedLanguage || targetLanguage) : '';
+  const hasTranslated = Boolean(resolvedTarget) && !isSameSubtitleLanguage(detectedLanguage, resolvedTarget) && hasSegmentTranslation;
   const speakerCount = Array.isArray(res.speakers) ? res.speakers.length : collectUniqueSpeakers(segments).length;
   const nextIncludeSpeaker = (prev.options.detectSpeakers || speakerCount > 1) ? prev.options.includeSpeaker : false;
+  const nextTargetOption = pickDefaultTargetLanguage(detectedLanguage, prev.options.targetLanguage);
   return {
     ...prev,
     jobId: res.jobId || '',
@@ -325,8 +342,14 @@ function applyExtractedSubtitleResult(prev, res, shouldTranslate, elapsed) {
     videoSize: res.videoSize !== undefined ? res.videoSize : prev.videoSize,
     segments,
     hasTranslation: hasSegmentTranslation,
+    translatedLanguage: hasSegmentTranslation ? (resolvedTarget || prev.options.targetLanguage) : '',
     speakerNames: {},
-    options: { ...prev.options, includeSpeaker: nextIncludeSpeaker, previewMode: hasTranslated ? 'translated' : 'original' },
+    options: {
+      ...prev.options,
+      targetLanguage: nextTargetOption,
+      includeSpeaker: nextIncludeSpeaker,
+      previewMode: hasTranslated ? 'translated' : 'original',
+    },
     busyAction: '',
     status: { message: buildExtractSummary(segments.length, speakerCount, elapsed), error: false },
   };
@@ -340,7 +363,10 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
   const extractSubtitles = useCallback(async () => {
     if (!state.videoFile) return;
     const hadTranslation = Boolean(stateRef?.current?.hasTranslation ?? state.hasTranslation);
-    const shouldTranslate = state.options.sourceLanguage !== 'km' && Boolean(state.options.translateToKhmer);
+    const hadTranslatedLanguage = stateRef?.current?.translatedLanguage ?? state.translatedLanguage;
+    const targetLanguage = normalizeTargetLanguageCode(state.options.targetLanguage);
+    const shouldTranslate = Boolean(state.options.translateToKhmer)
+      && !isSameSubtitleLanguage(state.options.sourceLanguage, targetLanguage);
     const diarize = Boolean(state.options.detectSpeakers) && state.options.speakerCount !== '1';
     const numSpeakers = diarize ? (Number(state.options.speakerCount) || 0) : 1;
     await runSubtitleTask({
@@ -351,6 +377,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
       fallbackError: 'Subtitle extraction failed.',
       resetTranslationOnStart: true,
       hadTranslation,
+      hadTranslatedLanguage,
       onError: () => void refreshHealth(),
       onNotify, onUnlockSound,
       run: async (signal, elapsedSecs) => {
@@ -359,7 +386,8 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
           language: state.options.sourceLanguage,
           numSpeakers,
           diarize,
-          translateToKhmer: shouldTranslate,
+          translateTo: shouldTranslate ? targetLanguage : '',
+          translateToKhmer: shouldTranslate && targetLanguage === 'khm_Khmr',
           signal,
         });
         assertNotAborted(signal);
@@ -368,39 +396,42 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         const segs = Array.isArray(res.segments) ? res.segments : [];
         const spkCount = Array.isArray(res.speakers) ? res.speakers.length : collectUniqueSpeakers(segs).length;
         setActiveSegmentId('');
-        setState(prev => applyExtractedSubtitleResult(prev, res, shouldTranslate, elapsed));
+        setState(prev => applyExtractedSubtitleResult(prev, res, shouldTranslate ? targetLanguage : '', elapsed));
         onNotify?.({ kind: 'success', title: 'Subtitles ready', message: buildExtractSummary(segs.length, spkCount, elapsed) });
       },
     });
-  }, [state.videoFile, state.options, state.hasTranslation, stateRef, gateway, abortRef, setState, setBusyMeta, setActiveSegmentId, refreshHealth, markOnline, onNotify, onUnlockSound]);
+  }, [state.videoFile, state.options, state.hasTranslation, state.translatedLanguage, stateRef, gateway, abortRef, setState, setBusyMeta, setActiveSegmentId, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
   const translateNow = useCallback(async () => {
     if (!state.segments.length) return;
+    const sourceLang = state.detectedLanguage && state.detectedLanguage !== 'auto' ? state.detectedLanguage : state.options.sourceLanguage;
+    const targetLanguage = normalizeTargetLanguageCode(state.options.targetLanguage);
+    const targetMeta = resolveTargetLanguageMeta(targetLanguage);
     await runSubtitleTask({
       abortRef, setState, setBusyMeta, busyAction: 'translate',
-      baseMessage: 'Translating subtitles into Khmer offline…',
+      baseMessage: `Translating subtitles into ${targetMeta.shortLabel} offline…`,
       cancelMessage: 'Translation cancelled.',
       errorTitle: 'Translation failed',
       fallbackError: 'Translation failed.',
       onError: () => void refreshHealth(),
       onNotify, onUnlockSound,
       run: async (signal, elapsedSecs) => {
-        const sourceLang = state.detectedLanguage && state.detectedLanguage !== 'auto' ? state.detectedLanguage : state.options.sourceLanguage;
         const res = await gateway.translateSegments({
           segments: state.segments,
           sourceLanguage: sourceLang === 'auto' ? 'en' : sourceLang,
-          targetLanguage: 'km',
+          targetLanguage,
           signal,
         });
         assertNotAborted(signal);
         markOnline();
-        const summary = `Translated dialogue lines to Khmer in ${elapsedSecs()}s.`;
+        const summary = `Translated dialogue lines to ${targetMeta.shortLabel} in ${elapsedSecs()}s.`;
         setState(prev => {
           const nextSegments = Array.isArray(res.segments) ? res.segments : prev.segments;
           return {
             ...prev,
             segments: nextSegments,
             hasTranslation: nextSegments.length > 0,
+            translatedLanguage: nextSegments.length > 0 ? targetLanguage : '',
             options: {
               ...prev.options,
               previewMode: prev.options.previewMode === 'bilingual' ? 'bilingual' : 'translated',
@@ -410,10 +441,10 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
             status: { message: summary, error: false },
           };
         });
-        onNotify?.({ kind: 'success', title: 'Khmer translation ready', message: summary });
+        onNotify?.({ kind: 'success', title: `${targetMeta.shortLabel} translation ready`, message: summary });
       },
     });
-  }, [state.segments, state.detectedLanguage, state.options.sourceLanguage, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
+  }, [state.segments, state.detectedLanguage, state.options.sourceLanguage, state.options.targetLanguage, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
   const burnVideo = useCallback(async () => {
     if (!state.jobId || !hasSubtitleText || state.isAudioOnly) return;
@@ -464,7 +495,13 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     setActiveSegmentId(prev => (prev === segId ? '' : prev));
     setState(prev => {
       const nextSegments = deleteSubtitleSegment(prev.segments, segId);
-      return { ...prev, segments: nextSegments, hasTranslation: nextSegments.length > 0 ? prev.hasTranslation : false };
+      const keepTrans = nextSegments.length > 0 && prev.hasTranslation;
+      return {
+        ...prev,
+        segments: nextSegments,
+        hasTranslation: keepTrans,
+        translatedLanguage: keepTrans ? prev.translatedLanguage : '',
+      };
     });
   }, [setState, setActiveSegmentId]);
 
@@ -529,6 +566,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     videoSize: null,
     segments: [],
     hasTranslation: false,
+    translatedLanguage: '',
     speakerNames: {},
     options: DEFAULT_OPTIONS,
     busyAction: '',
@@ -543,6 +581,19 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
   useEffect(() => {
     onStateChange?.({ busy: Boolean(state.busyAction), hasVideo: Boolean(state.videoFile || state.segments.length) });
   }, [state.busyAction, state.videoFile, state.segments.length, onStateChange]);
+
+  const targetLanguageMeta = useMemo(
+    () => resolveTargetLanguageMeta(state.options.targetLanguage),
+    [state.options.targetLanguage]
+  );
+  const translatedLanguageMeta = useMemo(
+    () => resolveTargetLanguageMeta(state.translatedLanguage || state.options.targetLanguage),
+    [state.translatedLanguage, state.options.targetLanguage]
+  );
+  const activeSourceLanguage = state.detectedLanguage && state.detectedLanguage !== 'auto'
+    ? state.detectedLanguage
+    : state.options.sourceLanguage;
+  const canTranslate = !isSameSubtitleLanguage(activeSourceLanguage, state.options.targetLanguage);
 
   const { hasTranslated: hasTranslation, bilingual, useTranslation } = resolveTranslationFlags(
     state.hasTranslation,
@@ -600,12 +651,15 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
       videoSize: null,
       segments: [],
       hasTranslation: false,
+      translatedLanguage: '',
       speakerNames: {},
       busyAction: '',
       options: {
         ...prev.options,
         includeSpeaker: prev.options.detectSpeakers ? prev.options.includeSpeaker : false,
-        previewMode: prev.options.sourceLanguage !== 'km' && prev.options.translateToKhmer ? 'translated' : 'original',
+        previewMode: prev.options.translateToKhmer && !isSameSubtitleLanguage(prev.options.sourceLanguage, prev.options.targetLanguage)
+          ? 'translated'
+          : 'original',
       },
       status: { message: `Loaded ${file.name}. Ready to extract subtitles.`, error: false },
     }));
@@ -628,6 +682,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
       videoSize: null,
       segments: [],
       hasTranslation: false,
+      translatedLanguage: '',
       speakerNames: {},
       busyAction: '',
       status: { message: '', error: false },
@@ -639,8 +694,15 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
       const next = { ...prev.options, [key]: value };
       if (key === 'sourceLanguage') {
         const isKhmer = value === 'km';
+        const wasKhmer = prev.options.sourceLanguage === 'km';
+        const desiredTarget = (wasKhmer && !isKhmer && !prev.options.translateToKhmer)
+          ? DEFAULT_KHMER_TARGET
+          : prev.options.targetLanguage;
+        next.targetLanguage = pickDefaultTargetLanguage(value, desiredTarget);
         next.translateToKhmer = !isKhmer;
         next.previewMode = isKhmer ? 'original' : 'translated';
+      } else if (key === 'targetLanguage') {
+        next.targetLanguage = normalizeTargetLanguageCode(value);
       } else if (key === 'translateToKhmer') {
         next.previewMode = value ? 'translated' : 'original';
       } else if (key === 'detectSpeakers' && !value && collectUniqueSpeakers(prev.segments).length <= 1) {
@@ -723,10 +785,15 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     }
   }, [state.segments, state.speakerNames, effectiveIncludeSpeaker, useTranslation, bilingual, services]);
 
-  const getTtsHandoff = useCallback(
-    (speakerId = ttsSpeakerId) => buildBoundedTtsHandoff({ segments: state.segments, useTranslation, speakerId }),
-    [state.segments, useTranslation, ttsSpeakerId]
-  );
+  const setStatus = useCallback(status => {
+    setState(prev => ({ ...prev, status }));
+  }, []);
+
+  const getTtsHandoff = useCallback((speakerId = ttsSpeakerId, selectedIds = null) => {
+    const idSet = selectedIds?.length ? new Set(selectedIds) : null;
+    const scopedSegments = idSet ? state.segments.filter(seg => idSet.has(seg.id)) : state.segments;
+    return buildBoundedTtsHandoff({ segments: scopedSegments, useTranslation, speakerId });
+  }, [state.segments, useTranslation, ttsSpeakerId]);
 
   const editActions = useSegmentEditingActions({ segments: state.segments, setState, setActiveSegmentId, useTranslation });
   const asyncActions = useSubtitleAsyncActions({
@@ -746,9 +813,13 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     effectiveIncludeSpeaker,
     hasSubtitleText,
     hasTranslation,
+    targetLanguageMeta,
+    translatedLanguageMeta,
+    canTranslate,
     useTranslation,
     bilingual,
     vttUrl,
+    setStatus,
     selectVideoFile,
     clearWorkspace,
     updateOption,

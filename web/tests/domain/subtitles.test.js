@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { countGraphemes } from '../../src/domain/presets.js';
 import {
+  DEFAULT_ENGLISH_TARGET,
+  DEFAULT_KHMER_TARGET,
+  POPULAR_SOURCE_LANGUAGE_IDS,
+  POPULAR_TARGET_LANGUAGE_IDS,
+  SOURCE_LANGUAGE_OPTIONS,
+  TARGET_LANGUAGE_OPTIONS,
   adjustSubtitleSegmentTiming,
   buildBoundedTtsHandoff,
   buildDialogueText,
@@ -16,11 +22,16 @@ import {
   formatShortClock,
   formatSubtitleTime,
   getSpeakerColor,
+  groupLanguageOptions,
   isAudioOnlyFile,
+  isSameSubtitleLanguage,
   mergeSubtitleSegmentWithNext,
+  normalizeTargetLanguageCode,
   parseEditableTimestamp,
+  pickDefaultTargetLanguage,
   replaceTextInSegments,
   resolveSpeakerLabel,
+  resolveTargetLanguageMeta,
   splitSubtitleSegment,
 } from '../../src/domain/subtitles.js';
 
@@ -194,4 +205,58 @@ test('active cue lookup, timestamp editing, split/merge/delete, and find-and-rep
     cleanVtt,
     'WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nLine one\nLine two\nLine three\nបន្ទាត់ទី១\nបន្ទាត់ទី២\n'
   );
+});
+
+test('multilingual subtitle language catalog exposes all 100 Whisper sources, all 202 NLLB targets, and safe helpers', () => {
+  assert.equal(SOURCE_LANGUAGE_OPTIONS.length, 101);
+  assert.equal(new Set(SOURCE_LANGUAGE_OPTIONS.map(o => o.id)).size, 101);
+  assert.equal(SOURCE_LANGUAGE_OPTIONS[0].id, 'auto');
+  assert.ok(SOURCE_LANGUAGE_OPTIONS.some(o => o.id === 'km'));
+  assert.ok(SOURCE_LANGUAGE_OPTIONS.some(o => o.id === 'yue'));
+  assert.ok(SOURCE_LANGUAGE_OPTIONS.some(o => o.id === 'yo'));
+
+  assert.equal(TARGET_LANGUAGE_OPTIONS.length, 202);
+  assert.equal(new Set(TARGET_LANGUAGE_OPTIONS.map(o => o.id)).size, 202);
+  assert.ok(TARGET_LANGUAGE_OPTIONS.some(o => o.id === 'zul_Latn'));
+
+  assert.equal(normalizeTargetLanguageCode('km'), DEFAULT_KHMER_TARGET);
+  assert.equal(normalizeTargetLanguageCode('en'), DEFAULT_ENGLISH_TARGET);
+  assert.equal(normalizeTargetLanguageCode('ja'), 'jpn_Jpan');
+  assert.equal(normalizeTargetLanguageCode('zh-TW'), 'zho_Hant');
+  assert.equal(normalizeTargetLanguageCode('arb_Arab'), 'arb_Arab');
+  assert.equal(normalizeTargetLanguageCode('unknown_code'), DEFAULT_KHMER_TARGET);
+
+  const kmMeta = resolveTargetLanguageMeta('km');
+  assert.equal(kmMeta.id, 'khm_Khmr');
+  assert.equal(kmMeta.shortLabel, 'Khmer');
+  assert.equal(kmMeta.bcp47, 'km');
+  assert.equal(kmMeta.isKhmer, true);
+  assert.equal(kmMeta.isRtl, false);
+
+  const arMeta = resolveTargetLanguageMeta('arb_Arab');
+  assert.equal(arMeta.shortLabel, 'Arabic');
+  assert.equal(arMeta.bcp47, 'ar');
+  assert.equal(arMeta.isKhmer, false);
+  assert.equal(arMeta.isRtl, true);
+
+  const heMeta = resolveTargetLanguageMeta('heb_Hebr');
+  assert.equal(heMeta.isRtl, true);
+
+  assert.equal(isSameSubtitleLanguage('km', 'khm_Khmr'), true);
+  assert.equal(isSameSubtitleLanguage('en', 'eng_Latn'), true);
+  assert.equal(isSameSubtitleLanguage('km', 'eng_Latn'), false);
+  assert.equal(isSameSubtitleLanguage('auto', 'khm_Khmr'), false);
+
+  assert.equal(pickDefaultTargetLanguage('km', 'khm_Khmr'), DEFAULT_ENGLISH_TARGET);
+  assert.equal(pickDefaultTargetLanguage('km', 'jpn_Jpan'), 'jpn_Jpan');
+  assert.equal(pickDefaultTargetLanguage('en', 'eng_Latn'), DEFAULT_KHMER_TARGET);
+  assert.equal(pickDefaultTargetLanguage('ja', 'jpn_Jpan'), DEFAULT_KHMER_TARGET);
+
+  const groupedSrc = groupLanguageOptions(SOURCE_LANGUAGE_OPTIONS, POPULAR_SOURCE_LANGUAGE_IDS);
+  assert.equal(groupedSrc.popular.length, POPULAR_SOURCE_LANGUAGE_IDS.length);
+  assert.equal(groupedSrc.popular.length + groupedSrc.others.length, SOURCE_LANGUAGE_OPTIONS.length);
+
+  const groupedTgt = groupLanguageOptions(TARGET_LANGUAGE_OPTIONS, POPULAR_TARGET_LANGUAGE_IDS);
+  assert.equal(groupedTgt.popular.length, POPULAR_TARGET_LANGUAGE_IDS.length);
+  assert.equal(groupedTgt.popular.length + groupedTgt.others.length, TARGET_LANGUAGE_OPTIONS.length);
 });

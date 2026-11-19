@@ -151,6 +151,13 @@ export function Studio() {
     onUnlockSound: notifications.unlockSound,
   };
 
+  const subtitleVoiceCatalog = useMemo(() => ({
+    characters: catalog.library.allVoices,
+    anchors: catalog.anchorApi.anchors,
+    defaultCharacterId: catalog.activeCharacter.id,
+    lockedSeeds: catalog.lockedSeeds,
+  }), [catalog.library.allVoices, catalog.anchorApi.anchors, catalog.activeCharacter.id, catalog.lockedSeeds]);
+
   return (
     <div className="studio-window">
       <Sidebar
@@ -163,9 +170,16 @@ export function Studio() {
       <main className="studio-workspace">
         <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
           externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
-        <VideoSubtitleWorkspace notices={updateBanner} hidden={activeWorkspace !== 'subtitles'}
-          onSendToTts={handleSendToTts} onStateChange={handleSubtitleStateChange}
-          onNotify={notifications.notify} onUnlockSound={notifications.unlockSound} />
+        <VideoSubtitleWorkspace
+          notices={updateBanner}
+          hidden={activeWorkspace !== 'subtitles'}
+          voiceCatalog={subtitleVoiceCatalog}
+          onRefreshEngine={refreshEngine}
+          onSendToTts={handleSendToTts}
+          onStateChange={handleSubtitleStateChange}
+          onNotify={notifications.notify}
+          onUnlockSound={notifications.unlockSound}
+        />
       </main>
       <ToastRegion toasts={notifications.toasts} onDismiss={notifications.dismiss} />
     </div>

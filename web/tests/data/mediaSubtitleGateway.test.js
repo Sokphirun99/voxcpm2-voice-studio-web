@@ -23,6 +23,10 @@ test('mediaSubtitleGateway checks health, transcribes video, translates, and bur
   assert.equal(tr.jobId, 'abcd1234ef567890');
   assert.equal(calls[1].init.body.get('translate_to'), 'km');
 
+  await gateway.transcribeVideo({ file: new Blob(['vid'], { type: 'video/mp4' }), language: 'km', numSpeakers: 1, translateTo: 'jpn_Jpan' });
+  assert.equal(calls[2].init.body.get('language'), 'km');
+  assert.equal(calls[2].init.body.get('translate_to'), 'jpn_Jpan');
+
   const translated = await gateway.translateSegments({ segments: [{ text: 'Hi' }], sourceLanguage: 'en', targetLanguage: 'km' });
   assert.equal(translated.segments[0].translatedText, 'សួស្តី');
 

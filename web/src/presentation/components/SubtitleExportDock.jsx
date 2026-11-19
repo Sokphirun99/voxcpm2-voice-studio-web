@@ -39,6 +39,7 @@ function ExportFormatButtons({ hasSegments, busy, onExportFile, onCopyDialogue }
 export function SubtitleExportDock({
   hasSegments,
   hasSubtitleText = hasSegments,
+  selectedCount = 0,
   canBurn,
   isAudioOnly = false,
   speakers = [],
@@ -55,6 +56,7 @@ export function SubtitleExportDock({
   onSendToTts,
 }) {
   const showSpeakerFilter = hasSegments && speakers.length > 1;
+  const sendTtsLabel = selectedCount > 0 ? `Send selected to TTS (${selectedCount})` : 'Send to Text to speech';
   let burnTitle;
   if (isAudioOnly) burnTitle = 'MP4 burn-in is only available for video files';
   else if (hasSegments && !hasSubtitleText) burnTitle = 'Add subtitle text before exporting burned MP4';
@@ -82,7 +84,7 @@ export function SubtitleExportDock({
           )}
           <button type="button" id="subtitle-send-tts-btn" className="button button-primary"
             disabled={!hasSegments || busy} onClick={onSendToTts}>
-            <Icon name="waveform" /><span>Send to Text to speech</span>
+            <Icon name="waveform" /><span>{sendTtsLabel}</span>
           </button>
         </div>
       </div>

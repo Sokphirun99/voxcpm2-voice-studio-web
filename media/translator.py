@@ -9,6 +9,12 @@ import threading
 from typing import Any, Mapping, Sequence
 import unicodedata
 
+from languages import (
+    ISO_TO_NLLB,
+    SUPPORTED_NLLB_CODES,
+    UnsupportedLanguageError,
+    resolve_nllb_lang_code,
+)
 from model_cache import resolve_hf_model_path
 
 logger = logging.getLogger(__name__)
@@ -56,30 +62,6 @@ SPACELESS_SCRIPT_RANGES = (
     (0x4E00, 0x9FFF),  # CJK Unified Ideographs
 )
 
-ISO_TO_NLLB: dict[str, str] = {
-    "km": "khm_Khmr",
-    "en": "eng_Latn",
-    "zh": "zho_Hans",
-    "yue": "yue_Hant",
-    "ja": "jpn_Jpan",
-    "ko": "kor_Hang",
-    "th": "tha_Thai",
-    "vi": "vie_Latn",
-    "lo": "lao_Laoo",
-    "my": "mya_Mymr",
-    "id": "ind_Latn",
-    "ms": "zsm_Latn",
-    "tl": "tgl_Latn",
-    "fr": "fra_Latn",
-    "de": "deu_Latn",
-    "es": "spa_Latn",
-    "pt": "por_Latn",
-    "it": "ita_Latn",
-    "ru": "rus_Cyrl",
-    "ar": "arb_Arab",
-    "hi": "hin_Deva",
-}
-
 
 @dataclass(frozen=True)
 class _RepeatPolicy:
@@ -116,14 +98,6 @@ _OUTPUT_REPEAT_POLICY = _RepeatPolicy(
     drop_truncated_tail=True,
     collapse_spaceless_scripts=True,
 )
-
-
-def resolve_nllb_lang_code(lang: str) -> str:
-    """Resolve an ISO 639-1 code or Flores-200 tag into an NLLB language code; pure, defaults to 'eng_Latn'."""
-    cleaned = (lang or "").strip()
-    if "_" in cleaned:
-        return cleaned
-    return ISO_TO_NLLB.get(cleaned.lower(), "eng_Latn")
 
 
 def _normalize_sep(sep: str) -> str:
@@ -487,19 +461,23 @@ class LocalTranslator:
 
         tokenizer, model = self._ensure_loaded()
         tokenizer.src_lang = src_code
+        forced_id = tokenizer.convert_tokens_to_ids(tgt_code)
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if forced_id is None or (unk_id is not None and forced_id == unk_id):
+            raise UnsupportedLanguageError(f"Unsupported NLLB target token '{tgt_code}'.")
         encoded = tokenizer(
             list(batch), return_tensors="pt", padding=True, truncation=True, max_length=MAX_INPUT_TOKENS
         ).to(self._device)
-        gen_kwargs = _build_generate_kwargs(encoded, tokenizer.convert_tokens_to_ids(tgt_code))
+        gen_kwargs = _build_generate_kwargs(encoded, forced_id)
         with torch.inference_mode():
             generated = model.generate(**encoded, **gen_kwargs)
         decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
         return [sanitize_repetitive_translation(out.strip()) for out in decoded]
 
     def translate_lines(self, lines: Sequence[str], source_lang: str, target_lang: str = "km") -> list[str]:
-        """Translate `lines` from `source_lang` to `target_lang` (default Khmer), returning same-length list; loads model once."""
+        """Translate `lines` from `source_lang` to any NLLB-200 `target_lang`, returning a same-length list."""
         src_code = resolve_nllb_lang_code(source_lang)
-        tgt_code = resolve_nllb_lang_code(target_lang)
+        tgt_code = resolve_nllb_lang_code(target_lang, strict=True)
         if src_code == tgt_code:
             return [(line or "").strip() for line in lines]
         results = [""] * len(lines)

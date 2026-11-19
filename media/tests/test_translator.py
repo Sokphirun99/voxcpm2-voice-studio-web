@@ -242,3 +242,56 @@ def test_translate_lines_normalizes_source_sanitizes_output_and_batches_cleanly(
         "សួស្តី",
         "នៅ តែ នៅ តែ នៅ តែ",
     ]
+
+
+def test_full_multilingual_catalog_resolution_and_strict_validation() -> None:
+    """All 202 NLLB-200 targets and 97 Whisper-to-NLLB mappings resolve accurately; invalid or unsupported codes fail loudly."""
+    import pytest
+    from languages import (
+        ISO_TO_NLLB,
+        SUPPORTED_NLLB_CODES,
+        UNSUPPORTED_WHISPER_TRANSLATION_CODES,
+        UnsupportedLanguageError,
+        is_same_translation_language,
+    )
+
+    assert len(SUPPORTED_NLLB_CODES) == 202
+    for code in SUPPORTED_NLLB_CODES:
+        assert resolve_nllb_lang_code(code, strict=True) == code
+        assert resolve_nllb_lang_code(code.lower(), strict=True) == code
+
+    for iso_code, nllb_code in ISO_TO_NLLB.items():
+        assert nllb_code in SUPPORTED_NLLB_CODES
+        assert resolve_nllb_lang_code(iso_code, strict=True) == nllb_code
+
+    assert resolve_nllb_lang_code("zh-TW", strict=True) == "zho_Hant"
+    assert resolve_nllb_lang_code("zh_CN", strict=True) == "zho_Hans"
+    assert resolve_nllb_lang_code("tr", strict=True) == "tur_Latn"
+    assert resolve_nllb_lang_code("uk", strict=True) == "ukr_Cyrl"
+    assert resolve_nllb_lang_code("pl", strict=True) == "pol_Latn"
+    assert resolve_nllb_lang_code("nl", strict=True) == "nld_Latn"
+    assert resolve_nllb_lang_code("ja", strict=True) == "jpn_Jpan"
+    assert resolve_nllb_lang_code("yue", strict=True) == "yue_Hant"
+
+    assert is_same_translation_language("en", "eng_Latn") is True
+    assert is_same_translation_language("km", "khm_Khmr") is True
+    assert is_same_translation_language("km", "eng_Latn") is False
+    assert is_same_translation_language("zh-TW", "zho_Hant") is True
+    assert is_same_translation_language("zh-CN", "zho_Hant") is False
+
+    for invalid in ("", "   ", "xx_Invalid", "klingon"):
+        with pytest.raises(UnsupportedLanguageError):
+            resolve_nllb_lang_code(invalid, strict=True)
+
+    for unsupported_src in UNSUPPORTED_WHISPER_TRANSLATION_CODES:
+        with pytest.raises(UnsupportedLanguageError):
+            resolve_nllb_lang_code(unsupported_src)
+
+    translator = LocalTranslator()
+    tokenizer = _FakeTokenizer(seq_len=5)
+    tokenizer.unk_token_id = 3  # type: ignore[attr-defined]
+    tokenizer.convert_tokens_to_ids = lambda _code: 3  # type: ignore[method-assign]
+    translator._tokenizer = tokenizer
+    translator._model = _FakeSeq2SeqModel()
+    with pytest.raises(UnsupportedLanguageError):
+        translator._translate_batch(["Hello"], "eng_Latn", "jpn_Jpan")

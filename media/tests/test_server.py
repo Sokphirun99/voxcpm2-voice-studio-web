@@ -357,3 +357,129 @@ def test_burn_aligns_odd_video_size_cleanly(tmp_path: Path) -> None:
     out_mp4 = tmp_path / "odd_burned.mp4"
     out_mp4.write_bytes(burn_res.content)
     assert probe_video_dimensions(out_mp4) == (640, 360)
+
+
+def test_multilingual_any_to_any_translation_validation_and_async_translate(tmp_path: Path) -> None:
+    """Supports Khmer-to-English and any-to-any FLORES-200 targets, skips equivalent self-translation, and returns 400 on invalid codes."""
+    import asyncio
+    import threading
+    import httpx
+
+    sample_mp4 = tmp_path / "multi.mp4"
+    _make_sample_mp4(sample_mp4)
+    client = _make_client(tmp_path)
+
+    # 1. Khmer source -> English FLORES-200 target during /transcribe
+    with open(sample_mp4, "rb") as fh:
+        km_to_en = client.post(
+            "/transcribe",
+            files={"file": ("khmer.mp4", fh, "video/mp4")},
+            data={"language": "km", "diarize": "false", "translate_to": "eng_Latn"},
+        )
+    assert km_to_en.status_code == 200
+    km_body = km_to_en.json()
+    assert km_body["language"] == "km"
+    assert km_body["translatedLanguage"] == "eng_Latn"
+    assert km_body["segments"][0]["translatedText"].startswith("[eng_Latn] ")
+
+    # 2. English source -> Japanese target via /transcribe and /translate
+    with open(sample_mp4, "rb") as fh:
+        en_to_ja = client.post(
+            "/transcribe",
+            files={"file": ("english.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "translate_to": "jpn_Jpan"},
+        )
+    assert en_to_ja.status_code == 200
+    ja_body = en_to_ja.json()
+    assert ja_body["translatedLanguage"] == "jpn_Jpan"
+    assert ja_body["segments"][0]["translatedText"].startswith("[jpn_Jpan] ")
+
+    tr_ar = client.post(
+        "/translate",
+        json={"segments": ja_body["segments"], "sourceLanguage": "km", "targetLanguage": "arb_Arab"},
+    )
+    assert tr_ar.status_code == 200
+    assert tr_ar.json()["targetLanguage"] == "arb_Arab"
+    assert tr_ar.json()["segments"][0]["translatedText"].startswith("[arb_Arab] ")
+
+    # 3. Equivalent ISO <-> NLLB code skips self-translation cleanly
+    with open(sample_mp4, "rb") as fh:
+        same_en = client.post(
+            "/transcribe",
+            files={"file": ("same.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "translate_to": "eng_Latn"},
+        )
+    assert same_en.status_code == 200
+    assert same_en.json()["translatedLanguage"] == ""
+    assert same_en.json()["segments"][0]["translatedText"] == ""
+
+    # 4. Whisper-only source (`la`) keeps transcript during /transcribe without crashing, while explicit /translate rejects 400
+    with open(sample_mp4, "rb") as fh:
+        latin_tr = client.post(
+            "/transcribe",
+            files={"file": ("latin.mp4", fh, "video/mp4")},
+            data={"language": "la", "diarize": "false", "translate_to": "eng_Latn"},
+        )
+    assert latin_tr.status_code == 200
+    assert latin_tr.json()["translatedLanguage"] == ""
+    assert latin_tr.json()["segments"][0]["translatedText"] == ""
+
+    bad_src_tr = client.post(
+        "/translate",
+        json={"segments": ja_body["segments"], "sourceLanguage": "la", "targetLanguage": "eng_Latn"},
+    )
+    assert bad_src_tr.status_code == 400
+
+    # 5. Invalid target codes fail fast with HTTP 400 on both /transcribe and /translate
+    with open(sample_mp4, "rb") as fh:
+        bad_transcribe = client.post(
+            "/transcribe",
+            files={"file": ("badlang.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "translate_to": "not_a_language"},
+        )
+    assert bad_transcribe.status_code == 400
+
+    bad_translate = client.post(
+        "/translate",
+        json={"segments": ja_body["segments"], "sourceLanguage": "en", "targetLanguage": "not_a_language"},
+    )
+    assert bad_translate.status_code == 400
+
+    # 6. Slow /translate runs off the event loop without blocking /health
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingTranslator:
+        def translate_lines(self, lines: list[str], source_lang: str, target_lang: str = "km") -> list[str]:
+            started.set()
+            assert release.wait(timeout=5.0)
+            return [f"[{target_lang}] {line}" for line in lines]
+
+    async_app = create_app(
+        MediaServices(
+            job_store=MediaJobStore(tmp_path / "async-jobs"),
+            transcriber=_FakeTranscriber(),
+            diarizer=_FakeDiarizer(),
+            translator=_BlockingTranslator(),
+        )
+    )
+
+    async def exercise_async_translate() -> None:
+        transport = httpx.ASGITransport(app=async_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            tr_task = asyncio.create_task(
+                async_client.post(
+                    "/translate",
+                    json={"segments": ja_body["segments"], "sourceLanguage": "en", "targetLanguage": "fra_Latn"},
+                )
+            )
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            release.set()
+            tr_res = await tr_task
+            assert tr_res.status_code == 200
+            assert tr_res.json()["segments"][0]["translatedText"].startswith("[fra_Latn] ")
+
+    asyncio.run(exercise_async_translate())

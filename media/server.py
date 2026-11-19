@@ -21,6 +21,12 @@ from asr import DEFAULT_KHMER_WHISPER_REPO, DEFAULT_WHISPER_REPO, LocalTranscrib
 from diarizer import LocalDiarizer, are_diarization_models_ready
 from jobs import InvalidMediaInputError, JobNotFoundError, MediaJobPaths, MediaJobStore
 from khmer_dictionary import get_lexicon_stats
+from languages import (
+    UNSUPPORTED_WHISPER_TRANSLATION_CODES,
+    UnsupportedLanguageError,
+    is_same_translation_language,
+    resolve_nllb_lang_code,
+)
 from subtitles import (
     SPEAKER_ASS_COLORS,
     SubtitleSegment,
@@ -250,11 +256,15 @@ def _maybe_translate_aligned(
     translate_to: str,
 ) -> list[str] | None:
     """Translate extracted segment texts when `translate_to` target language differs from `detected_lang`."""
-    target = (translate_to or "").strip().lower()
-    source = (detected_lang or "").strip().lower()
-    if not target or not aligned or target == source:
+    target = (translate_to or "").strip()
+    if not target or not aligned:
         return None
-    return services.translator.translate_lines([s.text for s in aligned], detected_lang, translate_to)
+    resolve_nllb_lang_code(target, strict=True)
+    if (detected_lang or "").strip().lower() in UNSUPPORTED_WHISPER_TRANSLATION_CODES:
+        return None
+    if is_same_translation_language(detected_lang, target):
+        return None
+    return services.translator.translate_lines([s.text for s in aligned], detected_lang, target)
 
 
 def _run_transcriber(transcriber: Any, wav_path: Path, language: str, turns: list) -> dict:
@@ -284,6 +294,7 @@ def _execute_transcribe_pipeline(
     return {
         "jobId": job.job_id,
         "language": detected_lang,
+        "translatedLanguage": opts.translate_to if translations is not None else "",
         "speakers": speakers,
         "segments": serialized,
         "isAudioOnly": not has_video,
@@ -337,11 +348,16 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         req_id = getattr(request.state, "request_id", "-")
         try:
+            if opts.translate_to:
+                resolve_nllb_lang_code(opts.translate_to, strict=True)
             job = _create_job_safe(active_services.job_store, file.filename)
             await _save_bounded_upload(file, job.source_video)
             return await asyncio.to_thread(_execute_transcribe_pipeline, active_services, job, opts, req_id)
         except HTTPException:
             raise
+        except UnsupportedLanguageError as exc:
+            _log_json(logging.WARNING, req_id, "Unsupported translation language during transcribe", {"error": str(exc)})
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except MediaProcessingError as exc:
             _log_json(logging.ERROR, req_id, "Media processing failed during transcribe", {"error": str(exc)})
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -350,13 +366,23 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="Video subtitle extraction failed unexpectedly.") from exc
 
     @app.post("/translate")
-    def translate(request: Request, payload: TranslateRequest) -> dict[str, Any]:
+    async def translate(request: Request, payload: TranslateRequest) -> dict[str, Any]:
         req_id = getattr(request.state, "request_id", "-")
         try:
+            resolve_nllb_lang_code(payload.targetLanguage, strict=True)
+            resolve_nllb_lang_code(payload.sourceLanguage)
             texts = [seg.text for seg in payload.segments]
-            translated = active_services.translator.translate_lines(texts, payload.sourceLanguage, payload.targetLanguage)
+            translated = await asyncio.to_thread(
+                active_services.translator.translate_lines,
+                texts,
+                payload.sourceLanguage,
+                payload.targetLanguage,
+            )
             updated = [seg.model_copy(update={"translatedText": tr}).model_dump() for seg, tr in zip(payload.segments, translated)]
             return {"segments": updated, "targetLanguage": payload.targetLanguage}
+        except UnsupportedLanguageError as exc:
+            _log_json(logging.WARNING, req_id, "Unsupported translation language", {"error": str(exc)})
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             _log_json(logging.ERROR, req_id, "Translation error", {"error": str(exc)})
             raise HTTPException(status_code=500, detail="Offline subtitle translation failed.") from exc

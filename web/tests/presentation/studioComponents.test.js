@@ -955,6 +955,18 @@ test('buildExtractSummary pluralizes segment count cleanly and resolveTranslatio
     assert.deepEqual(resolveTranslationFlags(true, 'bilingual'), { hasTranslated: true, bilingual: true, useTranslation: true });
     assert.deepEqual(resolveTranslationFlags(true, 'original'), { hasTranslated: true, bilingual: false, useTranslation: false });
     assert.deepEqual(resolveTranslationFlags(false, 'translated'), { hasTranslated: false, bilingual: false, useTranslation: false });
+
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    const subHtml = renderToStaticMarkup(
+      React.createElement(StudioProvider, { services: createStubServices() }, React.createElement(VideoSubtitleWorkspace, { notices: null }))
+    );
+    assert.ok(subHtml.includes('id="subtitle-source-lang"'));
+    assert.ok(subHtml.includes('id="subtitle-auto-translate"'));
+    assert.ok(subHtml.includes('<optgroup label="Popular">'));
+    assert.ok(subHtml.includes('<optgroup label="All languages (A–Z)">'));
+    assert.ok(subHtml.includes('value="yue"'));
+    assert.ok(subHtml.includes('value="yo"'));
   });
 });
 

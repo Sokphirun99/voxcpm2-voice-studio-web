@@ -3,6 +3,21 @@
  */
 
 import { MAX_SCRIPT_LENGTH, countGraphemes } from './presets.js';
+export {
+  DEFAULT_ENGLISH_TARGET,
+  DEFAULT_KHMER_TARGET,
+  DEFAULT_SOURCE_LANGUAGE,
+  ISO_TO_NLLB,
+  POPULAR_SOURCE_LANGUAGE_IDS,
+  POPULAR_TARGET_LANGUAGE_IDS,
+  SOURCE_LANGUAGE_OPTIONS,
+  TARGET_LANGUAGE_OPTIONS,
+  groupLanguageOptions,
+  isSameSubtitleLanguage,
+  normalizeTargetLanguageCode,
+  pickDefaultTargetLanguage,
+  resolveTargetLanguageMeta,
+} from './subtitleLanguages.js';
 
 export const SUBTITLE_SPEAKER_COLORS = Object.freeze([
   '#eeeeec',
@@ -41,23 +56,6 @@ const AUDIO_ONLY_EXT_PATTERN = /\.(mp3|wav|m4a|aac|ogg|flac)$/i;
 const VIDEO_EXT_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi)$/i;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 export const MIN_SPLIT_GAP_SEC = 0.1;
-
-export const SOURCE_LANGUAGE_OPTIONS = Object.freeze([
-  { id: 'km', label: 'Khmer (ខ្មែរ)' },
-  { id: 'auto', label: 'Auto-detect language' },
-  { id: 'en', label: 'English' },
-  { id: 'zh', label: 'Chinese (Mandarin)' },
-  { id: 'th', label: 'Thai' },
-  { id: 'vi', label: 'Vietnamese' },
-  { id: 'ja', label: 'Japanese' },
-  { id: 'ko', label: 'Korean' },
-  { id: 'fr', label: 'French' },
-  { id: 'es', label: 'Spanish' },
-  { id: 'de', label: 'German' },
-  { id: 'ru', label: 'Russian' },
-  { id: 'ar', label: 'Arabic' },
-  { id: 'hi', label: 'Hindi' },
-]);
 
 /**
  * Formats seconds as `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` (VTT).

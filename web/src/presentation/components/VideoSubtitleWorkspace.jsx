@@ -5,17 +5,24 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Blocks } from 'loading-dev';
 import {
+  POPULAR_SOURCE_LANGUAGE_IDS,
+  POPULAR_TARGET_LANGUAGE_IDS,
   SOURCE_LANGUAGE_OPTIONS,
   SUBTITLE_BACKGROUND_OPTIONS,
   SUBTITLE_FONT_SCALE_OPTIONS,
   SUBTITLE_POSITION_OPTIONS,
+  TARGET_LANGUAGE_OPTIONS,
   getSpeakerColor,
+  groupLanguageOptions,
+  isSameSubtitleLanguage,
   resolveSpeakerLabel,
 } from '../../domain/subtitles.js';
+import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
 import { SubtitleExportDock } from './SubtitleExportDock.jsx';
 import { SubtitleSegmentRow } from './SubtitleSegmentRow.jsx';
+import { SubtitleVoiceOutputCard, SubtitleVoiceToolbar } from './SubtitleVoiceControls.jsx';
 
 const GENERATE_SPINNER_SIZE_PX = 16;
 
@@ -27,7 +34,7 @@ const SPEAKER_COUNT_OPTIONS = Object.freeze([
   { id: '6', label: '5+ speakers' },
 ]);
 
-function SubtitleToolbar({ busy, hasFile, hasSegments, onClear, onCancel, onExtract }) {
+function SubtitleToolbar({ busy, extracting, hasFile, hasSegments, onClear, onCancel, onExtract }) {
   return (
     <header className="studio-toolbar">
       <h1>Video to subtitle</h1>
@@ -41,10 +48,10 @@ function SubtitleToolbar({ busy, hasFile, hasSegments, onClear, onCancel, onExtr
             <Icon name="stop_fill" /><span>Cancel</span>
           </button>
         )}
-        <button type="button" id="subtitle-extract-btn" className={busy ? 'button generate is-generating' : 'button generate'}
-          disabled={!hasFile || busy} aria-busy={busy || undefined} onClick={onExtract}>
-          {busy ? <Blocks size={GENERATE_SPINNER_SIZE_PX} className="generate-spinner" /> : <Icon name="subtitles" />}
-          <span>{busy ? 'Extracting…' : 'Extract subtitles'}</span>
+        <button type="button" id="subtitle-extract-btn" className={extracting ? 'button generate is-generating' : 'button generate'}
+          disabled={!hasFile || busy} aria-busy={extracting || undefined} onClick={onExtract}>
+          {extracting ? <Blocks size={GENERATE_SPINNER_SIZE_PX} className="generate-spinner" /> : <Icon name="subtitles" />}
+          <span>{extracting ? 'Extracting…' : 'Extract subtitles'}</span>
         </button>
       </div>
     </header>
@@ -67,14 +74,15 @@ function MediaOfflineBanner({ health, onRefresh }) {
   );
 }
 
-function VideoPreviewCard({ ctrl }) {
-  const { videoRef, vttUrl, useTranslation, bilingual, selectVideoFile, handleVideoMetadata, handleVideoTimeUpdate } = ctrl;
-  const { videoFile, videoUrl, videoSize, isAudioOnly, detectedLanguage, busyAction } = ctrl.state;
+function VideoPreviewCard({ ctrl, busy = false, onSelectFile }) {
+  const { videoRef, vttUrl, useTranslation, bilingual, translatedLanguageMeta, handleVideoMetadata, handleVideoTimeUpdate } = ctrl;
+  const { videoFile, videoUrl, videoSize, isAudioOnly, detectedLanguage } = ctrl.state;
   const trackRef = useRef(null);
-  const busy = Boolean(busyAction);
   const isPortrait = Boolean(videoSize && videoSize.height > videoSize.width);
   const aspectStyle = videoSize ? { '--video-aspect': `${videoSize.width} / ${videoSize.height}` } : undefined;
-  const trackLabel = bilingual ? 'Original + Khmer' : useTranslation ? 'Khmer' : 'Original';
+  const targetShort = translatedLanguageMeta?.shortLabel || 'Khmer';
+  const trackLabel = bilingual ? `Original + ${targetShort}` : useTranslation ? targetShort : 'Original';
+  const trackLang = useTranslation ? (translatedLanguageMeta?.bcp47 || 'km') : (detectedLanguage || 'en');
 
   const showTrack = () => {
     const trackEl = trackRef.current;
@@ -108,7 +116,7 @@ function VideoPreviewCard({ ctrl }) {
                 ref={trackRef}
                 kind="subtitles"
                 src={vttUrl}
-                srcLang={useTranslation ? 'km' : (detectedLanguage || 'en')}
+                srcLang={trackLang}
                 label={trackLabel}
                 default
                 onLoad={showTrack}
@@ -119,7 +127,7 @@ function VideoPreviewCard({ ctrl }) {
       ) : null}
       <label className="subtitle-upload-dropzone" htmlFor="subtitle-video-input">
         <input id="subtitle-video-input" type="file" accept="video/*,audio/*,.mkv,.avi,.m4v,.aac,.ogg,.flac"
-          disabled={busy} onChange={e => { selectVideoFile(e.target.files?.[0]); e.target.value = ''; }} />
+          disabled={busy} onChange={e => { onSelectFile(e.target.files?.[0]); e.target.value = ''; }} />
         <Icon name="upload" />
         <span className="subtitle-upload-copy">
           <strong>{videoFile ? videoFile.name : 'Choose a video or audio clip'}</strong>
@@ -213,12 +221,32 @@ function SubtitleToggleRow({ id, label, checked, disabled, hidden = false, onCha
   );
 }
 
+const GROUPED_SOURCE_LANGUAGES = groupLanguageOptions(SOURCE_LANGUAGE_OPTIONS, POPULAR_SOURCE_LANGUAGE_IDS);
+const GROUPED_TARGET_LANGUAGES = groupLanguageOptions(TARGET_LANGUAGE_OPTIONS, POPULAR_TARGET_LANGUAGE_IDS);
+
+function GroupedLanguageOptions({ grouped }) {
+  return (
+    <>
+      <optgroup label="Popular">
+        {grouped.popular.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+      </optgroup>
+      <optgroup label="All languages (A–Z)">
+        {grouped.others.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+      </optgroup>
+    </>
+  );
+}
+
 function SubtitleSettingsForm({ ctrl }) {
-  const { options, segments, detectedLanguage, busyAction, videoFile, isAudioOnly } = ctrl.state;
+  const { options, segments, busyAction, videoFile, isAudioOnly, translatedLanguage } = ctrl.state;
   const busy = Boolean(busyAction);
   const hasTranslation = Boolean(ctrl.hasTranslation);
-  const canTranslateToKhmer = options.sourceLanguage !== 'km' && detectedLanguage !== 'km';
+  const canTranslate = ctrl.canTranslate !== false;
+  const targetMeta = ctrl.targetLanguageMeta || { shortLabel: 'Khmer' };
+  const translatedMeta = ctrl.translatedLanguageMeta || targetMeta;
+  const isRetranslatingSameTarget = hasTranslation && isSameSubtitleLanguage(translatedLanguage, options.targetLanguage);
   const showSpeakerLabelToggle = options.detectSpeakers || ctrl.speakers.length > 1;
+  const showTargetSelector = Boolean(options.translateToKhmer) || segments.length > 0;
   return (
     <div className="subtitle-settings-stack">
       <div className="subtitle-option-grid" data-columns={options.detectSpeakers ? '2' : '1'}>
@@ -227,7 +255,7 @@ function SubtitleSettingsForm({ ctrl }) {
           <div className="select-field select-field--plain">
             <select id="subtitle-source-lang" value={options.sourceLanguage} disabled={busy}
               onChange={e => ctrl.updateOption('sourceLanguage', e.target.value)}>
-              {SOURCE_LANGUAGE_OPTIONS.map(opt => <option key={opt.id} value={opt.id}>{opt.label}</option>)}
+              <GroupedLanguageOptions grouped={GROUPED_SOURCE_LANGUAGES} />
             </select>
             <Icon name="chevron_down" className="select-chevron" />
           </div>
@@ -251,15 +279,13 @@ function SubtitleSettingsForm({ ctrl }) {
           disabled={busy}
           onChange={checked => ctrl.updateOption('detectSpeakers', checked)}
         />
-        {options.sourceLanguage !== 'km' && (
-          <SubtitleToggleRow
-            id="subtitle-auto-translate"
-            label="Translate to Khmer"
-            checked={options.translateToKhmer}
-            disabled={busy}
-            onChange={checked => ctrl.updateOption('translateToKhmer', checked)}
-          />
-        )}
+        <SubtitleToggleRow
+          id="subtitle-auto-translate"
+          label="Translate subtitles"
+          checked={options.translateToKhmer}
+          disabled={busy}
+          onChange={checked => ctrl.updateOption('translateToKhmer', checked)}
+        />
         <SubtitleToggleRow
           id="subtitle-include-speaker"
           label="Show speaker names"
@@ -269,20 +295,41 @@ function SubtitleSettingsForm({ ctrl }) {
           onChange={checked => ctrl.updateOption('includeSpeaker', checked)}
         />
       </div>
-      {segments.length > 0 && (canTranslateToKhmer || hasTranslation) && (
+      {showTargetSelector && (
+        <div className="field field-compact">
+          <label className="field-label" htmlFor="subtitle-target-lang">Translate to</label>
+          <div className="select-field select-field--plain">
+            <select id="subtitle-target-lang" value={options.targetLanguage} disabled={busy}
+              onChange={e => ctrl.updateOption('targetLanguage', e.target.value)}>
+              <GroupedLanguageOptions grouped={GROUPED_TARGET_LANGUAGES} />
+            </select>
+            <Icon name="chevron_down" className="select-chevron" />
+          </div>
+        </div>
+      )}
+      {segments.length > 0 && (
         <div className="subtitle-translate-bar">
-          {canTranslateToKhmer && (
-            <button type="button" id="subtitle-translate-btn" className="button button-secondary" disabled={busy} onClick={() => void ctrl.translateNow()}>
-              {busyAction === 'translate' ? 'Translating…' : hasTranslation ? 'Re-translate Khmer' : 'Translate to Khmer'}
-            </button>
-          )}
+          <button
+            type="button"
+            id="subtitle-translate-btn"
+            className="button button-secondary"
+            disabled={busy || !canTranslate}
+            title={!canTranslate ? 'Choose a target language different from the source language.' : undefined}
+            onClick={() => void ctrl.translateNow()}
+          >
+            {busyAction === 'translate'
+              ? 'Translating…'
+              : isRetranslatingSameTarget
+                ? `Re-translate ${targetMeta.shortLabel}`
+                : `Translate to ${targetMeta.shortLabel}`}
+          </button>
           {hasTranslation && (
             <div className="select-field select-field--plain">
               <select aria-label="Preview language" value={options.previewMode} disabled={busy}
                 onChange={e => ctrl.updateOption('previewMode', e.target.value)}>
-                <option value="translated">Khmer subtitles</option>
+                <option value="translated">{translatedMeta.shortLabel} subtitles</option>
                 <option value="original">Original subtitles</option>
-                <option value="bilingual">Bilingual (Original + Khmer)</option>
+                <option value="bilingual">Bilingual (Original + {translatedMeta.shortLabel})</option>
               </select>
               <Icon name="chevron_down" className="select-chevron" />
             </div>
@@ -332,10 +379,12 @@ function FindReplaceBar({ busy, countMatches, onReplace }) {
   );
 }
 
-function SubtitleCueList({ ctrl }) {
+function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
   const { segments, speakerNames, detectedLanguage, busyAction } = ctrl.state;
   const [showFind, setShowFind] = useState(false);
-  const busy = Boolean(busyAction);
+  const mediaBusy = Boolean(busyAction);
+  const busy = mediaBusy || voice.voiceBusy;
+  const selectedSet = new Set(voice.selectedIds);
   if (!segments.length) {
     return (
       <div className="subtitle-empty-state">
@@ -361,6 +410,22 @@ function SubtitleCueList({ ctrl }) {
           </button>
         </div>
       </div>
+      <SubtitleVoiceToolbar
+        totalSegments={segments.length}
+        selectedCount={voice.selectedCount}
+        allSelected={voice.allSelected}
+        characters={voice.characters}
+        anchors={voice.anchors}
+        selectedVoiceId={voice.selectedVoiceId}
+        busy={mediaBusy}
+        voiceBusy={voice.voiceBusy}
+        batchProgress={voice.batchProgress}
+        onToggleSelectAll={voice.toggleSelectAll}
+        onClearSelection={voice.clearSelection}
+        onChangeVoice={voice.setSelectedVoiceId}
+        onGenerateSelected={() => void voice.generateSelectedVoices()}
+        onCancelVoice={voice.cancelVoiceGeneration}
+      />
       {showFind && <FindReplaceBar busy={busy} countMatches={ctrl.countMatches} onReplace={ctrl.findAndReplace} />}
       {segments.map((seg, index) => (
         <SubtitleSegmentRow
@@ -369,39 +434,98 @@ function SubtitleCueList({ ctrl }) {
           speakers={ctrl.speakers}
           speakerNames={speakerNames}
           useTranslation={ctrl.useTranslation}
+          targetLangMeta={ctrl.translatedLanguageMeta}
+          sourceLanguage={detectedLanguage || ctrl.state.options.sourceLanguage}
           showSpeakerBadge={hasMultiSpeakers}
           isActive={seg.id === ctrl.activeSegmentId}
+          isSelected={selectedSet.has(seg.id)}
           canMergeNext={index < segments.length - 1}
           busy={busy}
+          voiceClip={voice.segmentClips[seg.id] || null}
+          isVoiceStale={voice.isClipStale(seg)}
+          isGeneratingVoice={voice.generatingSegmentId === seg.id}
+          isPlayingVoice={voice.playingSegmentId === seg.id}
+          voiceDisabled={voice.voiceBusy}
+          onToggleSelect={voice.toggleSelectSegment}
           onSeek={ctrl.seekToSegment}
           onUpdate={ctrl.updateSegment}
           onUpdateTiming={ctrl.updateSegmentTiming}
           onSplit={ctrl.splitSegment}
           onMergeNext={ctrl.mergeSegmentWithNext}
-          onDelete={ctrl.deleteSegment}
+          onDelete={onDeleteSegment}
+          onGenerateVoice={segment => void voice.generateSegmentVoice(segment)}
+          onTogglePlayVoice={voice.togglePlaySegment}
+          onDownloadVoice={segment => voice.downloadSegmentVoice(segment, index)}
         />
       ))}
+      <SubtitleVoiceOutputCard
+        combinedClip={voice.combinedClip}
+        busy={busy || voice.voiceBusy}
+        onDownload={voice.downloadCombinedVoice}
+      />
     </div>
   );
 }
 
 /**
  * Self-contained Video-to-Subtitle workspace panel hosted inside the Studio shell.
- * Inputs: `{ notices, hidden, onSendToTts, onStateChange, onNotify, onUnlockSound }`.
+ * Inputs: `{ notices, hidden, voiceCatalog, onRefreshEngine, onSendToTts, onStateChange, onNotify, onUnlockSound }`.
  * Outputs: `<div className="workspace-panel subtitle-workspace">` element.
- * Side effects: delegates transcription, diarization, translation, and MP4 burn-in via useVideoSubtitles.
+ * Side effects: delegates transcription, diarization, translation, MP4 burn-in, and per-frame VoxCPM2 synthesis.
  * Failure modes: displays service connectivity or processing errors cleanly in banners/dock/toasts.
  * @param {object} props - Workspace props.
  * @returns {React.ReactElement} Video-to-Subtitle workspace element.
  */
-export function VideoSubtitleWorkspace({ notices, hidden = false, onSendToTts, onStateChange, onNotify, onUnlockSound }) {
-  const ctrl = useVideoSubtitles({ onStateChange, onNotify, onUnlockSound });
+export function VideoSubtitleWorkspace({
+  notices,
+  hidden = false,
+  voiceCatalog = null,
+  onRefreshEngine,
+  onSendToTts,
+  onStateChange,
+  onNotify,
+  onUnlockSound,
+}) {
+  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound });
   const { state, health, speakers } = ctrl;
-  const busy = Boolean(state.busyAction);
+  const voice = useSubtitleVoiceover({
+    segments: state.segments,
+    useTranslation: ctrl.useTranslation,
+    videoFile: state.videoFile,
+    voiceCatalog,
+    onStatus: ctrl.setStatus,
+    onNotify,
+    onUnlockSound,
+    onEngineFailure: onRefreshEngine,
+  });
+  const mediaBusy = Boolean(state.busyAction);
+  const busy = mediaBusy || voice.voiceBusy;
+
+  useEffect(() => {
+    onStateChange?.({ busy, hasVideo: Boolean(state.videoFile || state.segments.length) });
+  }, [busy, state.videoFile, state.segments.length, onStateChange]);
+
+  const handleSelectFile = file => {
+    if (!file) return;
+    voice.resetVoiceover();
+    ctrl.selectVideoFile(file);
+  };
+  const handleClear = () => {
+    voice.resetVoiceover();
+    ctrl.clearWorkspace();
+  };
+  const handleCancel = () => {
+    ctrl.cancel();
+    voice.cancelVoiceGeneration();
+  };
+  const handleDeleteSegment = segId => {
+    voice.removeSegmentClip(segId);
+    ctrl.deleteSegment(segId);
+  };
   const handleSendToTts = () => {
-    const handoff = ctrl.getTtsHandoff();
+    const handoff = ctrl.getTtsHandoff(undefined, voice.selectedIds);
     if (!handoff.text) {
-      onNotify?.({ kind: 'error', title: 'No text to send', message: 'Selected speaker has no subtitle text yet.' });
+      onNotify?.({ kind: 'error', title: 'No text to send', message: 'Selected frames or speaker have no subtitle text yet.' });
       return;
     }
     if (handoff.truncated) {
@@ -418,11 +542,18 @@ export function VideoSubtitleWorkspace({ notices, hidden = false, onSendToTts, o
         {notices}
         <MediaOfflineBanner health={health} onRefresh={() => void ctrl.refreshHealth()} />
       </div>
-      <SubtitleToolbar busy={busy} hasFile={Boolean(state.videoFile)} hasSegments={state.segments.length > 0}
-        onClear={ctrl.clearWorkspace} onCancel={ctrl.cancel} onExtract={() => void ctrl.extractSubtitles()} />
+      <SubtitleToolbar
+        busy={busy}
+        extracting={mediaBusy}
+        hasFile={Boolean(state.videoFile)}
+        hasSegments={state.segments.length > 0}
+        onClear={handleClear}
+        onCancel={handleCancel}
+        onExtract={() => void ctrl.extractSubtitles()}
+      />
       <div className="studio-grid subtitle-grid">
         <section className="subtitle-left-pane" aria-label="Video and controls">
-          <VideoPreviewCard ctrl={ctrl} />
+          <VideoPreviewCard ctrl={ctrl} busy={busy} onSelectFile={handleSelectFile} />
           <SubtitleSettingsForm ctrl={ctrl} />
           <SpeakerRosterCard
             speakers={speakers}
@@ -433,12 +564,13 @@ export function VideoSubtitleWorkspace({ notices, hidden = false, onSendToTts, o
           />
         </section>
         <section className="subtitle-right-pane studio-form" aria-label="Extracted dialogue subtitles">
-          <SubtitleCueList ctrl={ctrl} />
+          <SubtitleCueList ctrl={ctrl} voice={voice} onDeleteSegment={handleDeleteSegment} />
         </section>
       </div>
       <SubtitleExportDock
         hasSegments={state.segments.length > 0}
         hasSubtitleText={ctrl.hasSubtitleText}
+        selectedCount={voice.selectedCount}
         canBurn={Boolean(state.jobId) && health.burnInSupported !== false}
         isAudioOnly={state.isAudioOnly}
         speakers={speakers}
