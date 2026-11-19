@@ -2,6 +2,14 @@
 
 Offline Apple Silicon **Text-to-Speech** and **Multilingual Video-to-Subtitle Studio** that keeps the upstream open-source [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) engine strictly separated from our custom frontend and media subtitle pipeline.
 
+## Preview
+
+### Text to Speech (Khmer & Multilingual · 48 kHz)
+![Text to Speech workspace with Khmer script, locked character voice, and 48 kHz waveform player](./docs/screenshots/text-to-speech.png)
+
+### Video to Subtitle (101 Sources · 202 Translation Targets · Per-Frame TTS Voiceover)
+![Video to Subtitle workspace showing multilingual translation, frame selection, inline playback, and combined WAV voiceover](./docs/screenshots/video-to-subtitle.png)
+
 ## Highlights
 
 - **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, and `-16 LUFS` FFmpeg mastering.
