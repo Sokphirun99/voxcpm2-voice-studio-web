@@ -1,0 +1,46 @@
+# VoxCPM Media Subtitle Service (`media/`)
+
+Local Apple Silicon FastAPI service (port `8810`) powering the **Video to subtitle** workspace in Voice Studio:
+
+- **Speech-to-text**: Hybrid ASR ([`asr.py`](./asr.py)) routing Khmer to `seanghay/Qwen3-ASR-0.6B-Khmer` (+ 3-layer local Khmer lexicon in [`khmer_dictionary.py`](./khmer_dictionary.py) & [`lexicon/`](./lexicon/)) and other languages to `mlx-community/whisper-large-v3-turbo`.
+- **Speaker diarization**: Optional offline `sherpa-onnx` pipeline ([`diarizer.py`](./diarizer.py)) with adaptive RMS energy VAD fallback when disabled.
+- **Offline translation**: Meta `facebook/nllb-200-distilled-600M` ([`translator.py`](./translator.py)) with source/output repetition guards and beam search.
+- **Subtitle export & burn-in**: Grapheme/Khmer-cluster-safe ASS/SRT/VTT generation ([`subtitles.py`](./subtitles.py)) and `ffmpeg-full` (`libass`) MP4 rendering ([`video_io.py`](./video_io.py)).
+
+## Prerequisites (macOS Apple Silicon)
+
+- Python `3.12` + [`uv`](https://docs.astral.sh/uv/)
+- Homebrew `ffmpeg-full` (required for `libass` subtitle burn-in):
+  ```sh
+  brew install ffmpeg-full
+  ```
+
+## Setup
+
+```sh
+cd media
+uv sync --frozen --python 3.12
+# Install qwen-asr without dependency overrides so torch/transformers stay compatible:
+uv pip install --python .venv/bin/python --no-deps qwen-asr==0.0.6
+```
+
+## Run & Test
+
+```sh
+# Run unit and FastAPI/FFmpeg integration tests
+media/.venv/bin/pytest -v media/tests
+
+# Start via workspace orchestrator (recommended)
+./studio.sh start
+
+# Or run standalone on port 8810
+cd media && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8810
+```
+
+## Local Model Caches (Not Committed to Git)
+
+Pretrained weights are cached outside this repository:
+- HuggingFace models (`~/.cache/huggingface/hub/`): `mlx-community/whisper-large-v3-turbo`, `seanghay/Qwen3-ASR-0.6B-Khmer`, `facebook/nllb-200-distilled-600M`
+- Diarization ONNX models (`~/.cache/voxcpm-media/diarization/`): downloaded lazily by [`diarizer.py`](./diarizer.py)
+
+See [`../AGENTS.md`](../AGENTS.md) for the upstream dependency & model update checklist.

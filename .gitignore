@@ -1,0 +1,21 @@
+# Upstream open-source repository (cloned separately; never mixed into monorepo)
+/engine/
+
+# Local runtime logs and build/venv caches
+/logs/
+web/node_modules/
+web/dist/
+web/data/
+media/.venv/
+media/__pycache__/
+media/tests/__pycache__/
+media/.pytest_cache/
+*.pyc
+*.log
+
+# OS and environment secrets
+.DS_Store
+**/.DS_Store
+.env
+.env.*
+!.env.example
