@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,11 @@ from asr import DEFAULT_KHMER_WHISPER_REPO, DEFAULT_WHISPER_REPO, LocalTranscrib
 from diarizer import LocalDiarizer, are_diarization_models_ready
 from jobs import InvalidMediaInputError, JobNotFoundError, MediaJobPaths, MediaJobStore
 from khmer_dictionary import get_lexicon_stats
+from khmer_verifier import (
+    DEFAULT_KHMER_VERIFIER_REPO,
+    MAX_VERIFY_TEXT_CHARS,
+    compare_khmer_speech_texts,
+)
 from languages import (
     UNSUPPORTED_WHISPER_TRANSLATION_CODES,
     UnsupportedLanguageError,
@@ -122,6 +128,7 @@ class TranscribeFormOptions:
     num_speakers: int
     diarize: bool
     translate_to: str
+    double_check: bool = False
 
 
 def _parse_transcribe_options(
@@ -129,6 +136,7 @@ def _parse_transcribe_options(
     num_speakers: int = Form(0),
     diarize: bool = Form(True),
     translate_to: str = Form(""),
+    double_check: bool = Form(False),
 ) -> TranscribeFormOptions:
     """Parse multipart form fields into an immutable option object."""
     return TranscribeFormOptions(
@@ -136,6 +144,7 @@ def _parse_transcribe_options(
         num_speakers=max(0, min(12, int(num_speakers))),
         diarize=bool(diarize),
         translate_to=(translate_to or "").strip(),
+        double_check=bool(double_check),
     )
 
 
@@ -193,6 +202,8 @@ def _serialize_segments(segments: list[SubtitleSegment], translations: list[str]
             "speakerId": seg.speaker_id,
             "text": seg.text,
             "translatedText": tr_text,
+            "altText": seg.alt_text,
+            "verifyReason": seg.verify_reason,
         })
     return items, speakers
 
@@ -267,12 +278,52 @@ def _maybe_translate_aligned(
     return services.translator.translate_lines([s.text for s in aligned], detected_lang, target)
 
 
-def _run_transcriber(transcriber: Any, wav_path: Path, language: str, turns: list) -> dict:
-    """Invoke transcriber with speaker turns when supported, falling back to two-argument signature."""
+def _run_transcriber(
+    transcriber: Any,
+    wav_path: Path,
+    language: str,
+    turns: list,
+    double_check: bool = False,
+) -> dict:
+    """Invoke transcriber with optional double-check and speaker turns, degrading cleanly for stub signatures."""
     try:
-        return transcriber.transcribe(wav_path, language=language, turns=turns)
+        return transcriber.transcribe(wav_path, language=language, turns=turns, double_check=double_check)
     except TypeError:
-        return transcriber.transcribe(wav_path, language=language)
+        try:
+            return transcriber.transcribe(wav_path, language=language, turns=turns)
+        except TypeError:
+            return transcriber.transcribe(wav_path, language=language)
+
+
+def _run_audio_verifier(transcriber: Any, wav_path: Path, language: str) -> tuple[str, str]:
+    """Decode generated speech via `verify_audio` (Whisper Khmer verifier) or fallback `transcribe`."""
+    if hasattr(transcriber, "verify_audio"):
+        return transcriber.verify_audio(wav_path, language=language)
+    res = _run_transcriber(transcriber, wav_path, language, [])
+    heard = " ".join(str(s.get("text") or "").strip() for s in (res.get("segments") or []) if str(s.get("text") or "").strip())
+    return heard, DEFAULT_KHMER_VERIFIER_REPO if language == "km" else DEFAULT_WHISPER_REPO
+
+
+def _execute_verify_speech_pipeline(
+    services: MediaServices,
+    job: MediaJobPaths,
+    expected_text: str,
+    language: str,
+) -> dict[str, Any]:
+    """Extract 16 kHz mono WAV, run Whisper verification ASR, and score similarity against `expected_text`."""
+    extract_audio_16k_wav(job.source_video, job.audio_wav)
+    heard_text, used_model = _run_audio_verifier(services.transcriber, job.audio_wav, language)
+    score = compare_khmer_speech_texts(expected_text, heard_text)
+    return {
+        "verdict": score.verdict,
+        "similarity": score.similarity,
+        "cer": score.cer,
+        "expectedText": expected_text,
+        "heardText": heard_text,
+        "model": used_model,
+        "language": language,
+        "missingTerms": list(score.missing_terms),
+    }
 
 
 def _execute_transcribe_pipeline(
@@ -286,11 +337,12 @@ def _execute_transcribe_pipeline(
     has_video = has_video_stream(job.source_video)
     width, height = probe_video_dimensions(job.source_video) if has_video else (0, 0)
     turns = _run_diarization_safe(services, job.audio_wav, opts.num_speakers, request_id) if opts.diarize else []
-    transcript = _run_transcriber(services.transcriber, job.audio_wav, opts.language, turns)
+    transcript = _run_transcriber(services.transcriber, job.audio_wav, opts.language, turns, opts.double_check)
     detected_lang = str(transcript.get("language") or opts.language or "en")
     aligned = align_segments_with_speakers(transcript.get("segments") or [], turns)
     translations = _maybe_translate_aligned(services, aligned, detected_lang, opts.translate_to)
     serialized, speakers = _serialize_segments(aligned, translations)
+    summary = transcript.get("verificationSummary") or {"checked": 0, "fallbackApplied": 0, "suggestions": 0, "model": ""}
     return {
         "jobId": job.job_id,
         "language": detected_lang,
@@ -300,6 +352,7 @@ def _execute_transcribe_pipeline(
         "isAudioOnly": not has_video,
         "videoSize": {"width": width, "height": height} if has_video else None,
         "assColorMap": _build_ass_color_map(speakers),
+        "verificationSummary": summary,
     }
 
 
@@ -336,6 +389,7 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
             "diarizationReady": are_diarization_models_ready(),
             "whisperModel": DEFAULT_WHISPER_REPO,
             "khmerWhisperModel": DEFAULT_KHMER_WHISPER_REPO,
+            "khmerVerifierModel": DEFAULT_KHMER_VERIFIER_REPO,
             "translatorModel": DEFAULT_NLLB_MODEL_ID,
             "khmerLexicon": get_lexicon_stats(),
         }
@@ -364,6 +418,37 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
         except Exception as exc:
             _log_json(logging.ERROR, req_id, "Unexpected transcription error", {"error": str(exc)})
             raise HTTPException(status_code=500, detail="Video subtitle extraction failed unexpectedly.") from exc
+
+    @app.post("/verify-speech")
+    async def verify_speech(
+        request: Request,
+        file: UploadFile = File(...),
+        expected_text: str = Form(""),
+        language: str = Form("km"),
+    ) -> dict[str, Any]:
+        req_id = getattr(request.state, "request_id", "-")
+        clean_expected = (expected_text or "").strip()
+        if not clean_expected:
+            raise HTTPException(status_code=400, detail="Expected script text is required to verify speech.")
+        if len(clean_expected) > MAX_VERIFY_TEXT_CHARS:
+            raise HTTPException(status_code=400, detail=f"Expected script exceeds {MAX_VERIFY_TEXT_CHARS} characters.")
+        clean_lang = (language or "km").strip().lower() or "km"
+        job: MediaJobPaths | None = None
+        try:
+            job = _create_job_safe(active_services.job_store, file.filename or "speech.wav")
+            await _save_bounded_upload(file, job.source_video)
+            return await asyncio.to_thread(_execute_verify_speech_pipeline, active_services, job, clean_expected, clean_lang)
+        except HTTPException:
+            raise
+        except MediaProcessingError as exc:
+            _log_json(logging.ERROR, req_id, "Media processing failed during verify-speech", {"error": str(exc)})
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            _log_json(logging.ERROR, req_id, "Unexpected speech verification error", {"error": str(exc)})
+            raise HTTPException(status_code=500, detail="Speech verification failed unexpectedly.") from exc
+        finally:
+            if job is not None:
+                shutil.rmtree(job.root, ignore_errors=True)
 
     @app.post("/translate")
     async def translate(request: Request, payload: TranslateRequest) -> dict[str, Any]:

@@ -7,6 +7,7 @@ import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '.
 import { useStudioServices } from '../StudioContext.jsx';
 import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
+import { useSpeechVerification } from '../hooks/useSpeechVerification.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
 import { Icon } from './Icon.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
@@ -24,6 +25,7 @@ const INITIAL_OPTIONS = {
   customStyle: '',
   denoiseReference: false,
   masterAudio: true,
+  verifyAudio: false,
 };
 
 function isApplePlatform() {
@@ -256,6 +258,10 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
  */
 export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef, externalScript = '', onConsumeExternalScript }) {
   const { state, ctrl } = useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript, onConsumeExternalScript });
+  const verification = useSpeechVerification({
+    recording: ctrl.synthesis.recording,
+    autoVerify: Boolean(state.options.verifyAudio),
+  });
   const voiceActions = buildVoiceActions({
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
     setLibraryModal: state.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
@@ -268,7 +274,8 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
         onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
       <AudioPlayer recording={ctrl.synthesis.recording} activeCharacter={ctrl.activeCharacter} activeAnchor={ctrl.activeAnchor}
-        status={ctrl.synthesis.status} busyMeta={ctrl.synthesis.busyMeta} onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
+        status={ctrl.synthesis.status} busyMeta={ctrl.synthesis.busyMeta} verification={verification}
+        onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
         onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
       <VoiceLibrary open={state.libraryModal.open} openSaveForm={state.libraryModal.openForm}
         busy={ctrl.synthesis.busy} library={state.library} anchors={state.anchorApi.anchors}

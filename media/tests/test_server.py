@@ -81,6 +81,7 @@ def test_health_endpoint_reports_capabilities(tmp_path: Path) -> None:
     assert isinstance(body["startedAt"], str) and body["startedAt"].endswith("Z")
     assert body["burnInSupported"] is True
     assert "whisperModel" in body
+    assert body["khmerVerifierModel"] == "seanghay/whisper-small-khmer-v2"
 
 
 def test_transcribe_translate_and_burn_roundtrip(tmp_path: Path) -> None:
@@ -483,3 +484,111 @@ def test_multilingual_any_to_any_translation_validation_and_async_translate(tmp_
             assert tr_res.json()["segments"][0]["translatedText"].startswith("[fra_Latn] ")
 
     asyncio.run(exercise_async_translate())
+
+
+def test_transcribe_double_check_and_verify_speech_endpoint(tmp_path: Path) -> None:
+    """POST /transcribe forwards double_check & returns altText/verificationSummary; POST /verify-speech scores TTS WAVs cleanly."""
+    import wave
+    import numpy as np
+
+    wav_path = tmp_path / "tts_khmer.wav"
+    samples = (np.ones(16000, dtype=np.float32) * 0.1 * 32767).astype(np.int16)
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(samples.tobytes())
+
+    captured_double_checks: list[bool] = []
+
+    class _VerifyingTranscriber:
+        def transcribe(self, wav_p: Path, language: str | None = None, turns=None, double_check: bool = False) -> dict:
+            captured_double_checks.append(double_check)
+            return {
+                "language": "km",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "សួស្តី កម្ពុជា",
+                        "altText": "សួស្តី ប្រទេស កម្ពុជា" if double_check else "",
+                        "verifyReason": "double_check" if double_check else "",
+                    }
+                ],
+                "verificationSummary": {
+                    "checked": 1 if double_check else 0,
+                    "fallbackApplied": 0,
+                    "suggestions": 1 if double_check else 0,
+                    "model": "seanghay/whisper-small-khmer-v2" if double_check else "",
+                },
+            }
+
+        def verify_audio(self, wav_p: Path, language: str = "km") -> tuple[str, str]:
+            assert wav_p.is_file() and wav_p.stat().st_size > 100
+            return "សួស្តី កម្ពុជា", "seanghay/whisper-small-khmer-v2"
+
+    job_dir = tmp_path / "verify-jobs"
+    services = MediaServices(
+        job_store=MediaJobStore(job_dir),
+        transcriber=_VerifyingTranscriber(),
+        diarizer=_FakeDiarizer(),
+        translator=_FakeTranslator(),
+    )
+    client = TestClient(create_app(services))
+
+    with open(wav_path, "rb") as fh:
+        tr_res = client.post(
+            "/transcribe",
+            files={"file": ("voice.wav", fh, "audio/wav")},
+            data={"language": "km", "diarize": "false", "double_check": "true"},
+        )
+    assert tr_res.status_code == 200
+    tr_body = tr_res.json()
+    assert captured_double_checks == [True]
+    assert tr_body["segments"][0]["altText"] == "សួស្តី ប្រទេស កម្ពុជា"
+    assert tr_body["segments"][0]["verifyReason"] == "double_check"
+    assert tr_body["verificationSummary"]["suggestions"] == 1
+
+    # Round-trip TTS verification: exact Khmer match (spacing-invariant)
+    with open(wav_path, "rb") as fh:
+        ok_res = client.post(
+            "/verify-speech",
+            files={"file": ("tts.wav", fh, "audio/wav")},
+            data={"expected_text": "សួស្តីកម្ពុជា", "language": "km"},
+        )
+    assert ok_res.status_code == 200
+    ok_body = ok_res.json()
+    assert ok_body["verdict"] == "pass"
+    assert ok_body["similarity"] == 1.0
+    assert ok_body["heardText"] == "សួស្តី កម្ពុជា"
+    assert ok_body["model"] == "seanghay/whisper-small-khmer-v2"
+    assert ok_body["missingTerms"] == []
+
+    # Round-trip TTS verification: detects dropped words
+    with open(wav_path, "rb") as fh:
+        mismatch_res = client.post(
+            "/verify-speech",
+            files={"file": ("tts.wav", fh, "audio/wav")},
+            data={"expected_text": "សួស្តី កម្ពុជា ថ្ងៃនេះ មាន ព័ត៌មាន ពិសេស ជាច្រើន", "language": "km"},
+        )
+    assert mismatch_res.status_code == 200
+    mm_body = mismatch_res.json()
+    assert mm_body["verdict"] == "fail"
+    assert mm_body["similarity"] < 0.65
+    assert "ព័ត៌មាន" in mm_body["missingTerms"]
+
+    # Validation guards: empty expected_text & unsupported extension return HTTP 400
+    with open(wav_path, "rb") as fh:
+        empty_txt = client.post(
+            "/verify-speech",
+            files={"file": ("tts.wav", fh, "audio/wav")},
+            data={"expected_text": "   ", "language": "km"},
+        )
+    assert empty_txt.status_code == 400
+
+    bad_ext = client.post(
+        "/verify-speech",
+        files={"file": ("bad.exe", b"123", "application/octet-stream")},
+        data={"expected_text": "សួស្តី", "language": "km"},
+    )
+    assert bad_ext.status_code == 400

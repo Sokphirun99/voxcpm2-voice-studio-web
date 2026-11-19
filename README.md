@@ -12,9 +12,9 @@ Offline Apple Silicon **Text-to-Speech** and **Multilingual Video-to-Subtitle St
 
 ## Highlights
 
-- **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, and `-16 LUFS` FFmpeg mastering.
+- **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, `-16 LUFS` FFmpeg mastering, and on-demand / optional auto Whisper Khmer round-trip word QA (`seanghay/whisper-small-khmer-v2`).
 - **Video to Subtitle (`media/` + `web/`):**
-  - **101 source languages** (`Auto-detect` + all 100 Whisper languages via `mlx-community/whisper-large-v3-turbo`, plus `seanghay/Qwen3-ASR-0.6B-Khmer` for Khmer).
+  - **101 source languages** (`Auto-detect` + all 100 Whisper languages via `mlx-community/whisper-large-v3-turbo`, plus `seanghay/Qwen3-ASR-0.6B-Khmer` for Khmer with automatic selective fallback and optional full double-check via `seanghay/whisper-small-khmer-v2`).
   - **202 offline translation targets** (all Meta NLLB-200 FLORES-200 languages, any-to-any including Khmer → any language and RTL support).
   - Optional offline speaker diarization (`sherpa-onnx` Pyannote + 3D-Speaker), live VTT preview, inline timing/split/merge/find-replace editing, and `libass` burned-in MP4 export.
 - **Inline & Batch Subtitle Frame Text-to-Speech:** Select individual or multiple subtitle frames, pick any Voice Studio character, generate & play WAV voice clips per frame, and download a combined stitched WAV voiceover right below the subtitle list.
@@ -50,7 +50,7 @@ Other setup options:
 ./setup.sh --skip-web-npm   # skip host npm ci if running frontend via Docker only
 ```
 
-> **First run:** Pretrained AI models (VoxCPM2, Whisper Large-v3-Turbo, Qwen3-ASR-0.6B-Khmer, NLLB-200-600M, Sherpa-ONNX diarization) download automatically on first use into `~/.cache/huggingface/` and `~/.cache/voxcpm-media/`.
+> **First run:** Pretrained AI models (VoxCPM2, Whisper Large-v3-Turbo, Qwen3-ASR-0.6B-Khmer, Whisper Small Khmer v2 verifier, NLLB-200-600M, Sherpa-ONNX diarization) download automatically on first use into `~/.cache/huggingface/` and `~/.cache/voxcpm-media/`.
 
 ---
 
@@ -96,6 +96,7 @@ This project orchestrates separate upstream open-source projects and pretrained 
 - [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) — Apache-2.0
 - [mlx-whisper](https://github.com/ml-explore/mlx-examples) / OpenAI Whisper — MIT
 - [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) & `seanghay/Qwen3-ASR-0.6B-Khmer` — Apache-2.0
+- `seanghay/whisper-small-khmer-v2` — Khmer ASR selective fallback & TTS round-trip verifier
 - [Meta NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M) — CC-BY-NC-4.0 (non-commercial model weights)
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — Apache-2.0
 - [FFmpeg](https://ffmpeg.org/) & [Iconoir](https://iconoir.com/) (MIT)

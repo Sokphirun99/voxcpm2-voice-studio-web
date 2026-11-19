@@ -5,6 +5,7 @@
 import React, { memo, useEffect, useRef, useState } from 'react';
 import { Blocks } from 'loading-dev';
 import { formatTime } from '../../domain/audioValidation.js';
+import { formatVerifyReasonLabel } from '../../domain/speechVerification.js';
 import {
   MIN_SPLIT_GAP_SEC,
   formatEditableTimestamp,
@@ -200,6 +201,11 @@ function SegmentHeaderControls({
         >
           {timeLabel}
         </button>
+        {segment.verifyReason === 'whisper_fallback' && !segment.altText?.trim() && (
+          <span className="subtitle-verify-pill" title="Recovered automatically by Whisper Khmer model">
+            Whisper recovery
+          </span>
+        )}
       </div>
       <div className="subtitle-segment-actions">
         <button type="button" className="button subtle-button subtitle-cue-btn" disabled={busy}
@@ -286,8 +292,33 @@ function SegmentVoiceBar({
   );
 }
 
+function SegmentVerificationBanner({ segment, busy, onApply, onDismiss }) {
+  const suggestion = (segment.altText || '').trim();
+  const primary = (segment.text || '').trim();
+  if (!suggestion || suggestion === primary) return null;
+  const label = formatVerifyReasonLabel(segment.verifyReason);
+  return (
+    <div className="subtitle-verify-banner" role="note">
+      <div className="subtitle-verify-body">
+        <span className="subtitle-verify-pill">{label}</span>
+        <span className="subtitle-verify-text" dir="auto" lang="km">{suggestion}</span>
+      </div>
+      <div className="subtitle-verify-actions">
+        <button type="button" className="button subtle-button subtitle-cue-btn" disabled={busy}
+          onClick={onApply}>
+          Use suggestion
+        </button>
+        <button type="button" className="button subtle-button subtitle-cue-btn" disabled={busy}
+          aria-label="Dismiss Whisper suggestion" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /**
- * Renders one editable subtitle cue card with selection checkbox, optional speaker badge, playback sync, timing/split/merge/delete, bilingual reference, and inline TTS voice bar.
+ * Renders one editable subtitle cue card with selection checkbox, optional speaker badge, playback sync, timing/split/merge/delete, bilingual reference, Whisper second-opinion suggestion, and inline TTS voice bar.
  * @param {object} props - Segment row props.
  * @returns {React.ReactElement} Memoized subtitle cue card.
  */
@@ -315,6 +346,8 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   onSplit,
   onMergeNext,
   onDelete,
+  onApplySuggestion,
+  onDismissSuggestion,
   onGenerateVoice,
   onTogglePlayVoice,
   onDownloadVoice,
@@ -381,6 +414,14 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
         disabled={busy}
         onChange={e => onUpdate(segment.id, useTranslation ? { translatedText: e.target.value } : { text: e.target.value })}
       />
+      {!useTranslation && (
+        <SegmentVerificationBanner
+          segment={segment}
+          busy={busy}
+          onApply={() => onApplySuggestion?.(segment.id)}
+          onDismiss={() => onDismissSuggestion?.(segment.id)}
+        />
+      )}
       <SegmentVoiceBar
         hasText={Boolean(activeText.trim())}
         voiceClip={voiceClip}

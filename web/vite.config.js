@@ -13,7 +13,7 @@ const POLL_INTERVAL_MS = 250;
 const BUILD_ID = process.env.APP_BUILD_ID || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const ALLOWED_GRADIO_PATH = /^\/gradio_api\/(info|upload|call\/generate(\/[a-f0-9]+)?|file=\/.+\.wav)$/;
 const ALLOWED_STORAGE_PATH = /^\/api\/v1\/(health|stats|characters(\/[^/]+)?|anchors(\/[^/]+(\/audio)?)?|audio\/master|cache\/[a-f0-9]{64}(\/audio)?)$/;
-const ALLOWED_MEDIA_PATH = /^\/media_api\/(health|transcribe|translate|burn)$/;
+const ALLOWED_MEDIA_PATH = /^\/media_api\/(health|transcribe|translate|burn|verify-speech)$/;
 
 /**
  * Emits `/version.json` in dev middleware and production bundles so clients detect fresh builds safely.

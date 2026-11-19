@@ -38,6 +38,7 @@ const DEFAULT_OPTIONS = Object.freeze({
   targetLanguage: DEFAULT_ENGLISH_TARGET,
   detectSpeakers: false,
   speakerCount: '0',
+  doubleCheckKhmer: false,
   translateToKhmer: false,
   includeSpeaker: false,
   previewMode: 'original',
@@ -319,10 +320,16 @@ function useVttPreviewUrl({ segments, speakerNames, includeSpeaker, useTranslati
  * @param {string} elapsed - Formatted elapsed seconds string.
  * @returns {string} Summary copy with singular/plural segment noun.
  */
-export function buildExtractSummary(segmentCount, speakerCount, elapsed) {
+export function buildExtractSummary(segmentCount, speakerCount, elapsed, verificationSummary = null) {
   const segmentLabel = segmentCount === 1 ? 'segment' : 'segments';
   const spkNote = speakerCount > 1 ? ` (${speakerCount} speakers)` : '';
-  return `Extracted ${segmentCount} subtitle ${segmentLabel}${spkNote} in ${elapsed}s.`;
+  const extras = [];
+  const recovered = Number(verificationSummary?.fallbackApplied) || 0;
+  const suggestions = Number(verificationSummary?.suggestions) || 0;
+  if (recovered > 0) extras.push(`${recovered} recovered by Whisper`);
+  if (suggestions > 0) extras.push(`${suggestions} Whisper ${suggestions === 1 ? 'suggestion' : 'suggestions'}`);
+  const suffix = extras.length ? ` · ${extras.join(' · ')}` : '';
+  return `Extracted ${segmentCount} subtitle ${segmentLabel}${spkNote} in ${elapsed}s${suffix}.`;
 }
 
 function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
@@ -351,7 +358,7 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
       previewMode: hasTranslated ? 'translated' : 'original',
     },
     busyAction: '',
-    status: { message: buildExtractSummary(segments.length, speakerCount, elapsed), error: false },
+    status: { message: buildExtractSummary(segments.length, speakerCount, elapsed, res.verificationSummary), error: false },
   };
 }
 
@@ -386,6 +393,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
           language: state.options.sourceLanguage,
           numSpeakers,
           diarize,
+          doubleCheck: Boolean(state.options.doubleCheckKhmer),
           translateTo: shouldTranslate ? targetLanguage : '',
           translateToKhmer: shouldTranslate && targetLanguage === 'khm_Khmr',
           signal,
@@ -397,7 +405,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         const spkCount = Array.isArray(res.speakers) ? res.speakers.length : collectUniqueSpeakers(segs).length;
         setActiveSegmentId('');
         setState(prev => applyExtractedSubtitleResult(prev, res, shouldTranslate ? targetLanguage : '', elapsed));
-        onNotify?.({ kind: 'success', title: 'Subtitles ready', message: buildExtractSummary(segs.length, spkCount, elapsed) });
+        onNotify?.({ kind: 'success', title: 'Subtitles ready', message: buildExtractSummary(segs.length, spkCount, elapsed, res.verificationSummary) });
       },
     });
   }, [state.videoFile, state.options, state.hasTranslation, state.translatedLanguage, stateRef, gateway, abortRef, setState, setBusyMeta, setActiveSegmentId, refreshHealth, markOnline, onNotify, onUnlockSound]);
@@ -517,6 +525,26 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     setState(prev => ({ ...prev, segments: adjustSubtitleSegmentTiming(prev.segments, segId, timingPatch) }));
   }, [setState]);
 
+  const applySegmentSuggestion = useCallback(segId => {
+    setState(prev => ({
+      ...prev,
+      segments: prev.segments.map(seg => (
+        seg.id === segId && seg.altText?.trim()
+          ? { ...seg, text: seg.altText.trim(), altText: '', verifyReason: '' }
+          : seg
+      )),
+    }));
+  }, [setState]);
+
+  const dismissSegmentSuggestion = useCallback(segId => {
+    setState(prev => ({
+      ...prev,
+      segments: prev.segments.map(seg => (
+        seg.id === segId ? { ...seg, altText: '', verifyReason: '' } : seg
+      )),
+    }));
+  }, [setState]);
+
   const countMatches = useCallback(
     ({ findText, caseSensitive = false }) => countTextMatchesInSegments({ segments, findText, useTranslation, caseSensitive }),
     [segments, useTranslation]
@@ -536,7 +564,7 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     return { matchCount: result.matchCount, segmentCount: result.segmentCount };
   }, [segments, setState, useTranslation]);
 
-  return { updateSegment, deleteSegment, mergeSegmentWithNext, splitSegment, updateSegmentTiming, countMatches, findAndReplace };
+  return { updateSegment, deleteSegment, mergeSegmentWithNext, splitSegment, updateSegmentTiming, applySegmentSuggestion, dismissSegmentSuggestion, countMatches, findAndReplace };
 }
 
 /**

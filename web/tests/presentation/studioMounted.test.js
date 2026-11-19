@@ -806,3 +806,119 @@ test('mounted Studio surfaces invalid TTS reference sample validation errors via
     await vite.close();
   }
 });
+
+test('mounted Studio supports on-demand and optional auto Whisper word check for generated Khmer TTS', async () => {
+  const dom = installTestDom();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const { createSynthesizeSpeechUseCase } = await import('../../src/domain/useCases.js');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+
+    const verifyCalls = [];
+    const speechGateway = {
+      checkAvailability: async () => true,
+      uploadReferenceAudio: async params => ({ path: '/tmp/ref.wav', orig_name: params.fileName, mime_type: 'audio/wav' }),
+      synthesize: async params => ({ blob: new Blob(['RIFFwav'], { type: 'audio/wav' }), seed: params.seed }),
+    };
+    const services = {
+      speechGateway,
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        async verifySpeech(params) {
+          verifyCalls.push(params);
+          return {
+            verdict: 'warn',
+            similarity: 0.78,
+            cer: 0.22,
+            expectedText: params.expectedText,
+            heardText: 'សួស្តី កម្ពុជា',
+            model: 'seanghay/whisper-small-khmer-v2',
+            language: params.language,
+            missingTerms: ['ថ្ងៃនេះ'],
+          };
+        },
+      },
+      audioDecoder: { decodePeaks: async () => [0.3, 0.7] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 42 }),
+      lockReferenceAudio: { execute: async f => ({ blob: f, fileName: f.name }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: { loadAllAnchors: async () => ({}), saveAnchor: async () => {}, deleteAnchor: async () => {} },
+      }),
+    };
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+
+    // By default auto-check is OFF -> generating speech does NOT call verifySpeech automatically
+    const scriptInput = container.querySelector('#script');
+    await act(async () => {
+      setControlledText(scriptInput, 'សួស្តី កម្ពុជា ថ្ងៃនេះ', 21);
+    });
+    await act(async () => {
+      container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(verifyCalls.length, 0);
+
+    // Clicking on-demand "Check words" triggers Whisper verification and displays score + missing words
+    const verifyBtn = container.querySelector('#verify-speech-btn');
+    assert.ok(verifyBtn && !verifyBtn.disabled);
+    await act(async () => {
+      verifyBtn.dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(verifyCalls.length, 1);
+    assert.equal(verifyCalls[0].language, 'km');
+    const card = container.querySelector('.speech-verify-card');
+    assert.ok(card);
+    assert.match(card.textContent, /Check pronunciation · 78%/);
+    assert.match(card.textContent, /Whisper heard: សួស្តី កម្ពុជា/);
+    assert.match(card.textContent, /Missing \/ unclear: ថ្ងៃនេះ/);
+
+    // Dismissing hides the verification banner cleanly
+    await act(async () => {
+      card.querySelector('.speech-verify-dismiss').dispatchEvent({ type: 'click', bubbles: true });
+    });
+    assert.equal(container.querySelector('.speech-verify-card'), null);
+
+    // Enabling optional Auto-check runs Whisper automatically on the next generated take
+    const autoCheck = container.querySelector('#verify-audio');
+    assert.ok(autoCheck);
+    await act(async () => {
+      autoCheck.checked = true;
+      autoCheck.dispatchEvent({ type: 'click', bubbles: true, target: autoCheck });
+    });
+    await act(async () => {
+      setControlledText(scriptInput, 'សួស្តី កម្ពុជា ស្អែក', 19);
+    });
+    await act(async () => {
+      container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 30));
+    });
+    assert.equal(verifyCalls.length, 2);
+    assert.ok(container.querySelector('.speech-verify-card'));
+  } finally {
+    if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});

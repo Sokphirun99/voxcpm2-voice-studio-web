@@ -163,6 +163,11 @@ class KhmerDictionaryCorrector:
             "customGlossaryWords": len(self._custom_words),
         }
 
+    def is_known_khmer_token(self, token: str) -> bool:
+        """Return True when `token` matches a dictionary word or valid compound of known Khmer words."""
+        self._ensure_loaded()
+        return _is_valid_or_compound(token, self._valid_words)
+
     def _correct_token(self, token: str) -> str:
         """Correct a single out-of-vocabulary Khmer token when a high-confidence phonetic match exists."""
         if len(token) < 4 or not KHMER_WORD_RE.match(token):
@@ -208,3 +213,8 @@ def correct_khmer_transcript(text: str) -> str:
 def get_lexicon_stats() -> dict[str, int]:
     """Return statistics of the active 3-layer local Khmer lexicon."""
     return _DEFAULT_CORRECTOR.stats()
+
+
+def is_known_khmer_word(token: str) -> bool:
+    """Check whether a Khmer token belongs to the active 3-layer local Khmer lexicon."""
+    return _DEFAULT_CORRECTOR.is_known_khmer_token(token)

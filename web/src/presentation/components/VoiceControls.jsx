@@ -296,6 +296,11 @@ function AdvancedToggles({ options, onChange }) {
           onChange={event => onChange('denoiseReference', event.currentTarget.checked)} />
         <span>Clean background noise on voice sample</span>
       </label>
+      <label className="locked-checkbox advanced-checkbox">
+        <input type="checkbox" id="verify-audio" checked={Boolean(options.verifyAudio)}
+          onChange={event => onChange('verifyAudio', event.currentTarget.checked)} />
+        <span>Auto-check Khmer words after speech (Whisper)</span>
+      </label>
     </>
   );
 }

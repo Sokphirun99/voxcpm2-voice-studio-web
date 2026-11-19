@@ -12,6 +12,9 @@ test('mediaSubtitleGateway checks health, transcribes video, translates, and bur
       if (url === '/media_api/transcribe') return new Response(JSON.stringify({ jobId: 'abcd1234ef567890', language: 'en', segments: [] }), { status: 200 });
       if (url === '/media_api/translate') return new Response(JSON.stringify({ segments: [{ text: 'Hi', translatedText: 'សួស្តី' }] }), { status: 200 });
       if (url === '/media_api/burn') return new Response(new Blob(['MP4']), { status: 200, headers: { 'content-type': 'video/mp4' } });
+      if (url === '/media_api/verify-speech') {
+        return new Response(JSON.stringify({ verdict: 'pass', similarity: 0.96, heardText: 'សួស្តី', missingTerms: [] }), { status: 200 });
+      }
       throw new Error(`Unexpected URL ${url}`);
     },
   });
@@ -22,16 +25,24 @@ test('mediaSubtitleGateway checks health, transcribes video, translates, and bur
   const tr = await gateway.transcribeVideo({ file: new Blob(['vid'], { type: 'video/mp4' }), language: 'en', numSpeakers: 2, translateToKhmer: true });
   assert.equal(tr.jobId, 'abcd1234ef567890');
   assert.equal(calls[1].init.body.get('translate_to'), 'km');
+  assert.equal(calls[1].init.body.get('double_check'), 'false');
 
-  await gateway.transcribeVideo({ file: new Blob(['vid'], { type: 'video/mp4' }), language: 'km', numSpeakers: 1, translateTo: 'jpn_Jpan' });
+  await gateway.transcribeVideo({ file: new Blob(['vid'], { type: 'video/mp4' }), language: 'km', numSpeakers: 1, translateTo: 'jpn_Jpan', doubleCheck: true });
   assert.equal(calls[2].init.body.get('language'), 'km');
   assert.equal(calls[2].init.body.get('translate_to'), 'jpn_Jpan');
+  assert.equal(calls[2].init.body.get('double_check'), 'true');
 
   const translated = await gateway.translateSegments({ segments: [{ text: 'Hi' }], sourceLanguage: 'en', targetLanguage: 'km' });
   assert.equal(translated.segments[0].translatedText, 'សួស្តី');
 
   const mp4 = await gateway.burnSubtitles({ jobId: tr.jobId, segments: [], speakerNames: {} });
   assert.equal(await mp4.text(), 'MP4');
+
+  const qa = await gateway.verifySpeech({ blob: new Blob(['RIFF'], { type: 'audio/wav' }), expectedText: 'សួស្តី', language: 'km' });
+  assert.equal(qa.verdict, 'pass');
+  assert.equal(qa.similarity, 0.96);
+  assert.equal(calls.at(-1).init.body.get('expected_text'), 'សួស្តី');
+  assert.equal(calls.at(-1).init.body.get('language'), 'km');
 });
 
 test('mediaSubtitleGateway surfaces HTTP error details and cancellation cleanly', async () => {

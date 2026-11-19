@@ -12,6 +12,7 @@ from asr import (
     SAMPLE_RATE,
     VAD_MIN_SILENCE_SEC,
     KhmerWhisperTranscriber,
+    LocalTranscriber,
     _append_vad_turn,
     _find_quietest_split_sec,
     _merge_vad_regions,
@@ -118,3 +119,108 @@ def test_merge_vad_regions_and_append_vad_turn_edge_cases() -> None:
     assert len(merged) == 2
     assert merged[0].start == 0.0
     assert merged[1].end == 3.6
+
+
+def _write_test_wav(path: Path, seconds: float = 3.0) -> None:
+    """Write a non-silent mono 16 kHz PCM WAV file for ASR unit tests."""
+    import wave
+
+    samples = (np.ones(int(SAMPLE_RATE * seconds), dtype=np.float32) * 0.15 * 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(samples.tobytes())
+
+
+def test_selective_khmer_verifier_skips_clean_turns_and_recovers_failures(tmp_path: Path) -> None:
+    """Clean Khmer turns never trigger Whisper verifier by default; empty/looping turns auto-recover."""
+    wav_path = tmp_path / "sample.wav"
+    _write_test_wav(wav_path, seconds=4.0)
+    turns = [
+        SpeakerTurn(start=0.0, end=1.8, speaker="0"),
+        SpeakerTurn(start=2.0, end=3.8, speaker="0"),
+    ]
+
+    # 1. Clean turns + double_check=False -> verifier is never invoked
+    verifier_calls: list[int] = []
+
+    class _SpyVerifier:
+        model_repo = "seanghay/whisper-small-khmer-v2"
+
+        def transcribe_slices(self, slices: list[np.ndarray]) -> list[str]:
+            verifier_calls.append(len(slices))
+            return ["សួស្តី ប្រទេស កម្ពុជា" for _ in slices]
+
+    clean_primary = KhmerWhisperTranscriber(verifier=_SpyVerifier())
+    clean_primary._qwen_asr = SimpleNamespace(
+        transcribe=lambda chunks: [SimpleNamespace(text="សួស្តី កម្ពុជា") for _ in chunks]
+    )
+    clean_res = clean_primary.transcribe(wav_path, turns=turns, double_check=False)
+    assert verifier_calls == []
+    assert clean_res["verificationSummary"]["checked"] == 0
+    assert [s["text"] for s in clean_res["segments"]] == ["សួស្តី កម្ពុជា", "សួស្តី កម្ពុជា"]
+
+    # 2. Optional double_check=True checks all turns and surfaces differing suggestions without overwriting
+    double_res = clean_primary.transcribe(wav_path, turns=turns, double_check=True)
+    assert verifier_calls == [2]
+    assert double_res["verificationSummary"]["checked"] == 2
+    assert double_res["verificationSummary"]["suggestions"] == 2
+    assert double_res["segments"][0]["text"] == "សួស្តី កម្ពុជា"
+    assert double_res["segments"][0]["altText"] == "សួស្តី ប្រទេស កម្ពុជា"
+    assert double_res["segments"][0]["verifyReason"] == "double_check"
+
+    # 3. Essential automatic fallback recovers empty & looping turns only (1 clean + 1 empty -> only 1 checked)
+    verifier_calls.clear()
+    mixed_primary = KhmerWhisperTranscriber(verifier=_SpyVerifier())
+    mixed_primary._qwen_asr = SimpleNamespace(
+        transcribe=lambda chunks: [SimpleNamespace(text="សួស្តី កម្ពុជា"), SimpleNamespace(text="")]
+    )
+    mixed_res = mixed_primary.transcribe(wav_path, turns=turns, double_check=False)
+    assert verifier_calls == [1]
+    assert mixed_res["verificationSummary"]["checked"] == 1
+    assert mixed_res["verificationSummary"]["fallbackApplied"] == 1
+    assert mixed_res["segments"][0]["text"] == "សួស្តី កម្ពុជា"
+    assert mixed_res["segments"][1]["text"] == "សួស្តី ប្រទេស កម្ពុជា"
+    assert mixed_res["segments"][1]["verifyReason"] == "whisper_fallback"
+
+
+def test_verifier_failure_degrades_gracefully_and_verify_audio_prefers_whisper_verifier(tmp_path: Path) -> None:
+    """Secondary verifier errors never fail transcription, and verify_audio uses whisper-small-khmer-v2 with fallback."""
+    wav_path = tmp_path / "tts.wav"
+    _write_test_wav(wav_path, seconds=2.0)
+
+    class _FailingVerifier:
+        model_repo = "seanghay/whisper-small-khmer-v2"
+
+        def transcribe_slices(self, slices: list[np.ndarray]) -> list[str]:
+            raise RuntimeError("offline cache missing")
+
+        def transcribe(self, path: Path, turns=None, double_check: bool = False) -> dict:
+            raise RuntimeError("offline cache missing")
+
+    primary = KhmerWhisperTranscriber(verifier=_FailingVerifier())
+    primary._qwen_asr = SimpleNamespace(transcribe=lambda chunks: [SimpleNamespace(text="សួស្តី") for _ in chunks])
+    res = primary.transcribe(wav_path, turns=[SpeakerTurn(start=0.0, end=1.8, speaker="0")], double_check=True)
+    assert len(res["segments"]) == 1
+    assert res["segments"][0]["text"] == "សួស្តី"
+    assert res["verificationSummary"]["checked"] == 0
+
+    local = LocalTranscriber()
+    local._khmer_verifier.transcribe = lambda path, turns=None, double_check=False: {
+        "language": "km",
+        "segments": [{"start": 0.0, "end": 1.8, "text": "សួស្តី កម្ពុជា"}],
+    }
+    heard, model = local.verify_audio(wav_path, language="km")
+    assert heard == "សួស្តី កម្ពុជា"
+    assert model == "seanghay/whisper-small-khmer-v2"
+
+    # When whisper verifier raises, verify_audio falls back cleanly to primary Qwen3-ASR
+    local._khmer_verifier = _FailingVerifier()
+    local._khmer.transcribe = lambda path, turns=None, double_check=False: {
+        "language": "km",
+        "segments": [{"start": 0.0, "end": 1.8, "text": "សួស្តី ពី ម៉ូដែល មេ"}],
+    }
+    fb_heard, fb_model = local.verify_audio(wav_path, language="km")
+    assert fb_heard == "សួស្តី ពី ម៉ូដែល មេ"
+    assert "Qwen3-ASR" in fb_model

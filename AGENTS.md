@@ -97,8 +97,9 @@ Current verified baseline: `qwen-asr==0.0.6` (installed with `--no-deps`), `mlx-
 ### 2. Inspect upstream compatibility areas
 1. **HTTP API contract with `web/` (`media/server.py`, `web/src/data/mediaSubtitleGateway.js`, `web/vite.config.js`, `web/nginx.conf`)**
    - Keep port `8810` and endpoints intact:
-     - `GET /health` (`ok`, `burnInSupported`, `pid`, `startedAt`, model IDs)
-     - `POST /transcribe` (`file`, `language`, `num_speakers`, `diarize`, `translate_to` -> `{ jobId, language, speakers, segments, isAudioOnly, videoSize, assColorMap }`)
+     - `GET /health` (`ok`, `burnInSupported`, `pid`, `startedAt`, model IDs including `khmerVerifierModel`)
+     - `POST /transcribe` (`file`, `language`, `num_speakers`, `diarize`, `translate_to`, `double_check` -> `{ jobId, language, speakers, segments, isAudioOnly, videoSize, assColorMap, verificationSummary }`)
+     - `POST /verify-speech` (`file`, `expected_text`, `language` -> `{ verdict, similarity, cer, expectedText, heardText, model, language, missingTerms }`)
      - `POST /translate` (`{ segments, sourceLanguage, targetLanguage }`)
      - `POST /burn` (`{ jobId, segments, speakerNames, videoSize, includeSpeaker, useTranslation, bilingual, subtitleStyle }`)
 2. **Python packages (`media/pyproject.toml`, `media/uv.lock`)**
@@ -107,7 +108,7 @@ Current verified baseline: `qwen-asr==0.0.6` (installed with `--no-deps`), `mlx-
    - When upgrading `sherpa-onnx`, confirm `OfflineSpeakerDiarization` and `OfflineSpeechDenoiser` API signatures and the 3 release URLs in `media/diarizer.py` still match.
    - When upgrading `transformers` / `torch`, verify `LocalTranslator._translate_batch` decoding kwargs (`num_beams=2`, `early_stopping=True`, `repetition_penalty=1.15`, `no_repeat_ngram_size=5`, `forced_bos_token_id`) and MPS compatibility.
 3. **Cached open-source models & `ffmpeg-full`**
-   - Active HuggingFace repos (`~/.cache/huggingface/hub/`): `mlx-community/whisper-large-v3-turbo`, `seanghay/Qwen3-ASR-0.6B-Khmer`, `facebook/nllb-200-distilled-600M` (keep `media/cleanup_cache.py` `ACTIVE_PROJECT_REPOS` in sync if a default model ID changes).
+   - Active HuggingFace repos (`~/.cache/huggingface/hub/`): `mlx-community/whisper-large-v3-turbo`, `seanghay/Qwen3-ASR-0.6B-Khmer`, `seanghay/whisper-small-khmer-v2`, `facebook/nllb-200-distilled-600M` (keep `media/cleanup_cache.py` `ACTIVE_PROJECT_REPOS` in sync if a default model ID changes).
    - Active diarization ONNX cache (`~/.cache/voxcpm-media/diarization/`): Pyannote segmentation 3.0, 3D-Speaker CAM++, GTCRN denoiser (`media/diarizer.py`).
    - After upgrading Homebrew `ffmpeg-full`, verify `libass` filter availability via `media/tests/test_video_io.py`.
 

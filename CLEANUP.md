@@ -9,7 +9,7 @@
 ### ក. ឯកសារបណ្ដោះអាសន្ន និងម៉ូដែលសាកល្បងដែលលែងប្រើ (~9.7 GB)
 | ទីតាំង / ធនធាន | ទំហំបច្ចុប្បន្ន | តួនាទី | លុបបានឬទេ? |
 | :--- | :---: | :--- | :--- |
-| `~/.cache/huggingface/hub/` (10 benchmark repos)* | `~9.39 GB` (`8,955 MiB`) | ម៉ូដែល ASR សាកល្បង (`omniASR-CTC-1B`, `metythorn/whisper-large-v3-turbo`, `Vagabond404/khmer-asr-sota`, `whisper-small-khmer-v2`, `khmer-dictionary-44k`, stubs) | **លុបបានភ្លាម** — App នៅដើរធម្មតា |
+| `~/.cache/huggingface/hub/` (9 benchmark repos)* | `~8.4 GB` | ម៉ូដែល ASR សាកល្បង (`omniASR-CTC-1B`, `metythorn/whisper-large-v3-turbo`, `Vagabond404/khmer-asr-sota`, `khmer-dictionary-44k`, stubs) | **លុបបានភ្លាម** — App នៅដើរធម្មតា |
 | `/tmp/voxcpm-media-jobs` | `273 MB` | វីដេអូ Upload និង Export MP4 ចាស់ៗ | **លុបបានភ្លាម** |
 | `/tmp/test_*`, `/tmp/tiktok_*`, `/tmp/burned_*`, `/tmp/kmwiktionary*.bz2` | `~18 MB` | ឯកសារតេស្តសំឡេង/រូបភាព និង Wiktionary raw dump | **លុបបានភ្លាម** |
 | `logs/*.log` | `~408 KB` | Log របស់ Engine & Media Services | កាត់ឱ្យទទេបាន |
@@ -20,7 +20,7 @@
 ### ខ. ប្រព័ន្ធស្នូលដែលកំពុងដំណើរការ Voice Studio (~14.2 GB)
 | ប្រភេទ | ទីតាំង / ឈ្មោះ | ទំហំ | កំណត់ចំណាំ |
 | :--- | :--- | :---: | :--- |
-| **Active HuggingFace Models** | `openbmb/VoxCPM2` (`5.0 GB`), `facebook/nllb-200-distilled-600M` (`2.5 GB`), `mlx-community/whisper-large-v3-turbo` (`1.6 GB`), `seanghay/Qwen3-ASR-0.6B-Khmer` (`1.6 GB`) | `~10.7 GB` | លុបតាម `media/cleanup_cache.py` ដោយប្រើ HuggingFace revision/blob tracking |
+| **Active HuggingFace Models** | `openbmb/VoxCPM2` (`5.0 GB`), `facebook/nllb-200-distilled-600M` (`2.5 GB`), `mlx-community/whisper-large-v3-turbo` (`1.6 GB`), `seanghay/Qwen3-ASR-0.6B-Khmer` (`1.6 GB`), `seanghay/whisper-small-khmer-v2` (`~0.9 GB`) | `~11.6 GB` | លុបតាម `media/cleanup_cache.py` ដោយប្រើ HuggingFace revision/blob tracking |
 | **ModelScope Denoiser** | `~/.cache/modelscope/hub/models/iic/speech_zipenhancer_ans_multiloss_16k_base` | `18 MB` | សម្អាតសំឡេង Reference audio ក្នុង `engine/` |
 | **Diarization & GTCRN** | `~/.cache/voxcpm-media/diarization` | `35 MB` | Pyannote + 3D-Speaker + GTCRN ONNX |
 | **Python Environments** | `engine/.venv` (`1.4 GB`), `media/.venv` (`1.3 GB`) | `2.7 GB` | បង្កើតឡើងវិញបានតាម `uv sync --frozen --python 3.12` |

@@ -1921,3 +1921,127 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
     dom.restore();
   }
 });
+
+test('mounted VideoSubtitleWorkspace supports optional Khmer Whisper double-check toggle and one-click suggestion apply/dismiss', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root = null;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    const transcribeCalls = [];
+    const services = {
+      logger: { debug() {}, warn() {}, error() {} },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        async transcribeVideo(params) {
+          transcribeCalls.push(params);
+          return {
+            jobId: 'facefeed12345678',
+            language: 'km',
+            isAudioOnly: true,
+            speakers: ['speaker-1'],
+            videoSize: null,
+            segments: [
+              {
+                id: 'seg-1',
+                start: 0,
+                end: 2.0,
+                speakerId: 'speaker-1',
+                text: 'សួស្តី កំពុង សាក',
+                translatedText: '',
+                altText: 'សួស្តី កំពុង សាកល្បង',
+                verifyReason: 'double_check',
+              },
+              {
+                id: 'seg-2',
+                start: 2.2,
+                end: 4.0,
+                speakerId: 'speaker-1',
+                text: 'សង្គ្រោះ ដោយ Whisper',
+                translatedText: '',
+                altText: '',
+                verifyReason: 'whisper_fallback',
+              },
+              {
+                id: 'seg-3',
+                start: 4.2,
+                end: 6.0,
+                speakerId: 'speaker-1',
+                text: 'រក្សា អក្សរ ដើម',
+                translatedText: '',
+                altText: 'ជម្រើស ផ្សេង ទៀត',
+                verifyReason: 'high_oov',
+              },
+            ],
+            verificationSummary: { checked: 3, fallbackApplied: 1, suggestions: 2, model: 'seanghay/whisper-small-khmer-v2' },
+          };
+        },
+        translateSegments: async () => ({ segments: [] }),
+        burnSubtitles: async () => new Blob(),
+      },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { hidden: false })));
+    });
+
+    const toggle = dom.container.querySelector('#subtitle-double-check-khmer');
+    assert.ok(toggle);
+    assert.equal(toggle.checked, false);
+
+    // Enable optional Double-check Khmer (Whisper)
+    await act(async () => {
+      toggle.checked = true;
+      toggle.dispatchEvent({ type: 'click', bubbles: true, target: toggle });
+    });
+
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['wav'], 'khmer.wav', { type: 'audio/wav' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    assert.equal(transcribeCalls.length, 1);
+    assert.equal(transcribeCalls[0].doubleCheck, true);
+    assert.match(dom.container.querySelector('.subtitle-dock').querySelector('.status').textContent, /1 recovered by Whisper · 2 Whisper suggestions/);
+
+    const rows = dom.container.querySelectorAll('.subtitle-segment-row');
+    assert.equal(rows.length, 3);
+    assert.match(rows[1].textContent, /Whisper recovery/);
+
+    // Row 1 renders Whisper suggestion banner and clicking "Use suggestion" replaces text cleanly
+    const banner1 = rows[0].querySelector('.subtitle-verify-banner');
+    assert.ok(banner1);
+    assert.match(banner1.textContent, /សួស្តី កំពុង សាកល្បង/);
+    const useBtn = banner1.querySelectorAll('button').find(b => b.textContent.includes('Use suggestion'));
+    await act(async () => { useBtn.click(); });
+    assert.equal(rows[0].querySelector('.subtitle-line-input').value, 'សួស្តី កំពុង សាកល្បង');
+    assert.equal(rows[0].querySelector('.subtitle-verify-banner'), null);
+
+    // Row 3 renders Whisper check banner and clicking "Dismiss" preserves original text cleanly
+    const banner3 = rows[2].querySelector('.subtitle-verify-banner');
+    assert.ok(banner3);
+    const dismissBtn = banner3.querySelectorAll('button').find(b => b.textContent.includes('Dismiss'));
+    await act(async () => { dismissBtn.click(); });
+    assert.equal(rows[2].querySelector('.subtitle-line-input').value, 'រក្សា អក្សរ ដើម');
+    assert.equal(rows[2].querySelector('.subtitle-verify-banner'), null);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});

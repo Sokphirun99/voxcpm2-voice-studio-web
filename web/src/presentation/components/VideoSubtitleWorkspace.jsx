@@ -247,6 +247,7 @@ function SubtitleSettingsForm({ ctrl }) {
   const isRetranslatingSameTarget = hasTranslation && isSameSubtitleLanguage(translatedLanguage, options.targetLanguage);
   const showSpeakerLabelToggle = options.detectSpeakers || ctrl.speakers.length > 1;
   const showTargetSelector = Boolean(options.translateToKhmer) || segments.length > 0;
+  const showKhmerDoubleCheck = options.sourceLanguage === 'km' || options.sourceLanguage === 'auto';
   return (
     <div className="subtitle-settings-stack">
       <div className="subtitle-option-grid" data-columns={options.detectSpeakers ? '2' : '1'}>
@@ -278,6 +279,14 @@ function SubtitleSettingsForm({ ctrl }) {
           checked={options.detectSpeakers}
           disabled={busy}
           onChange={checked => ctrl.updateOption('detectSpeakers', checked)}
+        />
+        <SubtitleToggleRow
+          id="subtitle-double-check-khmer"
+          label="Double-check Khmer (Whisper)"
+          checked={Boolean(options.doubleCheckKhmer)}
+          disabled={busy}
+          hidden={!showKhmerDoubleCheck}
+          onChange={checked => ctrl.updateOption('doubleCheckKhmer', checked)}
         />
         <SubtitleToggleRow
           id="subtitle-auto-translate"
@@ -453,6 +462,8 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
           onSplit={ctrl.splitSegment}
           onMergeNext={ctrl.mergeSegmentWithNext}
           onDelete={onDeleteSegment}
+          onApplySuggestion={ctrl.applySegmentSuggestion}
+          onDismissSuggestion={ctrl.dismissSegmentSuggestion}
           onGenerateVoice={segment => void voice.generateSegmentVoice(segment)}
           onTogglePlayVoice={voice.togglePlaySegment}
           onDownloadVoice={segment => voice.downloadSegmentVoice(segment, index)}
