@@ -55,7 +55,7 @@ parse_args() {
 }
 
 require_clean_engine() {
-  [[ -d "${ENGINE_DIR}/.git" ]] || die "Missing upstream engine clone at ${ENGINE_DIR}. Run: git clone https://github.com/OpenBMB/VoxCPM.git engine"
+  [[ -d "${ENGINE_DIR}/.git" ]] || die "Missing upstream engine clone at ${ENGINE_DIR}. Run: ./setup.sh"
   local dirty
   dirty="$(git -C "${ENGINE_DIR}" status --short)"
   [[ -z "${dirty}" ]] || die "engine/ has local modifications. Keep engine/ untouched before updating:\n${dirty}"

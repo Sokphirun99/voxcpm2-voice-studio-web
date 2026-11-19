@@ -1,73 +1,93 @@
-# Project Text-to-Voice
+# Voice Studio · VoxCPM2
 
-Workspace separating the upstream open-source VoxCPM2 engine from the custom Voice Studio web frontend.
+Offline Apple Silicon **Text-to-Speech** and **Multilingual Video-to-Subtitle Studio** that keeps the upstream open-source [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) engine strictly separated from our custom frontend and media subtitle pipeline.
 
-## Folders
+## Highlights
 
-- **`engine/`** — Unmodified upstream open-source clone of [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) (`origin` points upstream; ignored by root `.gitignore`) with its own Python virtual environment (`engine/.venv/`). Update safely with `./update-engine.sh`.
-- **`media/`** — Custom local Apple Silicon speech-to-subtitle, diarization, Khmer 3-layer dictionary, translation, and burn-in service (port `8810`; tracked in this monorepo). See [media/README.md](./media/README.md).
-- **`web/`** — Custom React + Vite **Voice Studio** frontend, persistent Docker storage (`8090`), and unit tests (tracked in this monorepo). See [web/README.md](./web/README.md).
+- **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, and `-16 LUFS` FFmpeg mastering.
+- **Video to Subtitle (`media/` + `web/`):**
+  - **101 source languages** (`Auto-detect` + all 100 Whisper languages via `mlx-community/whisper-large-v3-turbo`, plus `seanghay/Qwen3-ASR-0.6B-Khmer` for Khmer).
+  - **202 offline translation targets** (all Meta NLLB-200 FLORES-200 languages, any-to-any including Khmer → any language and RTL support).
+  - Optional offline speaker diarization (`sherpa-onnx` Pyannote + 3D-Speaker), live VTT preview, inline timing/split/merge/find-replace editing, and `libass` burned-in MP4 export.
+- **Inline & Batch Subtitle Frame Text-to-Speech:** Select individual or multiple subtitle frames, pick any Voice Studio character, generate & play WAV voice clips per frame, and download a combined stitched WAV voiceover right below the subtitle list.
 
-## Fresh Machine Setup
+## Repository Layout
+
+- **`web/`** — React + Vite **Voice Studio** UI, persistent Docker storage API (`8090`), nginx proxy (`8087`), and Node test suite (tracked in this repo). See [web/README.md](./web/README.md).
+- **`media/`** — Offline Apple Silicon FastAPI service (`8810`) for ASR, speaker diarization, 3-layer Khmer dictionary correction, 202-language NLLB translation, and `libass` MP4 burn-in (tracked in this repo). See [media/README.md](./media/README.md).
+- **`engine/`** — Unmodified upstream clone of [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) (git-ignored, installed automatically by `./setup.sh` and updated safely via `./update-engine.sh`).
+
+---
+
+## Fresh Machine Setup (macOS Apple Silicon)
+
+**Prerequisites:** `git`, [`uv`](https://docs.astral.sh/uv/), `node` (v20+), [Homebrew](https://brew.sh/), and [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 
 ```sh
-git clone https://github.com/Sokphirun99/voxcpm2-voice-studio-web.git project-text-to-voice
-cd project-text-to-voice
-git clone https://github.com/OpenBMB/VoxCPM.git engine
-
-# 1. Engine environment
-(cd engine && uv sync --frozen --python 3.12)
-
-# 2. Media subtitle environment (requires Homebrew ffmpeg-full for libass burn-in)
-brew install ffmpeg-full
-(cd media && uv sync --frozen --python 3.12 && uv pip install --python .venv/bin/python --no-deps qwen-asr==0.0.6)
-
-# 3. Start full stack
-./studio.sh start
+git clone https://github.com/Sokphirun99/voxcpm2-voice-studio-web.git
+cd voxcpm2-voice-studio-web && ./setup.sh
 ```
 
-## Updating Upstream Open-Source `engine/`
+What `./setup.sh` does automatically (safe to re-run anytime):
+1. Clones `https://github.com/OpenBMB/VoxCPM.git` into `engine/` pinned to the verified compatible commit (`300e426`) on branch `main` tracking `origin/main` (pass `--latest` to track upstream HEAD immediately).
+2. Installs `ffmpeg-full` (with `libass` subtitle burn-in support) via Homebrew if missing.
+3. Syncs `engine/.venv` and `media/.venv` (Python 3.12 + `qwen-asr==0.0.6 --no-deps`) and installs `web/node_modules`.
+4. Starts the persistent background services (`8808` & `8810`) and Voice Studio container (`http://127.0.0.1:8087`).
+
+Other setup options:
+```sh
+./setup.sh --check          # check prerequisites & installed environments without modifying anything
+./setup.sh --no-start       # install everything without launching services yet
+./setup.sh --latest         # clone OpenBMB/VoxCPM at latest origin/main
+./setup.sh --skip-web-npm   # skip host npm ci if running frontend via Docker only
+```
+
+> **First run:** Pretrained AI models (VoxCPM2, Whisper Large-v3-Turbo, Qwen3-ASR-0.6B-Khmer, NLLB-200-600M, Sherpa-ONNX diarization) download automatically on first use into `~/.cache/huggingface/` and `~/.cache/voxcpm-media/`.
+
+---
+
+## Daily Commands
 
 ```sh
-./update-engine.sh --check          # inspect incoming upstream commits and contract diffs
+./studio.sh start     # start engine (8808), media service (8810), and Voice Studio (8087)
+./studio.sh status    # verify launchd daemons, Docker containers, and proxy HTTP health
+./studio.sh restart   # restart native services and rebuild/recreate Docker containers
+./studio.sh logs      # tail engine & media logs (logs/*.log)
+./studio.sh stop      # stop native services and Docker containers
+```
+
+### Updating Upstream Open-Source `engine/`
+
+Never edit files inside `engine/`. Use `./update-engine.sh` (see [AGENTS.md](./AGENTS.md) for the contract checklist):
+
+```sh
+./update-engine.sh --check          # preview incoming OpenBMB/VoxCPM commits & contract diffs
 ./update-engine.sh                  # fast-forward pull, rebuild engine/.venv, run tests, restart stack
 ./update-engine.sh --rollback <SHA> # roll back safely if an upstream change breaks compatibility
 ```
 
-## Quick start (macOS)
+### Running Tests & Disk Cleanup
 
-Run the persistent background engines (`launchd`, Apple GPU MPS on ports `8808` & `8810` with automatic restart) plus the Voice Studio Docker stack (`8087`) with one command:
+```sh
+npm --prefix web test && npm --prefix web run build
+media/.venv/bin/pytest -v media/tests
+./cleanup.sh --unused --dry-run     # preview unused model/cache cleanup (see CLEANUP.md)
+```
 
-~~~sh
-./studio.sh start
-~~~
+### Migrating Saved Custom Voices to Another Computer
 
-Other commands:
+Code and scripts come straight from Git, and AI models re-download automatically on first run. If you saved custom characters or locked voice anchors in Docker, copy the `voxcpm-voice-studio_storage-data` Docker volume (or keep your original reference `.wav` clips) when moving to a new Mac.
 
-~~~sh
-./studio.sh status    # check engine/media launchd services, Docker container, and proxy health
-./studio.sh logs      # tail engine & media logs (logs/*.log)
-./studio.sh restart   # restart engines and rebuild/restart Docker container
-./studio.sh stop      # stop background launchd services and Docker container
-./cleanup.sh --unused --dry-run   # preview unused benchmark models & temp cache cleanup (~9.7 GB)
-~~~
+---
 
-See [CLEANUP.md](./CLEANUP.md) for the full disk footprint inventory, safe cleanup modes (`--unused`, `--app`, `--all`), and manual uninstall steps.
+## License & Open-Source Attributions
 
-Manual setup (without `launchd`):
+Our custom code in this repository (`web/`, `media/`, and root workspace scripts) is released under the [MIT License](./LICENSE).
 
-1. Start the VoxCPM2 Gradio inference server from `engine/`:
-
-~~~sh
-cd engine
-uv sync --frozen --python 3.12
-PYTORCH_ENABLE_MPS_FALLBACK=1 .venv/bin/python app.py --host 127.0.0.1 --device auto
-~~~
-
-2. Start the live-reload Voice Studio container from the workspace root:
-
-~~~sh
-docker compose -f web/compose.yaml up --build -d
-~~~
-
-3. Open [Voice Studio](http://127.0.0.1:8087). See [web/README.md](./web/README.md) for development, testing, and production nginx options, and [AGENTS.md](./AGENTS.md) for the upstream `engine/` update review checklist.
+This project orchestrates separate upstream open-source projects and pretrained models, each governed by its own license:
+- [OpenBMB/VoxCPM](https://github.com/OpenBMB/VoxCPM) — Apache-2.0
+- [mlx-whisper](https://github.com/ml-explore/mlx-examples) / OpenAI Whisper — MIT
+- [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) & `seanghay/Qwen3-ASR-0.6B-Khmer` — Apache-2.0
+- [Meta NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M) — CC-BY-NC-4.0 (non-commercial model weights)
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — Apache-2.0
+- [FFmpeg](https://ffmpeg.org/) & [Iconoir](https://iconoir.com/) (MIT)
