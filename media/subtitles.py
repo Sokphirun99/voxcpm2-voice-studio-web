@@ -53,6 +53,8 @@ class SubtitleSegment:
     text: str
     speaker_id: str = "speaker-1"
     translated_text: str = ""
+    alt_text: str = ""
+    verify_reason: str = ""
 
 
 def format_timestamp(seconds: float, decimal_sep: str = ",") -> str:
@@ -135,11 +137,23 @@ def align_segments_with_speakers(
     ordered_ids: dict[str, str] = {}
     aligned: list[SubtitleSegment] = []
     for raw_seg in transcript_segments:
-        for start, end, text, raw_spk in _split_words_by_speaker(raw_seg, speaker_turns):
+        pieces = _split_words_by_speaker(raw_seg, speaker_turns)
+        raw_alt = str(raw_seg.get("altText") or "").strip() if len(pieces) == 1 else ""
+        raw_reason = str(raw_seg.get("verifyReason") or "").strip() if len(pieces) == 1 else ""
+        for start, end, text, raw_spk in pieces:
             key = str(raw_spk) if raw_spk is not None else "0"
             if key not in ordered_ids:
                 ordered_ids[key] = f"speaker-{len(ordered_ids) + 1}"
-            aligned.append(SubtitleSegment(start=max(0.0, start), end=max(start, end), text=text, speaker_id=ordered_ids[key]))
+            aligned.append(
+                SubtitleSegment(
+                    start=max(0.0, start),
+                    end=max(start, end),
+                    text=text,
+                    speaker_id=ordered_ids[key],
+                    alt_text=raw_alt,
+                    verify_reason=raw_reason,
+                )
+            )
     return aligned
 
 

@@ -1,7 +1,8 @@
-"""Local Apple Silicon speech-to-text transcription using Qwen3-ASR-0.6B-Khmer, Whisper, and mlx-whisper."""
+"""Local Apple Silicon speech-to-text transcription using Qwen3-ASR-0.6B-Khmer, Whisper Khmer verifier, and mlx-whisper."""
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import sys
@@ -13,6 +14,12 @@ import numpy as np
 
 from diarizer import load_mono_16k_float32
 from khmer_dictionary import correct_khmer_transcript
+from khmer_verifier import (
+    DEFAULT_KHMER_VERIFIER_REPO,
+    CandidatePair,
+    assess_khmer_turn_quality,
+    reconcile_khmer_candidates,
+)
 from model_cache import resolve_hf_model_path
 from subtitles import SpeakerTurn
 
@@ -168,11 +175,43 @@ def _slice_turn_audio(audio: np.ndarray, turn: SpeakerTurn) -> np.ndarray:
     return audio[s_idx:e_idx]
 
 
+def _collect_active_slices(audio: np.ndarray, speech_turns: list[SpeakerTurn]) -> tuple[list[SpeakerTurn], list[np.ndarray]]:
+    """Filter non-silent speaker turns and slice padded 16 kHz mono audio chunks."""
+    active_turns: list[SpeakerTurn] = []
+    slices: list[np.ndarray] = []
+    for turn in speech_turns:
+        chunk = _slice_turn_audio(audio, turn)
+        if chunk.size > 0 and float(np.sqrt(np.mean(np.square(chunk)))) >= MIN_RMS_ENERGY:
+            active_turns.append(turn)
+            slices.append(chunk)
+    return active_turns, slices
+
+
+def _build_segment_payload(turn: SpeakerTurn, text: str, alt_text: str = "", verify_reason: str = "") -> dict:
+    """Assemble one timed ASR segment dictionary with optional Whisper verification metadata."""
+    seg: dict = {"start": round(turn.start, 3), "end": round(turn.end, 3), "text": text}
+    if alt_text:
+        seg["altText"] = alt_text
+    if verify_reason:
+        seg["verifyReason"] = verify_reason
+    return seg
+
+
+def _join_segment_texts(segments: list[dict]) -> str:
+    """Join non-empty segment text fields into a single normalized transcript string."""
+    return " ".join(str(seg.get("text") or "").strip() for seg in segments if str(seg.get("text") or "").strip())
+
+
 class KhmerWhisperTranscriber:
     """Thread-safe Khmer ASR transcriber supporting Qwen3-ASR-0.6B-Khmer and fine-tuned Whisper."""
 
-    def __init__(self, model_repo: str = DEFAULT_KHMER_WHISPER_REPO) -> None:
+    def __init__(
+        self,
+        model_repo: str = DEFAULT_KHMER_WHISPER_REPO,
+        verifier: KhmerWhisperTranscriber | None = None,
+    ) -> None:
         self._model_repo = model_repo
+        self._verifier = verifier
         self._lock = threading.Lock()
         self._qwen_asr = None
         self._model = None
@@ -180,8 +219,13 @@ class KhmerWhisperTranscriber:
         self._device = "cpu"
         self._dtype = None
 
+    @property
+    def model_repo(self) -> str:
+        """Return configured HuggingFace model repository ID."""
+        return self._model_repo
+
     def _ensure_loaded(self) -> None:
-        """Lazily load Qwen3-ASR-0.6B-Khmer (or Whisper fallback) from local HuggingFace cache."""
+        """Lazily load Qwen3-ASR-0.6B-Khmer (or Whisper model) from cache or HuggingFace Hub."""
         if self._qwen_asr is not None or self._model is not None:
             return
         import torch
@@ -200,16 +244,17 @@ class KhmerWhisperTranscriber:
             return
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_dir, dtype=self._dtype, local_files_only=True)
+        is_local = Path(model_dir).is_dir()
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_dir, dtype=self._dtype, local_files_only=is_local)
         model.config.use_cache = True
         model.generation_config.use_cache = True
-        processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
+        processor = AutoProcessor.from_pretrained(model_dir, local_files_only=is_local)
         model.generation_config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="km", task="transcribe")
         self._model = model.to(self._device).eval()
         self._processor = processor
 
     def _transcribe_whisper_chunk(self, chunk: np.ndarray) -> str:
-        """Decode a single speech slice using the fallback HuggingFace Whisper model."""
+        """Decode a single speech slice using the HuggingFace Whisper model."""
         import torch
 
         inputs = self._processor(chunk, sampling_rate=SAMPLE_RATE, return_tensors="pt")
@@ -219,17 +264,10 @@ class KhmerWhisperTranscriber:
         raw = self._processor.batch_decode(pred_ids, skip_special_tokens=True)[0]
         return correct_khmer_transcript(raw)
 
-    def _transcribe_turns_locked(self, audio: np.ndarray, speech_turns: list[SpeakerTurn]) -> list[dict]:
-        """Run batched Qwen3-ASR or sequential Whisper inference while holding the model lock."""
+    def _decode_slices_locked(self, slices: list[np.ndarray]) -> list[str]:
+        """Decode audio slices via batched Qwen3-ASR or sequential Whisper while holding `self._lock`."""
         self._ensure_loaded()
-        active_turns: list[SpeakerTurn] = []
-        slices: list[np.ndarray] = []
-        for turn in speech_turns:
-            chunk = _slice_turn_audio(audio, turn)
-            if chunk.size > 0 and float(np.sqrt(np.mean(np.square(chunk)))) >= MIN_RMS_ENERGY:
-                active_turns.append(turn)
-                slices.append(chunk)
-        if not active_turns:
+        if not slices:
             return []
         if self._qwen_asr is not None:
             texts: list[str] = []
@@ -237,34 +275,123 @@ class KhmerWhisperTranscriber:
                 batch = [(chunk, SAMPLE_RATE) for chunk in slices[start : start + QWEN_ASR_BATCH_SIZE]]
                 results = self._qwen_asr.transcribe(batch)
                 texts.extend(correct_khmer_transcript(r.text) for r in results)
-        else:
-            texts = [self._transcribe_whisper_chunk(chunk) for chunk in slices]
-        return [
-            {"start": round(t.start, 3), "end": round(t.end, 3), "text": txt}
-            for t, txt in zip(active_turns, texts)
-            if txt
-        ]
+            return texts
+        return [self._transcribe_whisper_chunk(chunk) for chunk in slices]
 
-    def transcribe(self, wav_path: Path, turns: list[SpeakerTurn] | None = None) -> dict:
-        """Transcribe a 16 kHz mono WAV file into timed Khmer segments aligned with speaker turns."""
+    def transcribe_slices(self, slices: list[np.ndarray]) -> list[str]:
+        """Thread-safely decode pre-sliced 16 kHz mono speech chunks into corrected Khmer strings."""
+        if not slices:
+            return []
+        with self._lock:
+            return self._decode_slices_locked(slices)
+
+    def _transcribe_turns_locked(self, audio: np.ndarray, speech_turns: list[SpeakerTurn]) -> list[dict]:
+        """Run batched Qwen3-ASR or sequential Whisper inference while holding the model lock."""
+        active_turns, slices = _collect_active_slices(audio, speech_turns)
+        if not active_turns:
+            return []
+        texts = self._decode_slices_locked(slices)
+        return [_build_segment_payload(turn, txt) for turn, txt in zip(active_turns, texts) if txt]
+
+    def _run_verifier_safe(self, slices: list[np.ndarray]) -> list[str] | None:
+        """Invoke secondary Khmer Whisper verifier safely, degrading cleanly on load/runtime errors."""
+        if self._verifier is None or not slices:
+            return None
+        try:
+            logger.info("Running secondary Khmer verifier %s on %d turn(s)", self._verifier.model_repo, len(slices))
+            return self._verifier.transcribe_slices(slices)
+        except Exception as exc:
+            logger.warning("Secondary Khmer verifier %s skipped cleanly: %s", self._verifier.model_repo, exc)
+            return None
+
+    def _reconcile_verified_turns(
+        self,
+        active_turns: list[SpeakerTurn],
+        slices: list[np.ndarray],
+        primary_texts: list[str],
+        double_check: bool,
+    ) -> tuple[list[dict], dict]:
+        """Run selective (or full optional) secondary Whisper verification and reconcile results."""
+        qualities = [assess_khmer_turn_quality(txt) for txt in primary_texts]
+        target_indices = [idx for idx, qual in enumerate(qualities) if double_check or qual.is_suspicious]
+        secondary_map: dict[int, str] = {}
+        verifier_model = self._verifier.model_repo if self._verifier is not None else ""
+        if target_indices and self._verifier is not None:
+            decoded = self._run_verifier_safe([slices[idx] for idx in target_indices])
+            if decoded is not None and len(decoded) == len(target_indices):
+                secondary_map = dict(zip(target_indices, decoded))
+        segments, fallback_count, suggestion_count = _merge_verified_outputs(
+            active_turns, primary_texts, qualities, secondary_map, double_check
+        )
+        summary = {
+            "checked": len(secondary_map),
+            "fallbackApplied": fallback_count,
+            "suggestions": suggestion_count,
+            "model": verifier_model if secondary_map else "",
+        }
+        return segments, summary
+
+    def transcribe(
+        self,
+        wav_path: Path,
+        turns: list[SpeakerTurn] | None = None,
+        double_check: bool = False,
+    ) -> dict:
+        """Transcribe a 16 kHz mono WAV file into timed Khmer segments with selective Whisper verification."""
         audio = load_mono_16k_float32(Path(wav_path))
         speech_turns = prepare_speech_turns(audio, turns)
-        logger.info("Transcribing %s with Khmer model %s (%d turns)", Path(wav_path).name, self._model_repo, len(speech_turns))
+        active_turns, slices = _collect_active_slices(audio, speech_turns)
+        logger.info("Transcribing %s with Khmer model %s (%d turns)", Path(wav_path).name, self._model_repo, len(active_turns))
+        if not active_turns:
+            return {"language": "km", "segments": [], "verificationSummary": {"checked": 0, "fallbackApplied": 0, "suggestions": 0, "model": ""}}
         with self._lock:
-            segments = self._transcribe_turns_locked(audio, speech_turns)
-        return {"language": "km", "segments": segments}
+            primary_texts = self._decode_slices_locked(slices)
+        segments, summary = self._reconcile_verified_turns(active_turns, slices, primary_texts, double_check)
+        return {"language": "km", "segments": segments, "verificationSummary": summary}
+
+
+def _merge_verified_outputs(
+    active_turns: list[SpeakerTurn],
+    primary_texts: list[str],
+    qualities: list,
+    secondary_map: dict[int, str],
+    double_check: bool,
+) -> tuple[list[dict], int, int]:
+    """Combine primary and optional secondary decodes into final segment dicts and counters."""
+    segments: list[dict] = []
+    fallback_count = 0
+    suggestion_count = 0
+    for idx, (turn, primary_text, primary_quality) in enumerate(zip(active_turns, primary_texts, qualities)):
+        if idx in secondary_map:
+            sec_text = secondary_map[idx]
+            pair = CandidatePair(primary_text, sec_text, primary_quality, assess_khmer_turn_quality(sec_text))
+            reconciled = reconcile_khmer_candidates(pair, force_double_check=double_check)
+            if reconciled.used_fallback:
+                fallback_count += 1
+            elif reconciled.alt_text:
+                suggestion_count += 1
+            if reconciled.text:
+                segments.append(_build_segment_payload(turn, reconciled.text, reconciled.alt_text, reconciled.verify_reason))
+        elif primary_text:
+            segments.append(_build_segment_payload(turn, primary_text))
+    return segments, fallback_count, suggestion_count
 
 
 class LocalTranscriber:
-    """Thread-safe hybrid ASR routing Khmer speech to Qwen3-ASR-0.6B-Khmer and other languages to MLX Whisper."""
+    """Thread-safe hybrid ASR routing Khmer speech to Qwen3-ASR (+ selective Whisper verifier) and other languages to MLX Whisper."""
 
     def __init__(
         self,
         model_repo: str = DEFAULT_WHISPER_REPO,
         khmer_model_repo: str = DEFAULT_KHMER_WHISPER_REPO,
+        khmer_verifier_repo: str = DEFAULT_KHMER_VERIFIER_REPO,
     ) -> None:
         self._model_repo = model_repo
-        self._khmer = KhmerWhisperTranscriber(khmer_model_repo)
+        clean_verifier = (khmer_verifier_repo or "").strip()
+        self._khmer_verifier = (
+            KhmerWhisperTranscriber(clean_verifier) if clean_verifier and clean_verifier != khmer_model_repo else None
+        )
+        self._khmer = KhmerWhisperTranscriber(khmer_model_repo, verifier=self._khmer_verifier)
         self._lock = threading.Lock()
 
     def _transcribe_mlx(self, wav_path: Path, clean_lang: str | None) -> dict:
@@ -283,11 +410,29 @@ class LocalTranscriber:
             "segments": result.get("segments") or [],
         }
 
+    def _transcribe_khmer(self, path: Path, turns: list[SpeakerTurn] | None, double_check: bool) -> dict:
+        """Invoke the primary Khmer transcriber with the requested verification mode."""
+        method = self._khmer.transcribe
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            supports_double_check = True
+        else:
+            supports_double_check = "double_check" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        kwargs = {"turns": turns}
+        if supports_double_check:
+            kwargs["double_check"] = double_check
+        return method(path, **kwargs)
+
     def transcribe(
         self,
         wav_path: Path,
         language: str | None = None,
         turns: list[SpeakerTurn] | None = None,
+        double_check: bool = False,
     ) -> dict:
         """Transcribe a 16 kHz mono WAV file using Khmer fine-tuned ASR for `km` and MLX Whisper otherwise."""
         path = Path(wav_path)
@@ -295,9 +440,31 @@ class LocalTranscriber:
         if clean_lang == "auto":
             clean_lang = None
         if clean_lang == "km":
-            return self._khmer.transcribe(path, turns=turns)
+            return self._transcribe_khmer(path, turns, double_check)
         mlx_res = self._transcribe_mlx(path, clean_lang)
         if clean_lang is None and mlx_res.get("language") == "km":
             logger.info("Auto-detected Khmer speech in %s; switching to Khmer ASR", path.name)
-            return self._khmer.transcribe(path, turns=turns)
+            return self._transcribe_khmer(path, turns, double_check)
         return mlx_res
+
+    def verify_audio(self, wav_path: Path, language: str = "km") -> tuple[str, str]:
+        """Transcribe generated TTS audio for round-trip word QA using `whisper-small-khmer-v2` for Khmer.
+
+        Inputs: 16 kHz mono WAV path and target language (`'km'` or ISO code / `'auto'`).
+        Outputs: `(heard_text, model_repo_used)`.
+        Side effects: lazily loads the verifier model on first use.
+        Failure modes: falls back to primary Khmer ASR if `whisper-small-khmer-v2` fails to load.
+        """
+        path = Path(wav_path)
+        clean_lang = (language or "km").strip().lower() or "km"
+        if clean_lang == "km":
+            if self._khmer_verifier is not None:
+                try:
+                    res = self._khmer_verifier.transcribe(path, turns=None, double_check=False)
+                    return _join_segment_texts(res.get("segments") or []), self._khmer_verifier.model_repo
+                except Exception as exc:
+                    logger.warning("Khmer verifier %s failed during TTS QA; falling back to primary ASR: %s", self._khmer_verifier.model_repo, exc)
+            res = self._transcribe_khmer(path, None, False)
+            return _join_segment_texts(res.get("segments") or []), self._khmer.model_repo
+        mlx_res = self._transcribe_mlx(path, None if clean_lang == "auto" else clean_lang)
+        return _join_segment_texts(mlx_res.get("segments") or []), self._model_repo

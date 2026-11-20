@@ -2,9 +2,10 @@
  * @fileoverview Presentation hook driving single-character speech synthesis and status reporting.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatGenerationMetrics } from '../../domain/audioValidation.js';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
+import { findActiveTake, pushTakeHistory, removeTakeFromHistory } from '../../domain/takeHistory.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
 /**
@@ -68,14 +69,14 @@ function formatCompletedStatus({ customMessage, character, recording }) {
  * @param {object} spec - Execution callbacks and services.
  * @returns {Promise<void>} Completion promise.
  */
-async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, setRecording, setLastSeed, onNotify }) {
+async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, commitRecording, setLastSeed, onNotify }) {
   const result = await synthesizeSpeech.execute({
     ...request,
     signal,
     onProgress: info => updateProgress(formatProgressMessage(info)),
     onReferenceUploaded: fileData => onReferenceUploaded?.(request.character.id, fileData),
   });
-  setRecording(result.recording);
+  commitRecording(result.recording);
   if (result.recording.seed != null) setLastSeed(result.recording.seed);
   const customMessage = await onCompleted?.(result);
   const finalMessage = formatCompletedStatus({ customMessage, character: request.character, recording: result.recording });
@@ -129,16 +130,16 @@ function startSynthesisGeneration(ctx) {
     run: (signal, updateProgress) => executeSynthesisRequest({
       synthesizeSpeech: ctx.synthesizeSpeech, request: ctx.request, signal,
       onReferenceUploaded: ctx.onReferenceUploaded, onCompleted: ctx.onCompleted,
-      updateProgress, setStatus: ctx.setStatus, setRecording: ctx.setRecording, setLastSeed: ctx.setLastSeed, onNotify: ctx.onNotify,
+      updateProgress, setStatus: ctx.setStatus, commitRecording: ctx.commitRecording, setLastSeed: ctx.setLastSeed, onNotify: ctx.onNotify,
     }),
   });
 }
 
 /**
- * Coordinates abortable single-character speech synthesis and status reporting.
+ * Coordinates abortable single-character speech synthesis, bounded session take history, and status reporting.
  * Inputs: `{ onFailure, onValidationFieldError, onNotify, onUnlockSound }`.
- * Outputs: `{ busy, busyMeta, activeCharacterId, recording, lastSeed, status, setStatus, runGeneration, cancel }`.
- * Side effects: invokes injected domain use cases and aborts pending calls on unmount.
+ * Outputs: `{ busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, recording, lastSeed, status, setStatus, selectTake, deleteTake, regenerateChunk, runGeneration, cancel }`.
+ * Side effects: invokes injected domain use cases, commits generated takes, and aborts pending calls on unmount.
  * Failure modes: translates ValidationError, SynthesisCancelledError, and SynthesisError into status state.
  * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void, onNotify?: Function, onUnlockSound?: Function }} params - Hook callbacks.
  * @returns {object} Synthesis state and actions.
@@ -149,15 +150,90 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
   const [busy, setBusy] = useState(false);
   const [busyMeta, setBusyMeta] = useState(null);
   const [activeCharacterId, setActiveCharacterId] = useState(null);
-  const [recording, setRecording] = useState(null);
+  const [takes, setTakes] = useState([]);
+  const [activeTakeId, setActiveTakeId] = useState(null);
+  const [regeneratingChunk, setRegeneratingChunk] = useState(null);
   const [lastSeed, setLastSeed] = useState(null);
   const [status, setStatus] = useState({ message: 'No audio generated yet.', error: false });
+  const takesRef = useRef(takes);
+  takesRef.current = takes;
+  const regeneratingRef = useRef(null);
+  const recording = useMemo(() => findActiveTake(takes, activeTakeId), [takes, activeTakeId]);
+
+  const commitRecording = useCallback(nextRecording => {
+    if (!nextRecording?.id) return;
+    const nextTakes = pushTakeHistory(takesRef.current, nextRecording);
+    takesRef.current = nextTakes;
+    setTakes(nextTakes);
+    setActiveTakeId(nextRecording.id);
+  }, []);
+
+  const selectTake = useCallback(takeId => {
+    if (!takesRef.current.some(take => take.id === takeId)) return;
+    setActiveTakeId(takeId);
+  }, []);
+
+  const deleteTake = useCallback(takeId => {
+    const currentTakes = takesRef.current;
+    const remaining = removeTakeFromHistory(currentTakes, takeId);
+    if (remaining.length === currentTakes.length) return;
+    const removedIndex = currentTakes.findIndex(take => take.id === takeId);
+    takesRef.current = remaining;
+    setTakes(remaining);
+    setActiveTakeId(currentId => {
+      if (currentId !== takeId && remaining.some(take => take.id === currentId)) return currentId;
+      const fallbackIndex = Math.min(Math.max(removedIndex, 0), remaining.length - 1);
+      return remaining[fallbackIndex]?.id ?? null;
+    });
+  }, []);
+
+  const replaceTake = useCallback((takeId, nextRecording) => {
+    if (!takeId || !nextRecording?.id) return;
+    const currentTakes = takesRef.current;
+    if (!currentTakes.some(take => take.id === takeId)) return;
+    const nextTakes = currentTakes.map(take => (take.id === takeId ? nextRecording : take));
+    takesRef.current = nextTakes;
+    setTakes(nextTakes);
+  }, []);
+
+  const regenerateChunk = useCallback(async ({ recording: target, index, text, character, anchor, cachedUpload, options, onCompleted }) => {
+    if (!target?.id || abortController.current || regeneratingRef.current) return null;
+    const controller = new AbortController();
+    abortController.current = controller;
+    regeneratingRef.current = { takeId: target.id, index };
+    setRegeneratingChunk({ takeId: target.id, index });
+    setStatus({ message: `Regenerating segment ${index + 1} of ${target.chunks.length}…`, error: false });
+    try {
+      const result = await synthesizeSpeech.regenerateChunk({
+        recording: target, index, text, character, anchor, cachedUpload, options, signal: controller.signal,
+      });
+      if (controller.signal.aborted || !result?.recording) return null;
+      replaceTake(target.id, result.recording);
+      if (result.recording.seed != null) setLastSeed(result.recording.seed);
+      const customMessage = await onCompleted?.(result);
+      const metrics = formatGenerationMetrics(result.recording);
+      const identity = character ? `${character.name} (${character.id})` : 'Voice';
+      const message = customMessage || [`Segment ${index + 1} regenerated`, metrics, identity].filter(Boolean).join(' · ');
+      setStatus({ message, error: false });
+      onNotify?.({ kind: 'success', title: 'Segment updated', message });
+      return result.recording;
+    } catch (error) {
+      handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify });
+      return null;
+    } finally {
+      if (abortController.current === controller) abortController.current = null;
+      regeneratingRef.current = null;
+      setRegeneratingChunk(null);
+    }
+  }, [synthesizeSpeech, replaceTake, onFailure, onValidationFieldError, onNotify]);
+
   useEffect(() => () => abortController.current?.abort(), []);
   return {
-    busy, busyMeta, activeCharacterId, recording, lastSeed, status, setStatus,
+    busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, recording, lastSeed, status, setStatus,
+    selectTake, deleteTake, regenerateChunk,
     runGeneration: args => startSynthesisGeneration({
       ...args, busy, abortController, synthesizeSpeech, setBusy, setBusyMeta, setActiveCharacterId,
-      setStatus, setRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound,
+      setStatus, commitRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound,
     }),
     cancel: () => abortController.current?.abort(),
   };

@@ -4,10 +4,13 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
+import { createTtsProjectSnapshot } from '../../domain/projects.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
+import { useSpeechVerification } from '../hooks/useSpeechVerification.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
+import { ChunkSegmentsPanel } from './ChunkSegmentsPanel.jsx';
 import { Icon } from './Icon.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
 import { Toolbar } from './Toolbar.jsx';
@@ -24,6 +27,7 @@ const INITIAL_OPTIONS = {
   customStyle: '',
   denoiseReference: false,
   masterAudio: true,
+  verifyAudio: false,
 };
 
 function isApplePlatform() {
@@ -165,11 +169,28 @@ function focusValidationField(refs, field) {
 }
 
 function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
+  const activeRecording = ctrl.synthesis.recording;
+  const chunkCount = Array.isArray(activeRecording?.chunks) ? activeRecording.chunks.length : 0;
+  const belongsToOtherCharacter = Boolean(activeRecording?.characterId && activeRecording.characterId !== ctrl.activeCharacter.id);
+  const segmentsPanel = chunkCount >= 2 ? (
+    <ChunkSegmentsPanel key={activeRecording.id} recording={activeRecording}
+      busy={ctrl.synthesis.busy || Boolean(ctrl.synthesis.regeneratingChunk)}
+      regeneratingIndex={ctrl.synthesis.regeneratingChunk?.index ?? null}
+      disabled={belongsToOtherCharacter}
+      onRegenerate={(index, text) => ctrl.synthesis.regenerateChunk({
+        recording: activeRecording, index, text,
+        character: ctrl.activeCharacter, anchor: ctrl.activeAnchor,
+        cachedUpload: ctrl.actions.uploadedRefsRef.current[ctrl.activeCharacter.id] || null,
+        options: state.options,
+      })}
+      onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this segment in the browser. You can still regenerate it.', error: true })} />
+  ) : null;
   return (
     <form id="speech-form" className="studio-grid" onSubmit={event => submitCharacterSpeech(event, { ...state, ...ctrl })}>
       <ScriptEditor scriptInput={state.scriptRef} script={state.script} count={ctrl.count} isOverLimit={ctrl.isOverLimit}
         onReplaceScript={text => { state.setScript(text); state.scriptRef.current?.focus(); }}
-        onScriptChange={state.setScript} onScriptKey={event => handleScriptShortcut(event, ctrl.generateDisabled)} />
+        onScriptChange={state.setScript} onScriptKey={event => handleScriptShortcut(event, ctrl.generateDisabled)}
+        segmentsPanel={segmentsPanel} />
       <section className="voice-inspector" aria-labelledby="voice-title">
         <div className="pane-heading">
           <h2 id="voice-title">Voice</h2>
@@ -181,7 +202,7 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         <VoiceControls characters={state.library.allVoices} anchors={state.anchorApi.anchors} activeCharacter={ctrl.activeCharacter}
           activeAnchor={ctrl.activeAnchor} anchorWarning={state.anchorApi.anchorWarning} busy={ctrl.synthesis.busy}
           options={state.options} lastSeed={ctrl.synthesis.lastSeed} lockedSeed={state.lockedSeeds[ctrl.activeCharacter.id] ?? null}
-          transcriptRef={state.transcriptRef} actions={voiceActions} />
+          transcriptRef={state.transcriptRef} actions={voiceActions} glossaryRepository={ctrl.glossaryRepository} />
       </section>
     </form>
   );
@@ -195,13 +216,24 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   } = shared;
   const externalScript = propExternalScript || sharedScript || '';
   const onConsumeExternalScript = propConsume || sharedConsume;
-  const { logger } = useStudioServices();
+  const { logger, projectRepository, glossaryRepository = null } = useStudioServices();
   const scriptRef = useRef(null);
   const transcriptRef = useRef(null);
   const prevHiddenRef = useRef(hidden);
   const [script, setScript] = useState('');
   const [options, setOptions] = useState(INITIAL_OPTIONS);
+  const [projectId, setProjectId] = useState('');
+  const [projectTitle, setProjectTitle] = useState('');
+  const [projectsReady, setProjectsReady] = useState(false);
+  const scriptValueRef = useRef(script);
+  scriptValueRef.current = script;
   const [libraryModal, setLibraryModal] = useState({ open: false, openForm: false });
+  const receivedExternalScriptRef = useRef(Boolean(externalScript));
+  const allVoicesRef = useRef(library.allVoices);
+  const characterActionsRef = useRef(shared.characterActions);
+  allVoicesRef.current = library.allVoices;
+  characterActionsRef.current = shared.characterActions;
+  if (externalScript) receivedExternalScriptRef.current = true;
   const charactersRef = useRef(library.allVoices);
   charactersRef.current = library.allVoices;
 
@@ -210,6 +242,62 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     setScript(externalScript);
     onConsumeExternalScript?.();
   }, [externalScript, onConsumeExternalScript]);
+
+  useEffect(() => {
+    if (!projectRepository) {
+      setProjectsReady(true);
+      return undefined;
+    }
+    let active = true;
+    const restoreLatestProject = async () => {
+      try {
+        const page = await projectRepository.listProjects({ limit: 50, offset: 0 });
+        const latest = page.items.find(project => project.kind === 'tts');
+        if (!latest) return;
+        const snapshot = await projectRepository.getProject(latest.id);
+        if (!active || !snapshot || receivedExternalScriptRef.current || scriptValueRef.current.trim()) return;
+        setProjectId(snapshot.id);
+        setProjectTitle(snapshot.title);
+        setScript(snapshot.payload?.script || '');
+        if (snapshot.payload?.ttsOptions && typeof snapshot.payload.ttsOptions === 'object') {
+          setOptions(prev => ({ ...prev, ...snapshot.payload.ttsOptions }));
+        }
+        const voiceId = snapshot.payload?.voiceId;
+        if (voiceId && allVoicesRef.current.some(voice => voice.id === voiceId)) {
+          characterActionsRef.current.handleSelectCharacter(voiceId);
+        }
+      } catch (error) {
+        logger?.error?.('TextToSpeechWorkspace.restoreProject', error);
+      } finally {
+        if (active) setProjectsReady(true);
+      }
+    };
+    void restoreLatestProject();
+    return () => { active = false; };
+  }, [projectRepository, logger]);
+
+  useEffect(() => {
+    if (!projectsReady || !projectRepository || (!projectId && !script.trim())) return undefined;
+    const timer = globalThis.setTimeout(async () => {
+      try {
+        const title = projectTitle || script.split(/\r?\n/, 1)[0].trim().slice(0, 60) || 'Untitled TTS project';
+        const saved = await projectRepository.saveProject(createTtsProjectSnapshot({
+          id: projectId || undefined,
+          title,
+          script,
+          voiceId: activeCharacter.id,
+          ttsOptions: options,
+        }));
+        if (saved.project?.id && !projectId) {
+          setProjectId(saved.project.id);
+          setProjectTitle(saved.project.title);
+        }
+      } catch (error) {
+        logger?.error?.('TextToSpeechWorkspace.autosave', error, { projectId });
+      }
+    }, 1500);
+    return () => globalThis.clearTimeout?.(timer);
+  }, [projectsReady, projectRepository, projectId, projectTitle, script, activeCharacter.id, options, logger]);
 
   useEffect(() => {
     if (prevHiddenRef.current && !hidden) {
@@ -239,9 +327,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   }
   const count = countGraphemes(script);
   const isOverLimit = count > MAX_SCRIPT_LENGTH;
-  const generateDisabled = synthesis.busy || !anchorApi.isLoaded || !hasScript || isOverLimit;
+  const generateDisabled = synthesis.busy || Boolean(synthesis.regeneratingChunk) || !anchorApi.isLoaded || !hasScript || isOverLimit;
   const state = { scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi, charactersRef, libraryModal, setLibraryModal };
-  const ctrl = { logger, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled };
+  const ctrl = { logger, glossaryRepository, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled };
   return { state, ctrl };
 }
 
@@ -256,6 +344,10 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
  */
 export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef, externalScript = '', onConsumeExternalScript }) {
   const { state, ctrl } = useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript, onConsumeExternalScript });
+  const verification = useSpeechVerification({
+    recording: ctrl.synthesis.recording,
+    autoVerify: Boolean(state.options.verifyAudio),
+  });
   const voiceActions = buildVoiceActions({
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
     setLibraryModal: state.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
@@ -267,8 +359,11 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel} />
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
         onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
-      <AudioPlayer recording={ctrl.synthesis.recording} activeCharacter={ctrl.activeCharacter} activeAnchor={ctrl.activeAnchor}
-        status={ctrl.synthesis.status} busyMeta={ctrl.synthesis.busyMeta} onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
+      <AudioPlayer recording={ctrl.synthesis.recording} takes={ctrl.synthesis.takes}
+        activeTakeId={ctrl.synthesis.activeTakeId} activeCharacter={ctrl.activeCharacter} activeAnchor={ctrl.activeAnchor}
+        status={ctrl.synthesis.status} busyMeta={ctrl.synthesis.busyMeta} verification={verification}
+        onSelectTake={ctrl.synthesis.selectTake} onDeleteTake={ctrl.synthesis.deleteTake}
+        onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
         onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
       <VoiceLibrary open={state.libraryModal.open} openSaveForm={state.libraryModal.openForm}
         busy={ctrl.synthesis.busy} library={state.library} anchors={state.anchorApi.anchors}

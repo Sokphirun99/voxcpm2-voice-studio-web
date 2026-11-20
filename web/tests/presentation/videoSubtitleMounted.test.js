@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 import { createVoiceAnchorUseCases, createVoiceLibraryUseCases } from '../../src/domain/useCases.js';
+import { BUILT_IN_VOICES } from '../../src/domain/voiceLibrary.js';
 
 const WEB_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -1768,6 +1769,34 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
     const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
 
     const synthCalls = [];
+    const dubCalls = [];
+    let shouldFailDub = false;
+    const downloadedNames = [];
+    const blobByUrl = new Map();
+    const revokedUrls = [];
+    const origCreateObjectURL = URL.createObjectURL;
+    const origRevokeObjectURL = URL.revokeObjectURL;
+    URL.createObjectURL = blob => {
+      const url = origCreateObjectURL(blob);
+      blobByUrl.set(url, blob);
+      return url;
+    };
+    URL.revokeObjectURL = url => {
+      revokedUrls.push(url);
+      origRevokeObjectURL?.(url);
+    };
+    const origCreateElement = dom.container.ownerDocument.createElement;
+    dom.container.ownerDocument.createElement = tag => {
+      const el = origCreateElement(tag);
+      if (tag === 'a') {
+        const origClick = el.click.bind(el);
+        el.click = () => {
+          if (el.download) downloadedNames.push(el.download);
+          return origClick();
+        };
+      }
+      return el;
+    };
     const services = {
       speechGateway: {
         checkAvailability: async () => true,
@@ -1792,6 +1821,11 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
         }),
         translateSegments: async ({ segments }) => ({ segments }),
         burnSubtitles: async () => new Blob(['ftypmp4'], { type: 'video/mp4' }),
+        exportDubbedVideo: async params => {
+          dubCalls.push(params);
+          if (shouldFailDub) throw new Error('FFmpeg dubbing failed on server.');
+          return new Blob(['ftypdubbedmp4'], { type: 'video/mp4' });
+        },
       },
       audioDecoder: { decodePeaks: async () => [] },
       logger: { debug() {}, warn() {}, error() {} },
@@ -1905,7 +1939,72 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
     assert.ok(outputCard);
     assert.match(outputCard.textContent, /Selected voiceover · 2 frames/);
     assert.match(outputCard.textContent, /Sovath/);
+    assert.match(outputCard.textContent, /0\.2s gap/);
     assert.ok(outputCard.querySelector('#subtitle-download-voice-btn'));
+
+    // 4b. Gap selector defaults to 0.2s (200ms) and dynamically re-stitches the combined WAV without re-synthesizing
+    const gapSelect = subPanel.querySelector('#subtitle-tts-gap');
+    assert.ok(gapSelect);
+    assert.equal(gapSelect.value, '200');
+    assert.deepEqual(
+      gapSelect.querySelectorAll('option').map(opt => opt.textContent),
+      ['0.1s', '0.2s', '0.5s', '1.0s']
+    );
+    const { readWavDurationSeconds } = await import('../../src/domain/wavCodec.js');
+    const urlAt200ms = outputCard.querySelector('audio').getAttribute('src');
+    const durationAt200ms = readWavDurationSeconds(await blobByUrl.get(urlAt200ms).arrayBuffer());
+    assert.ok(Math.abs(durationAt200ms - (0.14 + 0.2 + 0.14)) < 0.001, `Expected 0.48s at 200ms gap, got ${durationAt200ms}`);
+
+    await act(async () => {
+      gapSelect.value = '1000';
+      gapSelect.dispatchEvent({ type: 'change', bubbles: true, target: gapSelect });
+      await new Promise(r => setTimeout(r, 30));
+    });
+    assert.equal(synthCalls.length, 3);
+    const updatedOutput = subPanel.querySelector('#subtitle-voice-output');
+    const urlAt1000ms = updatedOutput.querySelector('audio').getAttribute('src');
+    assert.notEqual(urlAt1000ms, urlAt200ms);
+    assert.equal(revokedUrls.includes(urlAt200ms), true);
+    assert.match(updatedOutput.textContent, /1\.0s gap/);
+    const durationAt1000ms = readWavDurationSeconds(await blobByUrl.get(urlAt1000ms).arrayBuffer());
+    assert.ok(Math.abs(durationAt1000ms - (0.14 + 1.0 + 0.14)) < 0.001, `Expected 1.28s at 1000ms gap, got ${durationAt1000ms}`);
+
+    // 4c. Dubbed MP4 export controls inside #subtitle-voice-output: select Original audio mode, export <stem>-dubbed.mp4, and surface error toast on failure
+    const dubModeSelect = updatedOutput.querySelector('#subtitle-dub-audio-mode');
+    const dubBtn = updatedOutput.querySelector('#subtitle-export-dub-btn');
+    assert.ok(dubModeSelect);
+    assert.ok(dubBtn);
+    assert.equal(dubModeSelect.value, 'duck');
+    assert.deepEqual(
+      dubModeSelect.querySelectorAll('option').map(opt => opt.textContent),
+      ['Duck (-16 dB)', 'Mute original', 'Keep original']
+    );
+    assert.equal(dubBtn.disabled || dubBtn.hasAttribute('disabled'), false);
+
+    await act(async () => {
+      dubModeSelect.value = 'mute';
+      dubModeSelect.dispatchEvent({ type: 'change', bubbles: true, target: dubModeSelect });
+    });
+    await act(async () => {
+      dubBtn.click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(dubCalls.length, 1);
+    assert.equal(dubCalls[0].jobId, 'voiceover1234567');
+    assert.equal(dubCalls[0].originalAudioMode, 'mute');
+    assert.deepEqual(
+      dubCalls[0].clips.map(clip => [clip.segmentId, clip.start, clip.end]),
+      [['seg-1', 0.0, 2.0], ['seg-3', 4.1, 6.0]]
+    );
+    assert.equal(downloadedNames.includes('song-dubbed.mp4'), true);
+
+    shouldFailDub = true;
+    await act(async () => {
+      subPanel.querySelector('#subtitle-export-dub-btn').click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.match(dom.container.querySelector('#studio-toast-region').textContent, /FFmpeg dubbing failed on server/);
+    shouldFailDub = false;
 
     // 5. Send selected to TTS sends ONLY selected frames (#1 and #3), skipping unselected #2
     await act(async () => { subPanel.querySelector('#subtitle-send-tts-btn').click(); });
@@ -1915,6 +2014,518 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
     await act(async () => { dom.container.querySelector('#nav-subtitles').click(); });
     await act(async () => { subPanel.querySelector('#subtitle-clear-btn').click(); });
     assert.equal(subPanel.querySelector('#subtitle-voice-output'), null);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace supports optional Khmer Whisper double-check toggle and one-click suggestion apply/dismiss', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root = null;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    const transcribeCalls = [];
+    const services = {
+      logger: { debug() {}, warn() {}, error() {} },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true }),
+        async transcribeVideo(params) {
+          transcribeCalls.push(params);
+          return {
+            jobId: 'facefeed12345678',
+            language: 'km',
+            isAudioOnly: true,
+            speakers: ['speaker-1'],
+            videoSize: null,
+            segments: [
+              {
+                id: 'seg-1',
+                start: 0,
+                end: 2.0,
+                speakerId: 'speaker-1',
+                text: 'សួស្តី កំពុង សាក',
+                translatedText: '',
+                altText: 'សួស្តី កំពុង សាកល្បង',
+                verifyReason: 'double_check',
+              },
+              {
+                id: 'seg-2',
+                start: 2.2,
+                end: 4.0,
+                speakerId: 'speaker-1',
+                text: 'សង្គ្រោះ ដោយ Whisper',
+                translatedText: '',
+                altText: '',
+                verifyReason: 'whisper_fallback',
+              },
+              {
+                id: 'seg-3',
+                start: 4.2,
+                end: 6.0,
+                speakerId: 'speaker-1',
+                text: 'រក្សា អក្សរ ដើម',
+                translatedText: '',
+                altText: 'ជម្រើស ផ្សេង ទៀត',
+                verifyReason: 'high_oov',
+              },
+            ],
+            verificationSummary: { checked: 3, fallbackApplied: 1, suggestions: 2, model: 'seanghay/whisper-small-khmer-v2' },
+          };
+        },
+        translateSegments: async () => ({ segments: [] }),
+        burnSubtitles: async () => new Blob(),
+      },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { hidden: false })));
+    });
+
+    const toggle = dom.container.querySelector('#subtitle-double-check-khmer');
+    assert.ok(toggle);
+    assert.equal(toggle.checked, false);
+
+    // Enable optional Double-check Khmer (Whisper)
+    await act(async () => {
+      toggle.checked = true;
+      toggle.dispatchEvent({ type: 'click', bubbles: true, target: toggle });
+    });
+
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['wav'], 'khmer.wav', { type: 'audio/wav' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    assert.equal(transcribeCalls.length, 1);
+    assert.equal(transcribeCalls[0].doubleCheck, true);
+    assert.match(dom.container.querySelector('.subtitle-dock').querySelector('.status').textContent, /1 recovered by Whisper · 2 Whisper suggestions/);
+
+    const rows = dom.container.querySelectorAll('.subtitle-segment-row');
+    assert.equal(rows.length, 3);
+    assert.match(rows[1].textContent, /Whisper recovery/);
+
+    // Row 1 renders Whisper suggestion banner and clicking "Use suggestion" replaces text cleanly
+    const banner1 = rows[0].querySelector('.subtitle-verify-banner');
+    assert.ok(banner1);
+    assert.match(banner1.textContent, /សួស្តី កំពុង សាកល្បង/);
+    const useBtn = banner1.querySelectorAll('button').find(b => b.textContent.includes('Use suggestion'));
+    await act(async () => { useBtn.click(); });
+    assert.equal(rows[0].querySelector('.subtitle-line-input').value, 'សួស្តី កំពុង សាកល្បង');
+    assert.equal(rows[0].querySelector('.subtitle-verify-banner'), null);
+
+    // Row 3 renders Whisper check banner and clicking "Dismiss" preserves original text cleanly
+    const banner3 = rows[2].querySelector('.subtitle-verify-banner');
+    assert.ok(banner3);
+    const dismissBtn = banner3.querySelectorAll('button').find(b => b.textContent.includes('Dismiss'));
+    await act(async () => { dismissBtn.click(); });
+    assert.equal(rows[2].querySelector('.subtitle-line-input').value, 'រក្សា អក្សរ ដើម');
+    assert.equal(rows[2].querySelector('.subtitle-verify-banner'), null);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace shows offline model hints only for enabled features with uncached models', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root = null;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    let models = { whisper: true, khmerAsr: true, translator: false, diarization: false };
+    const services = {
+      logger: { debug() {}, warn() {}, error() {} },
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true, models }),
+        transcribeVideo: async () => ({ jobId: 'abc123', language: 'en', videoSize: { width: 16, height: 9 }, segments: [] }),
+        translateSegments: async () => ({ segments: [] }),
+        burnSubtitles: async () => new Blob(),
+      },
+    };
+    const toggleSwitch = async (id, checked) => {
+      const el = dom.container.querySelector(id);
+      await act(async () => {
+        el.checked = checked;
+        el.dispatchEvent({ type: 'click', bubbles: true, target: el });
+      });
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { hidden: false })));
+    });
+    assert.equal(dom.container.querySelector('.subtitle-model-hints'), null);
+
+    await toggleSwitch('#subtitle-auto-translate', true);
+    let hints = dom.container.querySelector('.subtitle-model-hints');
+    assert.ok(hints);
+    assert.match(hints.textContent, /First-time translation will download NLLB-200 \(~2\.4 GB\)\./);
+    assert.doesNotMatch(hints.textContent, /speaker detection/);
+
+    await toggleSwitch('#subtitle-detect-speakers', true);
+    hints = dom.container.querySelector('.subtitle-model-hints');
+    assert.match(hints.textContent, /First-time speaker detection will download diarization models/);
+    assert.equal(hints.querySelectorAll('p').length, 2);
+
+    await act(async () => { root.unmount(); });
+    models = { whisper: true, khmerAsr: true, translator: true, diarization: true };
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { hidden: false })));
+    });
+    await toggleSwitch('#subtitle-auto-translate', true);
+    assert.equal(dom.container.querySelector('.subtitle-model-hints'), null);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace autosaves subtitle changes and restores on reload', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root = null;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    const savedProjects = new Map();
+    const projectRepository = {
+      listProjects: async () => {
+        const items = Array.from(savedProjects.values())
+          .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+          .map(({ id, kind, title, createdAt, updatedAt }) => ({ id, kind, title, createdAt, updatedAt }));
+        return { items, total: items.length, limit: 50, offset: 0, hasMore: false };
+      },
+      getProject: async id => savedProjects.get(id) ?? null,
+      saveProject: async snapshot => {
+        const id = snapshot.id || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const isCreated = !savedProjects.has(id);
+        const stored = { ...snapshot, id, updatedAt: new Date().toISOString() };
+        savedProjects.set(id, stored);
+        return { project: stored, isCreated };
+      },
+      deleteProject: async id => { savedProjects.delete(id); return { deleted: true, id }; },
+    };
+    const services = {
+      logger: { debug() {}, warn() {}, error() {} },
+      projectRepository,
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true, diarizationReady: true, models: {} }),
+        transcribeVideo: async () => ({
+          jobId: 'job-1',
+          language: 'en',
+          videoSize: { width: 16, height: 9 },
+          segments: [
+            { id: 'seg-1', start: 0.0, end: 2.0, text: 'Original text', translatedText: 'អត្ថបទដើម', speakerId: 'speaker-1' },
+            { id: 'seg-2', start: 2.1, end: 4.0, text: 'Second line', translatedText: 'បន្ទាត់ទីពីរ', speakerId: 'speaker-2' },
+          ],
+        }),
+        translateSegments: async () => ({ segments: [] }),
+        burnSubtitles: async () => new Blob(),
+      },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { hidden: false })));
+    });
+
+    const subPanel = dom.container.querySelector('.subtitle-workspace');
+    assert.ok(subPanel);
+
+    const fileInput = subPanel.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['video'], 'saved-video.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
+
+    // Update segment text via the inline input to trigger autosave
+    const row = subPanel.querySelector('.subtitle-segment-row');
+    assert.ok(row, 'subtitle segment row should render');
+    const input = row.querySelector('.subtitle-line-input');
+    assert.ok(input, 'segment input should render');
+    await act(async () => {
+      input._value = 'Updated subtitle text';
+      input.dispatchEvent({ type: 'input', bubbles: true, target: input });
+    });
+    const speakerInput = subPanel.querySelector('.subtitle-roster-input');
+    await act(async () => {
+      speakerInput._value = 'Saved host';
+      speakerInput.dispatchEvent({ type: 'input', bubbles: true, target: speakerInput });
+    });
+
+    // Wait for autosave debounce (1500ms)
+    await act(async () => { await new Promise(r => setTimeout(r, 1600)); });
+
+    // Verify autosave was called
+    assert.ok(savedProjects.size > 0, 'autosave should persist at least one project');
+    const saved = Array.from(savedProjects.values())[0];
+    assert.ok(saved.payload.segments.length > 0);
+    assert.equal(saved.payload.segments[0].text, 'Updated subtitle text');
+    assert.equal(saved.payload.segments[0].translatedText, 'អត្ថបទដើម');
+    assert.equal(saved.payload.speakerNames['speaker-1'], 'Saved host');
+    assert.equal(saved.payload.videoFileName, 'saved-video.mp4');
+
+    // Capture project id for reload
+    const projectId = saved.id;
+
+    // Simulate reload: unmount and remount with same repository
+    await act(async () => { root.unmount(); });
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(VideoSubtitleWorkspace, { hidden: false })));
+    });
+
+    // Verify project state is restored after the workspace remounts.
+    const reloaded = await projectRepository.getProject(projectId);
+    assert.ok(reloaded, 'saved project should be retrievable after reload');
+    assert.equal(reloaded.kind, 'subtitle');
+    const restoredRow = dom.container.querySelector('.subtitle-segment-row');
+    assert.ok(restoredRow, 'saved cue should be restored into the editor');
+    assert.equal(restoredRow.querySelector('textarea').value, 'Updated subtitle text');
+    assert.equal(dom.container.querySelector('.subtitle-roster-input').value, 'Saved host');
+    assert.match(dom.container.querySelector('.subtitle-upload-copy').textContent, /Re-link saved-video\.mp4/);
+
+    const restoredFileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      restoredFileInput.files = [new File(['video'], 'saved-video.mp4', { type: 'video/mp4' })];
+      restoredFileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    assert.match(dom.container.querySelector('#subtitle-extract-btn').textContent, /Link video for burn-in/);
+    await act(async () => { dom.container.querySelector('#subtitle-extract-btn').click(); });
+    assert.equal(dom.container.querySelector('.subtitle-line-input').value, 'Updated subtitle text');
+    const burnButton = dom.container.querySelector('#subtitle-burn-btn');
+    assert.equal(burnButton.disabled || burnButton.hasAttribute('disabled'), false);
+
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted TextToSpeechWorkspace autosaves and restores the current script project', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root = null;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { TextToSpeechWorkspace } = await vite.ssrLoadModule('/src/presentation/components/TextToSpeechWorkspace.jsx');
+    const projectId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const projects = new Map([[projectId, {
+      id: projectId,
+      kind: 'tts',
+      title: 'Saved script',
+      payload: { script: 'Script restored from storage', voiceId: 'char-nisa', ttsOptions: { guidance: 2 } },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      deletedAt: null,
+    }]]);
+    const projectRepository = {
+      listProjects: async () => ({
+        items: Array.from(projects.values()).map(({ id, kind, title, createdAt, updatedAt }) => ({ id, kind, title, createdAt, updatedAt })),
+        total: projects.size, limit: 50, offset: 0, hasMore: false,
+      }),
+      getProject: async id => projects.get(id) ?? null,
+      saveProject: async project => {
+        const id = project.id || projectId;
+        const saved = { ...project, id };
+        projects.set(id, saved);
+        return { project: saved, isCreated: false };
+      },
+      deleteProject: async id => { projects.delete(id); return { deleted: true, id }; },
+    };
+    const voice = BUILT_IN_VOICES.find(item => item.id === 'char-nisa');
+    const shared = {
+      library: {
+        allVoices: BUILT_IN_VOICES, matches: [], warning: null, storageStats: null,
+        refreshStats() {}, filters: { search: '', source: '', category: '' }, updateFilter() {},
+      },
+      anchorApi: { isLoaded: true, anchors: {}, anchorWarning: null },
+      activeCharacter: voice,
+      activeAnchor: null,
+      lockedSeeds: {},
+      setLockedSeeds() {},
+      characterActions: {
+        handleSelectCharacter() {}, handleUploadSample() {}, handleResetVoice() {}, handleUpdateAnchor() {},
+        handleCreateCharacter() {}, handleDeleteCharacter() {}, handlePinCurrentTake() {},
+      },
+      refreshEngine() {},
+      onTtsStateChange() {},
+      onNotify() {},
+    };
+    const services = {
+      projectRepository,
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: { execute: async () => ({}) },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(TextToSpeechWorkspace, { shared, hidden: false })));
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    const script = dom.container.querySelector('#script');
+    assert.equal(script.value, 'Script restored from storage');
+    await act(async () => {
+      script._value = 'Edited script survives refresh';
+      script.dispatchEvent({ type: 'input', bubbles: true, target: script });
+    });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 1600)); });
+    assert.equal(projects.get(projectId).payload.script, 'Edited script survives refresh');
+
+    await act(async () => { root.unmount(); });
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(TextToSpeechWorkspace, { shared, hidden: false })));
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    assert.equal(dom.container.querySelector('#script').value, 'Edited script survives refresh');
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted subtitle import translates cues and generates per-frame voice without a video', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    const translationRequests = [];
+    const voiceRequests = [];
+    const notices = [];
+    const services = {
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true }),
+        translateSegments: async request => {
+          translationRequests.push(request);
+          return { segments: request.segments.map(segment => ({ ...segment, translatedText: `Translated: ${segment.text}` })) };
+        },
+      },
+      synthesizeSpeech: {
+        execute: async request => {
+          voiceRequests.push(request);
+          return {
+            recording: {
+              id: 'imported-frame-take',
+              seed: 42,
+              characterId: 'char-nisa',
+              characterName: 'Nisa',
+              transcript: request.script,
+              blob: new Blob(['RIFF']),
+              audioDurationSeconds: 1,
+              elapsedMs: 1,
+              sizeBytes: 4,
+            },
+            uploadedFileData: null,
+          };
+        },
+      },
+      logger: { debug() {}, warn() {}, error() {} },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(VideoSubtitleWorkspace, { notices: null, onNotify: notice => notices.push(notice) })));
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+
+    const importInput = dom.container.querySelector('#subtitle-file-input');
+    await act(async () => {
+      importInput.files = [new File(['WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHost: Hello there.\n\n00:00:01.200 --> 00:00:02.000\nGuest: Welcome.'], 'captions.vtt', { type: 'text/vtt' })];
+      importInput.dispatchEvent({ type: 'change', bubbles: true, target: importInput });
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 2);
+    const burnButton = dom.container.querySelector('#subtitle-burn-btn');
+    assert.equal(burnButton.disabled || burnButton.hasAttribute('disabled'), true);
+    assert.ok(notices.some(notice => notice.title === 'Subtitles imported'));
+
+    const sourceLanguage = dom.container.querySelector('#subtitle-source-lang');
+    await act(async () => {
+      sourceLanguage.value = 'en';
+      sourceLanguage.dispatchEvent({ type: 'change', bubbles: true, target: sourceLanguage });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-translate-btn').click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    assert.equal(translationRequests.length, 1);
+    assert.equal(translationRequests[0].sourceLanguage, 'en');
+    assert.equal(translationRequests[0].segments.length, 2);
+
+    await act(async () => {
+      dom.container.querySelector('.subtitle-cue-voice-btn').click();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    assert.equal(voiceRequests.length, 1);
+    assert.equal(voiceRequests[0].script, 'Translated: Hello there.');
+    assert.ok(dom.container.querySelector('.subtitle-cue-audio-controls'));
+    const noJobDubBtn = dom.container.querySelector('#subtitle-export-dub-btn');
+    assert.ok(noJobDubBtn);
+    assert.equal(noJobDubBtn.disabled || noJobDubBtn.hasAttribute('disabled'), true);
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();

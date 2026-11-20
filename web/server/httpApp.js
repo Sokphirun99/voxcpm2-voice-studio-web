@@ -4,6 +4,8 @@
 
 import { randomUUID } from 'node:crypto';
 import { StorageError, ValidationError } from '../src/domain/errors.js';
+import { MAX_GLOSSARY_RULES } from '../src/domain/pronunciationRules.js';
+import { assertSafeProjectId } from './storageStore.js';
 import { FfmpegUnavailableError, createAudioMaster } from './audioMaster.js';
 import { createServerLogger } from './logger.js';
 import { createRateLimiter } from './rateLimiter.js';
@@ -325,6 +327,81 @@ async function handleCacheRoutes({ req, res, url, store, requestId }) {
 }
 
 /**
+ * Dispatches versioned project snapshot endpoints (`GET`, `PUT`, `DELETE /api/v1/projects[:id]`).
+ * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
+ * @returns {Promise<boolean>} True if route matched.
+ */
+async function handleProjectRoutes({ req, res, url, store, requestId }) {
+  if (url.pathname === `${API_PREFIX}/projects` && req.method === 'GET') {
+    const page = await store.listProjects({ limit: url.searchParams.get('limit'), offset: url.searchParams.get('offset') });
+    const { items, ...meta } = page;
+    sendJson({ res, status: 200, payload: { data: { items }, meta }, requestId });
+    return true;
+  }
+  const match = /^\/api\/v1\/projects\/([^/]+)$/.exec(url.pathname);
+  if (!match) return false;
+  let id;
+  try {
+    id = assertSafeProjectId(match[1], 'projectId');
+  } catch (error) {
+    throw new HttpApiError(400, 'INVALID_PROJECT_ID', error.message);
+  }
+  if (req.method === 'GET') {
+    const project = await store.getProject(id);
+    if (!project) throw new HttpApiError(404, 'PROJECT_NOT_FOUND', 'Project snapshot not found.');
+    sendJson({ res, status: 200, payload: { data: { project } }, requestId });
+    return true;
+  }
+  if (req.method === 'PUT') {
+    const body = await readJsonPayload(req);
+    const { project, isCreated } = await store.upsertProject(id, body);
+    sendJson({ res, status: isCreated ? 201 : 200, payload: { data: { project } }, requestId });
+    return true;
+  }
+  if (req.method === 'DELETE') {
+    const deleted = await store.deleteProject(id);
+    if (!deleted) throw new HttpApiError(404, 'PROJECT_NOT_FOUND', 'Project was not found.');
+    sendJson({ res, status: 200, payload: { data: { deleted: true, id } }, requestId });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Dispatches the pronunciation dictionary endpoint (`GET`, `PUT /api/v1/glossary`).
+ * `PUT` replaces the whole dictionary: malformed body shape → 400, rule violations → 422, other verbs → 405.
+ * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
+ * @returns {Promise<boolean>} True if route matched.
+ */
+async function handleGlossaryRoutes({ req, res, url, store, requestId }) {
+  if (url.pathname !== `${API_PREFIX}/glossary`) return false;
+  if (req.method === 'GET') {
+    const glossary = await store.getGlossary();
+    sendGlossary({ res, status: 200, glossary, requestId });
+    return true;
+  }
+  if (req.method === 'PUT') {
+    const body = await readJsonPayload(req);
+    const unknownKeys = Object.keys(body).filter(key => key !== 'rules');
+    if (!Array.isArray(body.rules) || unknownKeys.length > 0) {
+      throw new HttpApiError(400, 'INVALID_GLOSSARY_PAYLOAD', 'Body must be { "rules": [...] }.');
+    }
+    sendGlossary({ res, status: 200, glossary: await store.replaceGlossary(body.rules), requestId });
+    return true;
+  }
+  throw new HttpApiError(405, 'METHOD_NOT_ALLOWED', 'Use GET or PUT for the pronunciation glossary.');
+}
+
+/**
+ * Writes the `{ data: { rules }, meta }` glossary envelope.
+ * @param {{ res: import('node:http').ServerResponse, status: number, glossary: { rules: Array<object>, updatedAt: string|null }, requestId: string }} spec - Response spec.
+ */
+function sendGlossary({ res, status, glossary, requestId }) {
+  const meta = { count: glossary.rules.length, maxRules: MAX_GLOSSARY_RULES, updatedAt: glossary.updatedAt ?? null };
+  sendJson({ res, status, payload: { data: { rules: glossary.rules }, meta }, requestId });
+}
+
+/**
  * Resolves health or domain/audio routes inside the API gateway.
  * @param {object} ctx - Dispatch context.
  * @returns {Promise<void>} Resolves once response has been written.
@@ -344,6 +421,8 @@ async function routeApiRequest(ctx) {
   }
   const handled = (await handleCharacterRoutes(ctx))
     || (await handleAnchorRoutes(ctx))
+    || (await handleProjectRoutes(ctx))
+    || (await handleGlossaryRoutes(ctx))
     || (await handleAudioMasterRoute(ctx))
     || (await handleCacheRoutes(ctx));
   if (!handled) throw new HttpApiError(404, 'NOT_FOUND', 'Endpoint not found.');
@@ -361,6 +440,10 @@ async function dispatchStorageRequest({ req, res, store, audioMaster, limiter, l
   try {
     const rate = limiter.check(resolveClientIp(req));
     if (!rate.allowed) throw new HttpApiError(429, 'RATE_LIMIT_EXCEEDED', 'Too many storage requests. Retry shortly.', rate.retryAfterSeconds);
+    const rawPath = String(req.url || '/').split(/[?#]/, 1)[0];
+    if (/^\/api\/v1\/projects\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
+      throw new HttpApiError(400, 'INVALID_PROJECT_ID', 'Project id must be a UUID.');
+    }
     await routeApiRequest({ req, res, url, store, audioMaster, requestId });
     if (url.pathname !== `${API_PREFIX}/health`) {
       logger.info('HTTP request completed', { method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }, requestId);
@@ -368,8 +451,9 @@ async function dispatchStorageRequest({ req, res, store, audioMaster, limiter, l
   } catch (error) {
     const mapped = mapErrorToHttp(error);
     const retryHeader = mapped.status === 429 ? { 'Retry-After': String(error?.retryAfterSeconds || 60) } : {};
+    const extraHeaders = mapped.status === 405 ? { Allow: 'GET, PUT' } : retryHeader;
     logger.error('HTTP request failed', { method: req.method, path: url.pathname, status: mapped.status, code: mapped.code, errorMessage: error?.message }, requestId);
-    if (!res.headersSent) sendJson({ res, status: mapped.status, payload: { data: null, error: { code: mapped.code, message: mapped.message } }, requestId, headers: retryHeader });
+    if (!res.headersSent) sendJson({ res, status: mapped.status, payload: { data: null, error: { code: mapped.code, message: mapped.message } }, requestId, headers: extraHeaders });
   }
 }
 

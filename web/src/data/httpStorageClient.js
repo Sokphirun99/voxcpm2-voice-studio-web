@@ -38,7 +38,7 @@ export function buildStorageApiUrl(baseUrl, routePath) {
  * Side effects: performs HTTP fetch request.
  * Failure modes: throws `StorageUnavailableError` when unreachable or `StorageError` on HTTP/API failure.
  * @param {{ fetchImpl?: typeof fetch, url: string, options?: RequestInit, unavailableOn404?: boolean }} params - Request params.
- * @returns {Promise<{ data: any, meta: object }>} Parsed response payload and metadata.
+ * @returns {Promise<{ data: any, meta: object, status: number }>} Parsed response payload and metadata.
  */
 export async function requestStorageJson({ fetchImpl = globalThis.fetch, url, options = {}, unavailableOn404 = false }) {
   let response;
@@ -56,7 +56,10 @@ export async function requestStorageJson({ fetchImpl = globalThis.fetch, url, op
     throw new StorageError('Invalid response received from backend voice storage.', parseErr);
   });
   if (!response.ok || envelope?.error) {
-    throw new StorageError(envelope?.error?.message || `Voice storage request failed (${response.status}).`);
+    const error = new StorageError(envelope?.error?.message || `Voice storage request failed (${response.status}).`);
+    error.code = envelope?.error?.code || error.code;
+    error.status = response.status;
+    throw error;
   }
-  return { data: envelope?.data ?? null, meta: envelope?.meta ?? {} };
+  return { data: envelope?.data ?? null, meta: envelope?.meta ?? {}, status: response.status };
 }

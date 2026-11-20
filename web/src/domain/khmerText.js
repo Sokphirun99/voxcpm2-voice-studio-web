@@ -2,6 +2,8 @@
  * @fileoverview Pure domain Khmer Unicode cleanup and spoken number/currency expansion for cleaner TTS synthesis.
  */
 
+import { preservePauseMarkers } from './pauseMarkers.js';
+
 const KHMER_SCRIPT_PATTERN = /[\u1780-\u17FF]/;
 const INVISIBLE_JUNK_PATTERN = /[\uFEFF\u00AD\u200C\u200D]/g;
 const BROKEN_VOWEL_O_PATTERN = /\u17C1\u17B6/g;
@@ -151,14 +153,14 @@ export function expandKhmerNumbers(rawText) {
   if (!KHMER_SCRIPT_PATTERN.test(text) && !/[\u17E0-\u17E9៛]/.test(text)) return text;
   const numPattern = '[0-9\u17E0-\u17E9]+(?:,[0-9\u17E0-\u17E9]{3})*(?:\\.[0-9\u17E0-\u17E9]+)?';
   const timePattern = '(?<![A-Za-z0-9_:.])([0-2]?[0-9]|[\u17E0-\u17E2]?[\u17E0-\u17E9]):([0-5][0-9]|[\u17E0-\u17E5][\u17E0-\u17E9])(?![A-Za-z0-9_:.])';
-  return text
+  return preservePauseMarkers(text, masked => masked
     .replace(new RegExp(`(${numPattern})\\s*°\\s*([CFcf])`, 'g'), (_, num, unit) => formatTemperatureTokenToKhmer(num, unit))
     .replace(new RegExp(timePattern, 'g'), formatTimeTokenToKhmer)
     .replace(new RegExp(`\\$\\s*(${numPattern})`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ដុល្លារ`)
     .replace(new RegExp(`(${numPattern})\\s*\\$`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ដុល្លារ`)
     .replace(new RegExp(`(${numPattern})\\s*៛`, 'g'), (_, num) => `${numberTokenToKhmer(num)}រៀល`)
     .replace(new RegExp(`(${numPattern})\\s*%`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ភាគរយ`)
-    .replace(new RegExp(`(?<![A-Za-z0-9_.])(${numPattern})(?![A-Za-z0-9_.])`, 'g'), (_, num) => numberTokenToKhmer(num));
+    .replace(new RegExp(`(?<![A-Za-z0-9_.])(${numPattern})(?![A-Za-z0-9_.])`, 'g'), (_, num) => numberTokenToKhmer(num)));
 }
 
 /**

@@ -33,6 +33,7 @@ class MediaJobPaths:
     audio_wav: Path
     ass_file: Path
     burned_mp4: Path
+    dubbed_mp4: Path
 
 
 def validate_job_id(job_id: str) -> str:
@@ -70,6 +71,7 @@ class MediaJobStore:
             audio_wav=root / "audio_16k.wav",
             ass_file=root / "subtitles.ass",
             burned_mp4=root / "subtitled.mp4",
+            dubbed_mp4=root / "dubbed.mp4",
         )
 
     def prune_expired(self, keep_slots: int | None = None) -> None:

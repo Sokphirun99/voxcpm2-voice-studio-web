@@ -28,6 +28,8 @@ def _create_fake_hf_repo(hub_dir: Path, repo_type: str, repo_id: str, payload_by
 def test_select_target_repos_rejects_invalid_scope() -> None:
     assert ("model", "metythorn/whisper-large-v3-turbo") in select_target_repos("unused")
     assert ("model", "openbmb/VoxCPM2") not in select_target_repos("unused")
+    assert ("model", "seanghay/whisper-small-khmer-v2") not in select_target_repos("unused")
+    assert ("model", "seanghay/whisper-small-khmer-v2") in select_target_repos("all")
     assert ("model", "openbmb/VoxCPM2") in select_target_repos("all")
     with pytest.raises(ValueError):
         select_target_repos("invalid")

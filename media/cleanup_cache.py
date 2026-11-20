@@ -17,7 +17,6 @@ UNUSED_BENCHMARK_REPOS: frozenset[tuple[str, str]] = frozenset({
     ("model", "Darayut/omniASR-CTC-1B-km-en"),
     ("model", "metythorn/whisper-large-v3-turbo"),
     ("model", "Vagabond404/khmer-asr-sota"),
-    ("model", "seanghay/whisper-small-khmer-v2"),
     ("dataset", "seanghay/khmer-dictionary-44k"),
     ("model", "phonsobon/khmer-english-spellchecker"),
     ("model", "metythorn/whisper-large-v3"),
@@ -31,6 +30,7 @@ ACTIVE_PROJECT_REPOS: frozenset[tuple[str, str]] = frozenset({
     ("model", "facebook/nllb-200-distilled-600M"),
     ("model", "mlx-community/whisper-large-v3-turbo"),
     ("model", "seanghay/Qwen3-ASR-0.6B-Khmer"),
+    ("model", "seanghay/whisper-small-khmer-v2"),
 })
 
 

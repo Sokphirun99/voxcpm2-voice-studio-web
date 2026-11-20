@@ -41,6 +41,7 @@ export function SubtitleExportDock({
   hasSubtitleText = hasSegments,
   selectedCount = 0,
   canBurn,
+  hasVideoJob = false,
   isAudioOnly = false,
   speakers = [],
   speakerNames = {},
@@ -59,6 +60,7 @@ export function SubtitleExportDock({
   const sendTtsLabel = selectedCount > 0 ? `Send selected to TTS (${selectedCount})` : 'Send to Text to speech';
   let burnTitle;
   if (isAudioOnly) burnTitle = 'MP4 burn-in is only available for video files';
+  else if (hasSegments && !hasVideoJob) burnTitle = 'Load a video and link it before exporting burned MP4';
   else if (hasSegments && !hasSubtitleText) burnTitle = 'Add subtitle text before exporting burned MP4';
   else if (hasSegments && !canBurn) burnTitle = 'MP4 burn-in requires FFmpeg with libass support';
   const isDockIdle = !hasSegments && !busy && !status?.error;
@@ -68,7 +70,7 @@ export function SubtitleExportDock({
         <ExportFormatButtons hasSegments={hasSegments} busy={busy} onExportFile={onExportFile} onCopyDialogue={onCopyDialogue} />
         <div className="subtitle-export-primary">
           <button type="button" id="subtitle-burn-btn" className="button button-secondary"
-            title={burnTitle} disabled={!hasSegments || !hasSubtitleText || !canBurn || isAudioOnly || busy} onClick={onBurnVideo}>
+            title={burnTitle} disabled={!hasSegments || !hasSubtitleText || !hasVideoJob || !canBurn || isAudioOnly || busy} onClick={onBurnVideo}>
             <Icon name="arrow_down_to_line" />
             <span>{busyAction === 'burn' ? 'Rendering MP4...' : 'Export burned MP4'}</span>
           </button>

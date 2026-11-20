@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createAudioMaster } from '../../server/audioMaster.js';
@@ -326,4 +326,325 @@ test('storage API reports accurate /api/v1/stats capacity and container memory u
     assert.equal(typeof container.rssBytes, 'number');
     assert.ok(container.rssBytes > 0);
   }, { maxRequests: 50 }, { maxCacheEntries: 5 });
+});
+
+test('storage API creates, lists, gets, updates, and soft-deletes subtitle projects', async () => {
+  await withStorageHandler(async ({ handler, dataDir, store }) => {
+    const projectId = '11111111-1111-1111-1111-111111111111';
+
+    // Create a subtitle project
+    const createRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: `/api/v1/projects/${projectId}`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'subtitle',
+        title: 'News Clip Subtitles',
+        payload: {
+          videoFileName: 'news.mp4',
+          segments: [{ id: 'seg-1', start: 0.0, end: 2.0, text: 'Hello world' }],
+          speakerNames: { 'speaker-1': 'Host' },
+          subtitleOptions: { sourceLanguage: 'en', targetLanguage: 'km' },
+        },
+      }),
+    });
+    assert.equal(createRes.status, 201, 'create should return 201');
+    assert.equal(createRes.json().data.project.kind, 'subtitle');
+    assert.equal(createRes.json().data.project.title, 'News Clip Subtitles');
+    assert.equal(createRes.json().data.project.id, projectId);
+    assert.ok(createRes.json().data.project.createdAt);
+    assert.ok(createRes.json().data.project.updatedAt);
+
+    // Create a TTS project
+    const ttsRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/22222222-2222-2222-2222-222222222222',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'tts',
+        title: 'Khmer TTS Script',
+        payload: { script: 'សួស្តី', voiceId: 'voice-1', ttsOptions: { guidance: 1.5 } },
+      }),
+    });
+    assert.equal(ttsRes.status, 201);
+
+    // List projects (paginated, sorted by updatedAt desc)
+    const listRes = await invokeApp(handler, { urlPath: '/api/v1/projects?limit=50&offset=0' });
+    assert.equal(listRes.status, 200);
+    assert.equal(listRes.json().meta.total, 2);
+    assert.equal(listRes.json().meta.limit, 50);
+    assert.equal(listRes.json().meta.offset, 0);
+    assert.equal(listRes.json().meta.hasMore, false);
+    assert.equal(listRes.json().data.items.length, 2);
+    assert.equal('items' in listRes.json().meta, false);
+    const ids = listRes.json().data.items.map(i => i.id);
+    assert.ok(ids.includes(projectId));
+    assert.ok(ids.includes('22222222-2222-2222-2222-222222222222'));
+    const subtitleItem = listRes.json().data.items.find(i => i.id === projectId);
+    assert.equal(subtitleItem.kind, 'subtitle');
+    const firstPage = await invokeApp(handler, { urlPath: '/api/v1/projects?limit=1&offset=0' });
+    assert.equal(firstPage.json().data.items.length, 1);
+    assert.equal(firstPage.json().meta.hasMore, true);
+
+    // Get full project snapshot
+    const getRes = await invokeApp(handler, { urlPath: `/api/v1/projects/${projectId}` });
+    assert.equal(getRes.status, 200);
+    assert.equal(getRes.json().data.project.id, projectId);
+    assert.equal(getRes.json().data.project.payload.videoFileName, 'news.mp4');
+    assert.equal(getRes.json().data.project.payload.segments.length, 1);
+    assert.equal(getRes.json().data.project.payload.speakerNames['speaker-1'], 'Host');
+
+    // Update project (should preserve createdAt)
+    const updateRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: `/api/v1/projects/${projectId}`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'subtitle',
+        title: 'News Clip Subtitles (revised)',
+        payload: { videoFileName: 'news.mp4', segments: [], speakerNames: {}, subtitleOptions: {} },
+      }),
+    });
+    assert.equal(updateRes.status, 200);
+    assert.equal(updateRes.json().data.project.title, 'News Clip Subtitles (revised)');
+    const createdAtBefore = createRes.json().data.project.createdAt;
+    assert.equal(updateRes.json().data.project.createdAt, createdAtBefore);
+    assert.notEqual(updateRes.json().data.project.updatedAt, createRes.json().data.project.updatedAt);
+
+    // Restart persistence: new store against same dataDir
+    const restartedStore = createStorageStore({ dataDir });
+    const persisted = await restartedStore.getProject(projectId);
+    assert.ok(persisted, 'project should persist across store restart');
+    assert.equal(persisted.title, 'News Clip Subtitles (revised)');
+    assert.equal(persisted.createdAt, createdAtBefore);
+
+    // Soft-delete
+    const delRes = await invokeApp(handler, { method: 'DELETE', urlPath: `/api/v1/projects/${projectId}` });
+    assert.equal(delRes.status, 200);
+    assert.equal(delRes.json().data.deleted, true);
+
+    // Soft-deleted project returns 404 on get
+    const getDeleted = await invokeApp(handler, { urlPath: `/api/v1/projects/${projectId}` });
+    assert.equal(getDeleted.status, 404);
+
+    // Delete again returns 404
+    const delAgain = await invokeApp(handler, { method: 'DELETE', urlPath: `/api/v1/projects/${projectId}` });
+    assert.equal(delAgain.status, 404);
+
+    // List no longer includes deleted project
+    const listAfterDelete = await invokeApp(handler, { urlPath: '/api/v1/projects' });
+    assert.equal(listAfterDelete.json().meta.total, 1);
+    assert.equal(listAfterDelete.json().data.items.length, 1);
+    assert.notEqual(listAfterDelete.json().data.items[0].id, projectId);
+  });
+});
+
+test('storage API rejects invalid project IDs and path traversal with 400', async () => {
+  await withStorageHandler(async ({ handler }) => {
+    // Non-UUID ID
+    const badId = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/not-a-uuid',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'subtitle', title: 'Bad', payload: {} }),
+    });
+    assert.equal(badId.status, 400);
+    assert.equal(badId.json().error.code, 'INVALID_PROJECT_ID');
+
+    // Raw path traversal must be rejected before URL normalization can hide the bad segment.
+    const traversal = await invokeApp(handler, { urlPath: '/api/v1/projects/../etc/passwd' });
+    assert.equal(traversal.status, 400);
+
+    // URL-encoded path traversal matches route but fails UUID validation
+    const encodedTraversal = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/..%2Fetc%2Fpasswd',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'subtitle', title: 'Bad', payload: {} }),
+    });
+    assert.equal(encodedTraversal.status, 400);
+    assert.equal(encodedTraversal.json().error.code, 'INVALID_PROJECT_ID');
+
+    // Missing project returns 404
+    const missing = await invokeApp(handler, { urlPath: '/api/v1/projects/33333333-3333-3333-3333-333333333333' });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.json().error.code, 'PROJECT_NOT_FOUND');
+
+    // Invalid kind returns 422
+    const badKind = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/44444444-4444-4444-4444-444444444444',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'invalid', title: 'Bad', payload: {} }),
+    });
+    assert.equal(badKind.status, 422);
+    assert.equal(badKind.json().error.code, 'INVALID_PROJECT_KIND');
+
+    // Missing title returns 422
+    const badTitle = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/55555555-5555-5555-5555-555555555555',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'subtitle', title: '', payload: {} }),
+    });
+    assert.equal(badTitle.status, 422);
+    assert.equal(badTitle.json().error.code, 'INVALID_PROJECT_TITLE');
+
+    // Non-object payload returns 422
+    const badPayload = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/66666666-6666-6666-6666-666666666666',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'subtitle', title: 'OK', payload: 'not-an-object' }),
+    });
+    assert.equal(badPayload.status, 422);
+    assert.equal(badPayload.json().error.code, 'INVALID_PROJECT_PAYLOAD');
+
+    const oversized = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/77777777-7777-7777-7777-777777777777',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'tts', title: 'Large', payload: { script: 'x'.repeat(256 * 1024) } }),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(oversized.json().error.code, 'PAYLOAD_TOO_LARGE');
+
+    const unsupportedType = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: '/api/v1/projects/88888888-8888-8888-8888-888888888888',
+      headers: { 'content-type': 'text/plain' },
+      body: '{}',
+    });
+    assert.equal(unsupportedType.status, 415);
+    assert.equal(unsupportedType.json().error.code, 'UNSUPPORTED_MEDIA_TYPE');
+  });
+});
+
+const JSON_HEADERS = { 'content-type': 'application/json' };
+const putGlossary = (handler, body, headers = JSON_HEADERS) => invokeApp(handler, {
+  method: 'PUT', urlPath: '/api/v1/glossary', headers, body: typeof body === 'string' ? body : JSON.stringify(body),
+});
+
+test('storage API persists the pronunciation glossary atomically in glossary.json across store restart', async () => {
+  await withStorageHandler(async ({ handler, dataDir }) => {
+    const empty = await invokeApp(handler, { urlPath: '/api/v1/glossary' });
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.json().data, { rules: [] });
+    assert.equal(empty.json().error, null);
+    assert.equal(empty.json().meta.count, 0);
+    assert.equal(empty.json().meta.maxRules, 200);
+
+    const saved = await putGlossary(handler, { rules: [
+      { id: 'r1', source: '  NASA ', replacement: 'ណាសា' },
+      { source: 'ភ្នំពេញ', replacement: 'ភ្នំ ពេញ', enabled: false },
+      { source: '$&', replacement: '$$' },
+    ] });
+    assert.equal(saved.status, 200);
+    const { rules } = saved.json().data;
+    assert.deepEqual(rules.map(item => [item.source, item.replacement, item.enabled]), [
+      ['NASA', 'ណាសា', true], ['ភ្នំពេញ', 'ភ្នំ ពេញ', false], ['$&', '$$', true],
+    ]);
+    assert.equal(saved.json().meta.count, 3);
+
+    const onDisk = JSON.parse(await readFile(path.join(dataDir, 'glossary.json'), 'utf8'));
+    assert.deepEqual(onDisk.rules, rules);
+    assert.deepEqual((await readdir(dataDir)).filter(name => name.endsWith('.tmp')), []);
+
+    const restartedHandler = createStorageHttpApp({
+      store: createStorageStore({ dataDir }), rateLimitOptions: { maxRequests: 100 }, logger: { debug() {}, info() {}, warn() {}, error() {} },
+    });
+    const reloaded = await invokeApp(restartedHandler, { urlPath: '/api/v1/glossary' });
+    assert.equal(reloaded.status, 200);
+    assert.deepEqual(reloaded.json().data.rules, rules);
+    assert.equal(reloaded.json().meta.updatedAt, onDisk.updatedAt);
+
+    const replaced = await putGlossary(restartedHandler, { rules: [{ source: 'AI', replacement: 'ay eye' }] });
+    assert.equal(replaced.status, 200);
+    const replacedDisk = JSON.parse(await readFile(path.join(dataDir, 'glossary.json'), 'utf8'));
+    assert.equal(replacedDisk.createdAt, onDisk.createdAt);
+    assert.equal(replacedDisk.rules.length, 1);
+
+    const cleared = await putGlossary(restartedHandler, { rules: [] });
+    assert.equal(cleared.status, 200);
+    assert.deepEqual((await invokeApp(restartedHandler, { urlPath: '/api/v1/glossary' })).json().data.rules, []);
+  });
+});
+
+test('storage API serializes concurrent glossary writes so glossary.json is always a complete valid snapshot', async () => {
+  await withStorageHandler(async ({ handler, dataDir }) => {
+    const writes = Array.from({ length: 8 }, (_, index) => putGlossary(handler, {
+      rules: Array.from({ length: index + 1 }, (_, ruleIndex) => ({ source: `term-${ruleIndex}`, replacement: `say-${index}` })),
+    }));
+    const results = await Promise.all(writes);
+    assert.ok(results.every(result => result.status === 200));
+    const onDisk = JSON.parse(await readFile(path.join(dataDir, 'glossary.json'), 'utf8'));
+    assert.equal(onDisk.rules.length, 8);
+    assert.ok(onDisk.rules.every(item => item.replacement === 'say-7'));
+    assert.deepEqual((await readdir(dataDir)).filter(name => name.endsWith('.tmp')), []);
+  });
+});
+
+test('storage API rejects invalid glossary payloads with truthful 400/405/415/422 envelopes and keeps stored rules', async () => {
+  await withStorageHandler(async ({ handler, dataDir }) => {
+    const good = await putGlossary(handler, { rules: [{ source: 'keep', replacement: 'me' }] });
+    assert.equal(good.status, 200);
+
+    const badShape = [
+      ['{not json', 'INVALID_JSON'],
+      [JSON.stringify([{ source: 'x' }]), 'INVALID_JSON_OBJECT'],
+      [JSON.stringify({}), 'INVALID_GLOSSARY_PAYLOAD'],
+      [JSON.stringify({ rules: 'nope' }), 'INVALID_GLOSSARY_PAYLOAD'],
+      [JSON.stringify({ rules: [], extra: true }), 'INVALID_GLOSSARY_PAYLOAD'],
+    ];
+    for (const [body, code] of badShape) {
+      const res = await putGlossary(handler, body);
+      assert.equal(res.status, 400, code);
+      assert.equal(res.json().error.code, code);
+      assert.equal(res.json().data, null);
+    }
+
+    const wrongType = await putGlossary(handler, '{"rules":[]}', { 'content-type': 'text/plain' });
+    assert.equal(wrongType.status, 415);
+
+    const tooMany = Array.from({ length: 201 }, (_, index) => ({ source: `t${index}`, replacement: 'x' }));
+    const semantic = [
+      [[{ source: '   ', replacement: 'x' }], 'EMPTY_GLOSSARY_SOURCE'],
+      [[{ replacement: 'x' }], 'EMPTY_GLOSSARY_SOURCE'],
+      [[{ source: 'a'.repeat(121), replacement: 'x' }], 'GLOSSARY_TERM_TOO_LONG'],
+      [[{ source: 'a', replacement: 'b'.repeat(121) }], 'GLOSSARY_TERM_TOO_LONG'],
+      [[{ source: 'a', replacement: 5 }], 'INVALID_GLOSSARY_TERM'],
+      [['bare string'], 'INVALID_GLOSSARY_RULE'],
+      [[{ source: 'dup', replacement: 'a' }, { source: 'dup', replacement: 'b' }], 'DUPLICATE_GLOSSARY_SOURCE'],
+      [tooMany, 'GLOSSARY_TOO_MANY_RULES'],
+    ];
+    for (const [rules, code] of semantic) {
+      const res = await putGlossary(handler, { rules });
+      assert.equal(res.status, 422, code);
+      assert.equal(res.json().error.code, code);
+      assert.equal(typeof res.json().meta.requestId, 'string');
+    }
+
+    const unsupportedVerb = await invokeApp(handler, { method: 'DELETE', urlPath: '/api/v1/glossary' });
+    assert.equal(unsupportedVerb.status, 405);
+    assert.equal(unsupportedVerb.headers.allow, 'GET, PUT');
+    assert.equal(unsupportedVerb.json().error.code, 'METHOD_NOT_ALLOWED');
+
+    const stillThere = await invokeApp(handler, { urlPath: '/api/v1/glossary' });
+    assert.deepEqual(stillThere.json().data.rules.map(item => item.source), ['keep']);
+    assert.deepEqual((await readdir(dataDir)).filter(name => name.endsWith('.tmp')), []);
+  });
+});
+
+test('storage API reports a corrupt glossary as 500 and lets a valid PUT repair it', async () => {
+  await withStorageHandler(async ({ handler, dataDir }) => {
+    await writeFile(path.join(dataDir, 'glossary.json'), '{"rules": [');
+    const broken = await invokeApp(handler, { urlPath: '/api/v1/glossary' });
+    assert.equal(broken.status, 500);
+    assert.equal(broken.json().data, null);
+    assert.ok(broken.json().error.code);
+
+    const repaired = await putGlossary(handler, { rules: [{ source: 'ok', replacement: 'fixed' }] });
+    assert.equal(repaired.status, 200);
+    assert.equal((await invokeApp(handler, { urlPath: '/api/v1/glossary' })).json().data.rules[0].replacement, 'fixed');
+  });
 });

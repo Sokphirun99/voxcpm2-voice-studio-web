@@ -2,7 +2,7 @@
 
 Local Apple Silicon FastAPI service (port `8810`) powering the **Video to subtitle** workspace in Voice Studio:
 
-- **Speech-to-text**: Hybrid ASR ([`asr.py`](./asr.py)) routing Khmer to `seanghay/Qwen3-ASR-0.6B-Khmer` (+ 3-layer local Khmer lexicon in [`khmer_dictionary.py`](./khmer_dictionary.py) & [`lexicon/`](./lexicon/)) and other languages to `mlx-community/whisper-large-v3-turbo`.
+- **Speech-to-text & Khmer verification**: Hybrid ASR ([`asr.py`](./asr.py), [`khmer_verifier.py`](./khmer_verifier.py)) routing Khmer to `seanghay/Qwen3-ASR-0.6B-Khmer` (+ 3-layer local Khmer lexicon in [`khmer_dictionary.py`](./khmer_dictionary.py) & [`lexicon/`](./lexicon/)), with automatic selective recovery on broken turns, optional full subtitle double-check, and TTS round-trip word QA (`POST /verify-speech`) via `seanghay/whisper-small-khmer-v2`; other languages use `mlx-community/whisper-large-v3-turbo`.
 - **Speaker diarization**: Optional offline `sherpa-onnx` pipeline ([`diarizer.py`](./diarizer.py)) with adaptive RMS energy VAD fallback when disabled.
 - **Offline translation**: Meta `facebook/nllb-200-distilled-600M` ([`translator.py`](./translator.py)) with source/output repetition guards and beam search.
 - **Subtitle export & burn-in**: Grapheme/Khmer-cluster-safe ASS/SRT/VTT generation ([`subtitles.py`](./subtitles.py)) and `ffmpeg-full` (`libass`) MP4 rendering ([`video_io.py`](./video_io.py)).
@@ -40,7 +40,7 @@ cd media && .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8810
 ## Local Model Caches (Not Committed to Git)
 
 Pretrained weights are cached outside this repository:
-- HuggingFace models (`~/.cache/huggingface/hub/`): `mlx-community/whisper-large-v3-turbo`, `seanghay/Qwen3-ASR-0.6B-Khmer`, `facebook/nllb-200-distilled-600M`
+- HuggingFace models (`~/.cache/huggingface/hub/`): `mlx-community/whisper-large-v3-turbo`, `seanghay/Qwen3-ASR-0.6B-Khmer`, `seanghay/whisper-small-khmer-v2`, `facebook/nllb-200-distilled-600M`
 - Diarization ONNX models (`~/.cache/voxcpm-media/diarization/`): downloaded lazily by [`diarizer.py`](./diarizer.py)
 
 See [`../AGENTS.md`](../AGENTS.md) for the upstream dependency & model update checklist.
