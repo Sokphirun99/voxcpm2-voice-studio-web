@@ -30,6 +30,20 @@
  */
 
 /**
+ * @typedef {object} ProjectRepositoryPort
+ * @property {(query?: { limit?: number, offset?: number }) => Promise<{ items: Array<object>, total: number, limit: number, offset: number, hasMore: boolean }>} listProjects
+ * @property {(id: string) => Promise<object|null>} getProject
+ * @property {(project: object) => Promise<{ project: object, isCreated: boolean }>} saveProject
+ * @property {(id: string) => Promise<{ deleted: boolean, id: string }>} deleteProject
+ */
+
+/**
+ * @typedef {object} GlossaryRepositoryPort
+ * @property {() => Promise<Array<{ id: string, source: string, replacement: string, enabled: boolean }>>} loadRules
+ * @property {(rules: Array<object>) => Promise<{ rules: Array<object>, localOnly: boolean }>} [saveRules]
+ */
+
+/**
  * @typedef {object} AudioDecoderPort
  * @property {(blob: Blob) => Promise<number[]>} decodePeaks
  * @property {(blob: Blob) => Promise<{ peaks: number[], duration: number }>} [decodeAudioSummary]

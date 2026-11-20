@@ -6,11 +6,29 @@ import subprocess
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from jobs import MediaJobStore
+from model_cache import MODEL_CACHE_REPOS, inspect_model_readiness
 from server import MediaServices, create_app
 from subtitles import SpeakerTurn
-from video_io import probe_video_dimensions, resolve_ffmpeg_bin
+from video_io import has_audio_stream, probe_video_dimensions, resolve_ffmpeg_bin
+
+
+def test_run_transcriber_does_not_retry_internal_type_error() -> None:
+    """A TypeError from inference must propagate instead of retrying without double-check options."""
+    import server as server_mod
+
+    calls: list[bool] = []
+
+    class _BrokenTranscriber:
+        def transcribe(self, wav_path: Path, language: str, turns: list, double_check: bool) -> dict:
+            calls.append(double_check)
+            raise TypeError("inference implementation failed")
+
+    with pytest.raises(TypeError, match="inference implementation failed"):
+        server_mod._run_transcriber(_BrokenTranscriber(), Path("audio.wav"), "km", [], double_check=True)
+    assert calls == [True]
 
 
 class _FakeTranscriber:
@@ -71,6 +89,14 @@ def _make_client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(services))
 
 
+def _seed_hf_cache(cache_root: Path, repo_ids: list[str]) -> None:
+    """Create minimal HuggingFace snapshot directories for the given repository IDs."""
+    for repo_id in repo_ids:
+        snapshot = cache_root / f"models--{repo_id.replace('/', '--')}" / "snapshots" / "0123456789abcdef"
+        snapshot.mkdir(parents=True, exist_ok=True)
+        (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
+
 def test_health_endpoint_reports_capabilities(tmp_path: Path) -> None:
     client = _make_client(tmp_path)
     res = client.get("/health")
@@ -82,6 +108,32 @@ def test_health_endpoint_reports_capabilities(tmp_path: Path) -> None:
     assert body["burnInSupported"] is True
     assert "whisperModel" in body
     assert body["khmerVerifierModel"] == "seanghay/whisper-small-khmer-v2"
+
+
+def test_health_reports_all_models_cached_from_local_cache(tmp_path: Path, monkeypatch) -> None:
+    cache_root = tmp_path / "hf"
+    _seed_hf_cache(cache_root, list(MODEL_CACHE_REPOS.values()))
+    monkeypatch.setattr("model_cache.are_diarization_models_ready", lambda: True)
+    monkeypatch.setattr("server.are_diarization_models_ready", lambda: True)
+    monkeypatch.setattr("server.inspect_model_readiness", lambda: inspect_model_readiness(cache_root))
+
+    body = _make_client(tmp_path).get("/health").json()
+
+    assert body["models"] == {"whisper": True, "khmerAsr": True, "translator": True, "diarization": True}
+    assert body["diarizationReady"] is True
+
+
+def test_health_reports_partially_cached_models_without_network(tmp_path: Path, monkeypatch) -> None:
+    cache_root = tmp_path / "hf"
+    _seed_hf_cache(cache_root, [MODEL_CACHE_REPOS["whisper"]])
+    monkeypatch.setattr("model_cache.are_diarization_models_ready", lambda: False)
+    monkeypatch.setattr("server.are_diarization_models_ready", lambda: False)
+    monkeypatch.setattr("server.inspect_model_readiness", lambda: inspect_model_readiness(cache_root))
+
+    body = _make_client(tmp_path).get("/health").json()
+
+    assert body["models"] == {"whisper": True, "khmerAsr": False, "translator": False, "diarization": False}
+    assert body["diarizationReady"] is False
 
 
 def test_transcribe_translate_and_burn_roundtrip(tmp_path: Path) -> None:
@@ -592,3 +644,183 @@ def test_transcribe_double_check_and_verify_speech_endpoint(tmp_path: Path) -> N
         data={"expected_text": "សួស្តី", "language": "km"},
     )
     assert bad_ext.status_code == 400
+
+
+def _make_wav_bytes(duration_seconds: float = 0.35, sample_rate: int = 48000) -> bytes:
+    """Build an in-memory mono 16-bit PCM WAV byte payload."""
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    num_frames = int(round(sample_rate * duration_seconds))
+    raw = b"".join((3000 if (i // 30) % 2 == 0 else -3000).to_bytes(2, "little", signed=True) for i in range(num_frames))
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(raw)
+    return buf.getvalue()
+
+
+def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path, monkeypatch) -> None:
+    """POST /dub exports valid time-aligned dubbed MP4s, validates inputs strictly, and runs off the event loop."""
+    import asyncio
+    import json
+    import threading
+    import httpx
+    import server as server_mod
+
+    sample_mp4 = tmp_path / "dub_source.mp4"
+    _make_sample_mp4(sample_mp4)
+    job_store = MediaJobStore(tmp_path / "dub-jobs")
+    services = MediaServices(
+        job_store=job_store,
+        transcriber=_FakeTranscriber(),
+        diarizer=_FakeDiarizer(),
+        translator=_FakeTranslator(),
+    )
+    app = create_app(services)
+    client = TestClient(app)
+
+    with open(sample_mp4, "rb") as fh:
+        tr = client.post("/transcribe", files={"file": ("news.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert tr.status_code == 200
+    job_id = tr.json()["jobId"]
+
+    wav_a = _make_wav_bytes(0.3)
+    wav_b = _make_wav_bytes(0.4)
+    meta = json.dumps([
+        {"segmentId": "seg-1", "start": 0.1, "end": 0.7, "fileIndex": 0},
+        {"segmentId": "seg-2", "start": 0.9, "end": 1.6, "fileIndex": 1},
+    ])
+
+    # 1. Valid roundtrips across duck, mute, and keep modes preserve 640x360 video + AAC audio and clean temp dirs
+    for mode in ("duck", "mute", "keep"):
+        res = client.post(
+            "/dub",
+            data={"jobId": job_id, "metadata": meta, "originalAudioMode": mode},
+            files=[
+                ("files", ("clip1.wav", wav_a, "audio/wav")),
+                ("files", ("clip2.wav", wav_b, "audio/wav")),
+            ],
+        )
+        assert res.status_code == 200, res.text
+        assert res.headers["content-type"] == "video/mp4"
+        out_mp4 = tmp_path / f"exported-{mode}.mp4"
+        out_mp4.write_bytes(res.content)
+        assert probe_video_dimensions(out_mp4) == (640, 360)
+        assert has_audio_stream(out_mp4) is True
+        job_dir = job_store.get_job(job_id).root
+        assert list(job_dir.glob("dub-*")) == []
+
+    # 2. Validation guards: bad mode, invalid/missing jobId, bad metadata, bad WAV magic bytes, and audio-only job
+    bad_mode = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": meta, "originalAudioMode": "loud"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav")), ("files", ("clip2.wav", wav_b, "audio/wav"))],
+    )
+    assert bad_mode.status_code == 400
+    empty_mode = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": meta, "originalAudioMode": " "},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav")), ("files", ("clip2.wav", wav_b, "audio/wav"))],
+    )
+    assert empty_mode.status_code == 400
+
+    bad_job = client.post(
+        "/dub",
+        data={"jobId": "../traversal", "metadata": meta, "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav")), ("files", ("clip2.wav", wav_b, "audio/wav"))],
+    )
+    assert bad_job.status_code == 400
+
+    missing_job = client.post(
+        "/dub",
+        data={"jobId": "abcdef0123456789", "metadata": meta, "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav")), ("files", ("clip2.wav", wav_b, "audio/wav"))],
+    )
+    assert missing_job.status_code == 404
+
+    bad_range = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 2.0, "end": 1.0, "fileIndex": 0}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert bad_range.status_code == 400
+
+    beyond_video = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 5.0, "end": 5.2, "fileIndex": 0}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert beyond_video.status_code == 400
+
+    bad_index = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 1.0, "fileIndex": 9}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert bad_index.status_code == 400
+
+    bad_wav = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 1.0, "fileIndex": 0}]), "originalAudioMode": "duck"},
+        files=[("files", ("fake.wav", b"NOT_A_REAL_WAV_HEADER" * 4, "audio/wav"))],
+    )
+    assert bad_wav.status_code == 400
+
+    with monkeypatch.context() as mp:
+        mp.setattr(server_mod, "MAX_DUB_CLIP_BYTES", 16)
+        oversized_wav = client.post(
+            "/dub",
+            data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 1.0, "fileIndex": 0}]), "originalAudioMode": "duck"},
+            files=[("files", ("large.wav", wav_a, "audio/wav"))],
+        )
+        assert oversized_wav.status_code == 413
+
+    # Audio-only job must be rejected with HTTP 400
+    audio_tr = client.post("/transcribe", files={"file": ("only.wav", wav_a, "audio/wav")}, data={"language": "en", "diarize": "false"})
+    assert audio_tr.status_code == 200
+    audio_dub = client.post(
+        "/dub",
+        data={"jobId": audio_tr.json()["jobId"], "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 0.3, "fileIndex": 0}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert audio_dub.status_code == 400
+
+    # 3. Non-blocking async execution: slow mux_dubbed_audio does not block concurrent /health
+    started = threading.Event()
+    release = threading.Event()
+    real_mux = server_mod.mux_dubbed_audio
+
+    def _slow_mux(source_video: Path, clips, output_mp4: Path, original_audio_mode: str = "duck") -> Path:
+        started.set()
+        assert release.wait(timeout=5.0)
+        return real_mux(source_video, clips, output_mp4, original_audio_mode=original_audio_mode)
+
+    monkeypatch.setattr(server_mod, "mux_dubbed_audio", _slow_mux)
+
+    async def exercise_async_dub() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            dub_task = asyncio.create_task(
+                async_client.post(
+                    "/dub",
+                    data={"jobId": job_id, "metadata": meta, "originalAudioMode": "duck"},
+                    files=[
+                        ("files", ("clip1.wav", wav_a, "audio/wav")),
+                        ("files", ("clip2.wav", wav_b, "audio/wav")),
+                    ],
+                )
+            )
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            assert health_res.json()["ok"] is True
+            release.set()
+            dub_res = await dub_task
+            assert dub_res.status_code == 200
+            assert dub_res.headers["content-type"] == "video/mp4"
+
+    asyncio.run(exercise_async_dub())

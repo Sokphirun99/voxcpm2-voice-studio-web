@@ -1,15 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEFAULT_DUB_AUDIO_MODE,
+  DUB_AUDIO_MODE_OPTIONS,
+  SUBTITLE_VOICEOVER_GAP_OPTIONS,
+  SUBTITLE_VOICEOVER_PAUSE_MS,
   buildCombinedVoiceoverBlob,
+  buildDubDownloadFilename,
+  buildDubExportClips,
   buildSubtitleSpeechSignature,
   buildSubtitleSynthesisCommand,
   buildVoiceoverDownloadFilename,
+  formatSubtitleVoiceoverGapLabel,
   isKhmerScriptText,
+  normalizeDubAudioMode,
+  normalizeSubtitleVoiceoverGapMs,
   resolveSubtitleSpeechText,
   selectOrderedSegments,
 } from '../../src/domain/subtitleTts.js';
-import { readWavDurationSeconds } from '../../src/domain/wavCodec.js';
+import { inspectWavBuffer, readWavDurationSeconds } from '../../src/domain/wavCodec.js';
 
 function createPcmWavBlob(durationMs = 100, sampleRate = 16000) {
   const numSamples = Math.round((sampleRate * durationMs) / 1000);
@@ -31,7 +40,7 @@ function createPcmWavBlob(durationMs = 100, sampleRate = 16000) {
   writeTag(36, 'data');
   view.setUint32(40, dataSize, true);
   for (let i = 0; i < numSamples; i++) {
-    view.setInt16(44 + i * 2, Math.round(Math.sin(i / 8) * 12000), true);
+    view.setInt16(44 + i * 2, i % 2 === 0 ? 4000 : -4000, true);
   }
   return new Blob([buf], { type: 'audio/wav' });
 }
@@ -75,16 +84,70 @@ test('subtitleTts resolves active speech text, Khmer auto-formatting, signatures
   assert.equal(buildVoiceoverDownloadFilename(null, '-voiceover'), 'subtitle-voiceover.wav');
 });
 
-test('buildCombinedVoiceoverBlob handles empty, single, and stitched multi-frame PCM WAV clips cleanly', async () => {
+test('buildCombinedVoiceoverBlob handles empty, single, and exact multi-frame PCM WAV durations across all gap presets', async () => {
   assert.equal(await buildCombinedVoiceoverBlob([]), null);
+  assert.equal(SUBTITLE_VOICEOVER_PAUSE_MS, 200);
+  assert.deepEqual(
+    SUBTITLE_VOICEOVER_GAP_OPTIONS.map(option => [option.ms, option.label]),
+    [[100, '0.1s'], [200, '0.2s'], [500, '0.5s'], [1000, '1.0s']]
+  );
+  assert.equal(normalizeSubtitleVoiceoverGapMs(100), 100);
+  assert.equal(normalizeSubtitleVoiceoverGapMs('500'), 500);
+  assert.equal(normalizeSubtitleVoiceoverGapMs(1000), 1000);
+  assert.equal(normalizeSubtitleVoiceoverGapMs(999), 200);
+  assert.equal(normalizeSubtitleVoiceoverGapMs('bad'), 200);
+  assert.equal(formatSubtitleVoiceoverGapLabel(1000), '1.0s');
+  assert.equal(formatSubtitleVoiceoverGapLabel(null), '0.2s');
 
-  const clip1 = createPcmWavBlob(120);
-  const clip2 = createPcmWavBlob(120);
+  const clip1 = createPcmWavBlob(200);
+  const clip2 = createPcmWavBlob(300);
+  const clip3 = createPcmWavBlob(250);
   const single = await buildCombinedVoiceoverBlob([clip1]);
   assert.equal(single.type, 'audio/wav');
+  assert.equal(readWavDurationSeconds(await single.arrayBuffer()), 0.2);
 
-  const combined = await buildCombinedVoiceoverBlob([clip1, clip2], 200);
-  assert.equal(combined.type, 'audio/wav');
-  const duration = readWavDurationSeconds(await combined.arrayBuffer());
-  assert.ok(duration > 0.35 && duration < 0.6, `Expected combined WAV duration ~0.44s, got ${duration}`);
+  // Default pause (omitted arg) must equal 200ms (0.2s) between each pair of clips.
+  const defaultCombined = await buildCombinedVoiceoverBlob([clip1, clip2, clip3]);
+  assert.equal(readWavDurationSeconds(await defaultCombined.arrayBuffer()), (200 + 200 + 300 + 200 + 250) / 1000);
+
+  // Verify exact PCM WAV duration and byte size for every gap selector preset (0.1s, 0.2s, 0.5s, 1.0s).
+  for (const { ms } of SUBTITLE_VOICEOVER_GAP_OPTIONS) {
+    const combined = await buildCombinedVoiceoverBlob([clip1, clip2, clip3], ms);
+    const buffer = await combined.arrayBuffer();
+    const info = inspectWavBuffer(buffer);
+    const expectedSeconds = (200 + 300 + 250 + ms * 2) / 1000;
+    assert.equal(combined.type, 'audio/wav');
+    assert.equal(readWavDurationSeconds(buffer), expectedSeconds);
+    assert.equal(info.dataSize, Math.round(expectedSeconds * 16000) * 2);
+  }
+});
+
+test('subtitleTts normalizes dub audio modes, collects ordered dub clips, and formats dubbed filenames', () => {
+  assert.equal(DEFAULT_DUB_AUDIO_MODE, 'duck');
+  assert.deepEqual(
+    DUB_AUDIO_MODE_OPTIONS.map(option => [option.id, option.label]),
+    [['duck', 'Duck (-16 dB)'], ['mute', 'Mute original'], ['keep', 'Keep original']]
+  );
+  assert.equal(normalizeDubAudioMode('mute'), 'mute');
+  assert.equal(normalizeDubAudioMode(' KEEP '), 'keep');
+  assert.equal(normalizeDubAudioMode('loud'), 'duck');
+  assert.equal(buildDubDownloadFilename({ name: 'interview.mov' }), 'interview-dubbed.mp4');
+  assert.equal(buildDubDownloadFilename(null), 'subtitle-dubbed.mp4');
+
+  const blobA = createPcmWavBlob(100);
+  const blobB = createPcmWavBlob(100);
+  const segments = [
+    { id: 'seg-1', start: 0.2, end: 1.4 },
+    { id: 'seg-2', start: 2.0, end: 3.1 },
+    { id: 'seg-3', start: 3.5, end: 4.5 },
+  ];
+  const clips = { 'seg-1': { blob: blobA }, 'seg-3': { blob: blobB } };
+  assert.deepEqual(
+    buildDubExportClips(segments, ['seg-3'], clips).map(c => [c.segmentId, c.start, c.end]),
+    [['seg-3', 3.5, 4.5]]
+  );
+  assert.deepEqual(
+    buildDubExportClips(segments, [], clips).map(c => [c.segmentId, c.start, c.end]),
+    [['seg-1', 0.2, 1.4], ['seg-3', 3.5, 4.5]]
+  );
 });

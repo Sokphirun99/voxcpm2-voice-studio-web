@@ -3,7 +3,6 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { createMediaSubtitleGateway } from '../../data/mediaSubtitleGateway.js';
 import { resolveVerificationLanguage } from '../../domain/speechVerification.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
@@ -12,11 +11,6 @@ const INITIAL_VERIFICATION = Object.freeze({
   result: null,
   error: '',
 });
-
-function resolveVerifierGateway(services) {
-  if (services?.mediaSubtitleGateway?.verifySpeech) return services.mediaSubtitleGateway;
-  return createMediaSubtitleGateway({ logger: services?.logger });
-}
 
 /**
  * Coordinates abortable round-trip speech verification (`POST /media_api/verify-speech`) for generated TTS recordings.
@@ -29,7 +23,7 @@ function resolveVerifierGateway(services) {
  */
 export function useSpeechVerification({ recording, autoVerify = false }) {
   const services = useStudioServices();
-  const gateway = useMemo(() => resolveVerifierGateway(services), [services]);
+  const gateway = useMemo(() => services?.mediaSubtitleGateway || null, [services]);
   const abortRef = useRef(null);
   const seqRef = useRef(0);
   const seenRecordingIdRef = useRef(recording?.id || '');
@@ -42,6 +36,10 @@ export function useSpeechVerification({ recording, autoVerify = false }) {
 
   const runVerification = useCallback(async target => {
     if (!target?.blob || !target?.transcript?.trim()) return;
+    if (typeof gateway?.verifySpeech !== 'function') {
+      setState({ checking: false, result: null, error: 'Speech verification is unavailable in this environment.' });
+      return;
+    }
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;

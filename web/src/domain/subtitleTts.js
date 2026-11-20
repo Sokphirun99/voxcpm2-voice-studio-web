@@ -8,9 +8,66 @@ import { concatenateWavBlobs, ensureAudioWavBlob } from './wavCodec.js';
 
 export const DEFAULT_SUBTITLE_TTS_GUIDANCE = 2;
 export const DEFAULT_SUBTITLE_TTS_STEPS = DEFAULT_STEPS;
-export const SUBTITLE_VOICEOVER_PAUSE_MS = 220;
+export const SUBTITLE_VOICEOVER_GAP_OPTIONS = Object.freeze([
+  Object.freeze({ ms: 100, label: '0.1s' }),
+  Object.freeze({ ms: 200, label: '0.2s' }),
+  Object.freeze({ ms: 500, label: '0.5s' }),
+  Object.freeze({ ms: 1000, label: '1.0s' }),
+]);
+export const SUBTITLE_VOICEOVER_PAUSE_MS = 200;
+export const DUB_AUDIO_MODE_OPTIONS = Object.freeze([
+  Object.freeze({ id: 'duck', label: 'Duck (-16 dB)' }),
+  Object.freeze({ id: 'mute', label: 'Mute original' }),
+  Object.freeze({ id: 'keep', label: 'Keep original' }),
+]);
+export const DEFAULT_DUB_AUDIO_MODE = 'duck';
 
+const VALID_SUBTITLE_VOICEOVER_GAPS = new Set(SUBTITLE_VOICEOVER_GAP_OPTIONS.map(option => option.ms));
+const VALID_DUB_AUDIO_MODES = new Set(DUB_AUDIO_MODE_OPTIONS.map(option => option.id));
 const KHMER_SCRIPT_PATTERN = /[\u1780-\u17FF]/;
+
+/**
+ * Validates a dubbed MP4 original-audio mix mode against `duck`, `mute`, and `keep`.
+ * Inputs: candidate mode string.
+ * Outputs: normalized mode string, defaulting to `DEFAULT_DUB_AUDIO_MODE` (`'duck'`).
+ * Side effects: none.
+ * Failure modes: returns `'duck'` for unrecognized or non-string inputs.
+ * @param {unknown} rawMode - Candidate mix mode.
+ * @returns {'duck'|'mute'|'keep'} Validated mix mode.
+ */
+export function normalizeDubAudioMode(rawMode) {
+  const cleaned = typeof rawMode === 'string' ? rawMode.trim().toLowerCase() : '';
+  return VALID_DUB_AUDIO_MODES.has(cleaned) ? cleaned : DEFAULT_DUB_AUDIO_MODE;
+}
+
+/**
+ * Validates a subtitle voiceover pause gap against the supported selector presets (`100`, `200`, `500`, `1000` ms).
+ * Inputs: candidate gap duration in milliseconds.
+ * Outputs: supported preset duration in milliseconds, defaulting to `SUBTITLE_VOICEOVER_PAUSE_MS` (`200`).
+ * Side effects: none.
+ * Failure modes: returns `200` for unrecognized, non-numeric, or empty values.
+ * @param {unknown} rawMs - Candidate pause duration in milliseconds.
+ * @returns {number} Validated pause gap in milliseconds.
+ */
+export function normalizeSubtitleVoiceoverGapMs(rawMs) {
+  const numeric = Number(rawMs);
+  return VALID_SUBTITLE_VOICEOVER_GAPS.has(numeric) ? numeric : SUBTITLE_VOICEOVER_PAUSE_MS;
+}
+
+/**
+ * Formats a subtitle voiceover gap in milliseconds into its short human label (`0.2s`).
+ * Inputs: gap duration in milliseconds.
+ * Outputs: formatted seconds label.
+ * Side effects: none.
+ * Failure modes: falls back to the default `0.2s` label for unrecognized values.
+ * @param {unknown} rawMs - Pause gap in milliseconds.
+ * @returns {string} Compact label such as `0.2s` or `1.0s`.
+ */
+export function formatSubtitleVoiceoverGapLabel(rawMs) {
+  const normalized = normalizeSubtitleVoiceoverGapMs(rawMs);
+  const match = SUBTITLE_VOICEOVER_GAP_OPTIONS.find(option => option.ms === normalized);
+  return match ? match.label : '0.2s';
+}
 
 /**
  * Returns true when `text` contains Khmer Unicode characters so Khmer number normalization applies automatically.
@@ -128,4 +185,40 @@ export async function buildCombinedVoiceoverBlob(blobs, pauseMs = SUBTITLE_VOICE
 export function buildVoiceoverDownloadFilename(videoFile, suffix = '-voiceover') {
   const stem = String(videoFile?.name || 'subtitle').replace(/\.[^.]+$/, '') || 'subtitle';
   return `${stem}${suffix}.wav`;
+}
+
+/**
+ * Collects time-aligned WAV clips for dubbed MP4 export, respecting selected frames when any selected frame has audio.
+ * Inputs: ordered `segments`, `selectedIds`, and `segmentClips` map.
+ * Outputs: ordered array of `{ segmentId, start, end, blob }`.
+ * Side effects: none.
+ * Failure modes: returns `[]` when no matching segments have generated audio blobs.
+ * @param {Array<{ id: string, start?: number, end?: number }>} segments - Timeline subtitle segments.
+ * @param {Iterable<string>|null|undefined} selectedIds - Active selection IDs.
+ * @param {Record<string, { blob?: Blob }>} segmentClips - Generated clip records keyed by segment ID.
+ * @returns {Array<{ segmentId: string, start: number, end: number, blob: Blob }>} Ordered dub clips.
+ */
+export function buildDubExportClips(segments, selectedIds, segmentClips) {
+  if (!Array.isArray(segments) || !segments.length || !segmentClips) return [];
+  const selected = selectOrderedSegments(segments, selectedIds).filter(seg => Boolean(segmentClips[seg.id]?.blob));
+  const matched = selected.length > 0 ? selected : segments.filter(seg => Boolean(segmentClips[seg.id]?.blob));
+  return matched.map(seg => {
+    const start = Number.isFinite(Number(seg.start)) ? Math.max(0, Number(seg.start)) : 0;
+    const rawEnd = Number.isFinite(Number(seg.end)) ? Number(seg.end) : start;
+    return { segmentId: seg.id, start, end: Math.max(start, rawEnd), blob: segmentClips[seg.id].blob };
+  });
+}
+
+/**
+ * Derives a clean `-dubbed.mp4` export filename from the active video file.
+ * Inputs: optional `videoFile`.
+ * Outputs: sanitized filename ending in `-dubbed.mp4`.
+ * Side effects: none.
+ * Failure modes: falls back to `subtitle-dubbed.mp4` when filename is unavailable.
+ * @param {{ name?: string }|null|undefined} videoFile - Source video file.
+ * @returns {string} Export filename ending in `-dubbed.mp4`.
+ */
+export function buildDubDownloadFilename(videoFile) {
+  const stem = String(videoFile?.name || 'subtitle').replace(/\.[^.]+$/, '') || 'subtitle';
+  return `${stem}-dubbed.mp4`;
 }

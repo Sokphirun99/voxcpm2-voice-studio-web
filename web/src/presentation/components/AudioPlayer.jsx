@@ -234,6 +234,53 @@ function SpeechVerificationPanel({ verification }) {
 }
 
 /**
+ * Formats one take pill label as `Take N · m:ss` when duration metadata is available.
+ * @param {object} take - Session recording.
+ * @param {number} index - Zero-based take index.
+ * @returns {string} Accessible take label.
+ */
+function formatTakeLabel(take, index) {
+  const label = `Take ${index + 1}`;
+  const seconds = take?.audioDurationSeconds;
+  return Number.isFinite(seconds) && seconds > 0 ? `${label} · ${formatTime(seconds)}` : label;
+}
+
+/**
+ * Renders compact A/B take selector pills for the bounded session history.
+ * @param {{ takes: object[], activeTakeId: string|null, onSelectTake?: Function, onDeleteTake?: Function }} props - Take history props.
+ * @returns {React.ReactElement|null} Take strip or null when fewer than two takes exist.
+ */
+function TakeHistoryPills({ takes, activeTakeId, onSelectTake, onDeleteTake }) {
+  if (!Array.isArray(takes) || takes.length <= 1) return null;
+  return (
+    <div className="take-history" role="group" aria-label="Generated takes">
+      <span className="take-history-label" aria-hidden="true">Takes</span>
+      <div className="take-history-pills">
+        {takes.map((take, index) => {
+          const label = formatTakeLabel(take, index);
+          const isActive = take.id === activeTakeId;
+          const detail = [take.characterName, take.transcript].filter(Boolean).join(' · ');
+          return (
+            <span className={isActive ? 'take-pill-group is-active' : 'take-pill-group'} key={take.id}>
+              <button type="button" className="button take-pill" aria-pressed={isActive}
+                aria-label={label} title={detail || label} onClick={() => onSelectTake?.(take.id)}>
+                {label}
+              </button>
+              {isActive && onDeleteTake && (
+                <button type="button" className="button take-pill-delete" aria-label={`Delete ${label}`}
+                  title={`Delete ${label}`} onClick={() => onDeleteTake(take.id)}>
+                  <Icon name="xmark" />
+                </button>
+              )}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
  * Renders play/pause, waveform scrubber, optional Whisper word-check button, character voice-pin button, and WAV download link.
  * @param {object} props - Controls props.
  * @returns {React.ReactElement} Player controls row.
@@ -355,15 +402,15 @@ function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError
 }
 
 /**
- * Renders the playback dock with status line, play/pause toggle, waveform scrubber, character lock, and WAV download.
- * Inputs: `{ recording, activeCharacter, activeAnchor, status, onPinTake, onPlaybackError }`.
+ * Renders the playback dock with status line, play/pause toggle, waveform scrubber, take A/B pills, character lock, and WAV download.
+ * Inputs: `{ recording, takes, activeTakeId, activeCharacter, activeAnchor, status, onPinTake, onSelectTake, onDeleteTake, onPlaybackError }`.
  * Outputs: `<section className="playback">` element.
  * Side effects: mounts a fresh `<audio>` per recording URL, tracks playback timing, and delegates decoding to `useRecordingMedia`.
  * Failure modes: calls `onPlaybackError` if `<audio>` fails to load or `play()` rejects.
  * @param {object} props - Player props.
  * @returns {React.ReactElement} Audio player dock.
  */
-export function AudioPlayer({ recording, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onPlaybackError }) {
+export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError }) {
   const { logger } = useStudioServices();
   const audio = useRef(null);
   const [media, setMedia] = useRecordingMedia(recording);
@@ -383,6 +430,8 @@ export function AudioPlayer({ recording, activeCharacter, activeAnchor, status, 
       <PlaybackControls media={media} recording={recording} activeCharacter={activeCharacter}
         activeAnchor={activeAnchor} verification={verification} onSeek={handleSeek} onPinTake={onPinTake}
         onTogglePlay={() => void toggleAudioElement({ element: audio.current, logger, onPlaybackError })} />
+      <TakeHistoryPills takes={takes} activeTakeId={activeTakeId || recording?.id || null}
+        onSelectTake={onSelectTake} onDeleteTake={onDeleteTake} />
       <SpeechVerificationPanel verification={verification} />
       <PlaybackAudioElement audioRef={audio} url={media.url} logger={logger} setMedia={setMedia} onPlaybackError={onPlaybackError} />
     </section>

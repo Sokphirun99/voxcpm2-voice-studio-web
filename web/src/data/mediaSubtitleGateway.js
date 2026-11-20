@@ -9,13 +9,32 @@ const TRANSCRIBE_ENDPOINT = '/media_api/transcribe';
 const TRANSLATE_ENDPOINT = '/media_api/translate';
 const BURN_ENDPOINT = '/media_api/burn';
 const VERIFY_SPEECH_ENDPOINT = '/media_api/verify-speech';
+const DUB_ENDPOINT = '/media_api/dub';
 const HEALTH_TIMEOUT_MS = 3000;
+const MODEL_READINESS_DEFAULTS = Object.freeze({
+  whisper: true,
+  khmerAsr: true,
+  translator: true,
+  diarization: true,
+});
 const HTML_ERROR_MESSAGES = Object.freeze({
   413: 'Media file exceeds the server upload limit (HTTP 413).',
   502: 'Could not reach the local video subtitle service (HTTP 502). Check that media service is running.',
   503: 'The local video subtitle service is temporarily unavailable (HTTP 503).',
   504: 'Video subtitle processing timed out via proxy (HTTP 504).',
 });
+
+/**
+ * Normalizes local model-cache readiness, defaulting absent legacy fields to ready so the UI stays silent.
+ * @param {unknown} models - Raw `models` payload from `/health`.
+ * @returns {{ whisper: boolean, khmerAsr: boolean, translator: boolean, diarization: boolean }} Safe readiness flags.
+ */
+function normalizeModelReadiness(models) {
+  const source = models && typeof models === 'object' ? models : {};
+  return Object.fromEntries(
+    Object.entries(MODEL_READINESS_DEFAULTS).map(([key, fallback]) => [key, typeof source[key] === 'boolean' ? source[key] : fallback])
+  );
+}
 
 /**
  * Checks whether an error reflects an aborted Fetch call.
@@ -90,9 +109,32 @@ function buildVerifySpeechFormData({ blob, expectedText, language = 'km', fileNa
 }
 
 /**
+ * Builds the multipart FormData payload for time-aligned dubbed MP4 export (`/media_api/dub`).
+ * @param {{ jobId: string, clips: Array<{ segmentId: string, start: number, end: number, blob: Blob }>, originalAudioMode?: string }} spec - Dub export inputs.
+ * @returns {FormData} Multipart payload containing jobId, originalAudioMode, metadata JSON, and WAV files.
+ */
+function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck' }) {
+  const form = new FormData();
+  form.append('jobId', String(jobId || ''));
+  form.append('originalAudioMode', String(originalAudioMode || 'duck'));
+  const metadata = clips.map((clip, fileIndex) => {
+    const fileName = `dub-clip-${String(fileIndex + 1).padStart(3, '0')}.wav`;
+    form.append('files', clip.blob, fileName);
+    return {
+      segmentId: String(clip.segmentId || `seg-${fileIndex + 1}`),
+      start: Number(clip.start) || 0,
+      end: Number(clip.end) || 0,
+      fileIndex,
+    };
+  });
+  form.append('metadata', JSON.stringify(metadata));
+  return form;
+}
+
+/**
  * Creates the local Video Subtitle Gateway backed by `/media_api`.
  * Inputs: optional `{ fetchImpl, logger }`.
- * Outputs: `{ checkHealth, transcribeVideo, translateSegments, burnSubtitles }`.
+ * Outputs: `{ checkHealth, transcribeVideo, translateSegments, burnSubtitles, verifySpeech, exportDubbedVideo }`.
  * Side effects: performs HTTP multipart/JSON calls against `/media_api`.
  * Failure modes: throws SynthesisCancelledError on abort or SynthesisError on network/server failure.
  * @param {{ fetchImpl?: typeof fetch, logger?: { error?: Function, warn?: Function } }} [deps] - Gateway dependencies.
@@ -107,7 +149,12 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
         const res = await fetchImpl(HEALTH_ENDPOINT, { cache: 'no-store', signal: controller.signal });
         if (!res.ok) return { online: false, reason: `Video subtitle service returned HTTP ${res.status}.` };
         const data = await res.json();
-        return { online: true, burnInSupported: Boolean(data?.burnInSupported), diarizationReady: Boolean(data?.diarizationReady) };
+        return {
+          online: true,
+          burnInSupported: Boolean(data?.burnInSupported),
+          diarizationReady: Boolean(data?.diarizationReady),
+          models: normalizeModelReadiness(data?.models),
+        };
       } catch (err) {
         return { online: false, reason: err?.message || 'Cannot reach local video subtitle service on port 8810.' };
       } finally {
@@ -193,6 +240,23 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
         if (err instanceof SynthesisError) throw err;
         logger?.error?.('mediaSubtitleGateway.verifySpeech', err);
         throw new SynthesisError('Could not reach the local speech verification service on port 8810.');
+      }
+    },
+
+    async exportDubbedVideo({ jobId, clips = [], originalAudioMode = 'duck', signal }) {
+      try {
+        const res = await fetchImpl(DUB_ENDPOINT, {
+          method: 'POST',
+          body: buildDubVideoFormData({ jobId, clips, originalAudioMode }),
+          signal,
+        });
+        if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not export dubbed MP4'), { status: res.status });
+        return await res.blob();
+      } catch (err) {
+        if (isAbortError(err)) throw new SynthesisCancelledError('Dubbed video export cancelled.');
+        if (err instanceof SynthesisError) throw err;
+        logger?.error?.('mediaSubtitleGateway.exportDubbedVideo', err);
+        throw new SynthesisError('Could not render dubbed MP4 video. Check that media service is running.');
       }
     },
   };

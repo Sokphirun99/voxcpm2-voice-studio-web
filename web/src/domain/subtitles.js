@@ -3,6 +3,7 @@
  */
 
 import { MAX_SCRIPT_LENGTH, countGraphemes } from './presets.js';
+import { ValidationError } from './errors.js';
 export {
   DEFAULT_ENGLISH_TARGET,
   DEFAULT_KHMER_TARGET,
@@ -52,10 +53,37 @@ export const SUBTITLE_STYLE_DEFAULTS = Object.freeze({
   backgroundStyle: 'box',
 });
 
+export const MODEL_DOWNLOAD_HINTS = Object.freeze({
+  whisper: 'First-time transcription will download Whisper Large-v3-Turbo (~1.5 GB).',
+  khmerAsr: 'First-time Khmer speech recognition will download Qwen3-ASR-0.6B-Khmer (~1.5 GB).',
+  translator: 'First-time translation will download NLLB-200 (~2.4 GB).',
+  diarization: 'First-time speaker detection will download diarization models (~35 MB).',
+});
+
+/**
+ * Resolves download hints for models required by the features currently enabled.
+ * @param {{ whisper?: boolean, khmerAsr?: boolean, translator?: boolean, diarization?: boolean } | null} models - Local cache readiness.
+ * @param {{ sourceLanguage?: string, detectSpeakers?: boolean, doubleCheckKhmer?: boolean, translateToKhmer?: boolean }} [options] - Active extraction options.
+ * @returns {string[]} Ordered hint messages; empty when every required model is cached or readiness is unknown.
+ */
+export function resolveModelReadinessHints(models, options = {}) {
+  if (!models || typeof models !== 'object') return [];
+  const missing = key => models[key] === false;
+  const khmerSource = options.sourceLanguage === 'km' || options.sourceLanguage === 'auto';
+  const needsKhmerAsr = khmerSource || Boolean(options.doubleCheckKhmer);
+  const hints = [];
+  if (missing('whisper')) hints.push(MODEL_DOWNLOAD_HINTS.whisper);
+  if (needsKhmerAsr && missing('khmerAsr')) hints.push(MODEL_DOWNLOAD_HINTS.khmerAsr);
+  if (options.detectSpeakers && missing('diarization')) hints.push(MODEL_DOWNLOAD_HINTS.diarization);
+  if (options.translateToKhmer && missing('translator')) hints.push(MODEL_DOWNLOAD_HINTS.translator);
+  return hints;
+}
+
 const AUDIO_ONLY_EXT_PATTERN = /\.(mp3|wav|m4a|aac|ogg|flac)$/i;
 const VIDEO_EXT_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi)$/i;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 export const MIN_SPLIT_GAP_SEC = 0.1;
+export const MAX_SUBTITLE_FILE_BYTES = 2 * 1024 * 1024;
 
 /**
  * Formats seconds as `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` (VTT).
@@ -70,6 +98,157 @@ export function formatSubtitleTime(seconds, decimalSep = ',') {
   const secs = Math.floor((safeMs % 60_000) / 1000);
   const ms = safeMs % 1000;
   return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}${decimalSep}${String(ms).padStart(3, '0')}`;
+}
+
+const SUBTITLE_TIMESTAMP_PATTERNS = Object.freeze({
+  srt: /^(\d{2,}):([0-5]\d):([0-5]\d),(\d{3})$/,
+  vtt: /^(?:(\d{2,}):)?([0-5]\d):([0-5]\d)\.(\d{3})$/,
+});
+
+/**
+ * Normalizes subtitle text and rejects unreadable or oversized files.
+ * @param {string} rawText - UTF-8 subtitle file content.
+ * @returns {string} LF-normalized content without a BOM.
+ */
+function normalizeSubtitleInput(rawText) {
+  if (typeof rawText !== 'string') {
+    throw new ValidationError('Subtitle file must contain text.', 'file', 'INVALID_SUBTITLE_FILE');
+  }
+  if (new TextEncoder().encode(rawText).byteLength > MAX_SUBTITLE_FILE_BYTES) {
+    throw new ValidationError('Subtitle files must be 2 MB or smaller.', 'file', 'SUBTITLE_FILE_TOO_LARGE');
+  }
+  return rawText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+}
+
+/**
+ * Parses one `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` / `MM:SS.mmm` (VTT) timestamp.
+ * @param {string} raw - Timestamp token.
+ * @param {'srt'|'vtt'} format - Timestamp dialect.
+ * @returns {number|null} Seconds, or null when malformed.
+ */
+function parseCueTimestamp(raw, format) {
+  const match = SUBTITLE_TIMESTAMP_PATTERNS[format]?.exec(raw.trim());
+  if (!match) return null;
+  const [, hours = '0', minutes, seconds, millis] = match;
+  const total = Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds) + Number(millis) / 1000;
+  return Number.isFinite(total) ? total : null;
+}
+
+/**
+ * Parses a `start --> end` timing line, ignoring trailing VTT cue settings.
+ * @param {string} line - Candidate timing line.
+ * @param {'srt'|'vtt'} format - Timestamp dialect.
+ * @returns {{ start: number, end: number }|null} Timing pair or null.
+ */
+function parseCueTiming(line, format) {
+  const match = /^\s*(\S+)\s+-->\s+(\S+)(?:\s+.*)?$/.exec(line);
+  if (!match) return null;
+  const start = parseCueTimestamp(match[1], format);
+  const end = parseCueTimestamp(match[2], format);
+  return start !== null && end !== null ? { start, end } : null;
+}
+
+/**
+ * Removes inline WebVTT/SRT formatting tags without touching the DOM.
+ * @param {string} text - Raw cue line.
+ * @returns {string} Plain cue text.
+ */
+function stripSubtitleTags(text) {
+  return text
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?[A-Za-z][^>]*>/g, '')
+    .trim();
+}
+
+/**
+ * Extracts an optional `[Speaker]` or `Speaker:` prefix from cue text.
+ * @param {string} text - Plain cue text.
+ * @returns {{ speakerName: string, text: string }} Speaker label and remaining text.
+ */
+function extractSubtitleSpeaker(text) {
+  const match = /^\[([^\]\n]+)\]\s*/.exec(text) || /^([^:\n]{1,80}):\s*/.exec(text);
+  if (!match) return { speakerName: '', text };
+  return { speakerName: match[1].trim(), text: text.slice(match[0].length).trim() };
+}
+
+/**
+ * Parses one SRT/VTT cue block, skipping headers, notes, and malformed cues.
+ * @param {string} block - Blank-line-delimited cue block.
+ * @param {'srt'|'vtt'} format - Timestamp dialect.
+ * @returns {{ start: number, end: number, speakerName: string, text: string }|null} Cue or null.
+ */
+function parseSubtitleCueBlock(block, format) {
+  const lines = block.split('\n');
+  if (/^(WEBVTT|NOTE(?:\s|$)|STYLE(?:\s|$)|REGION(?:\s|$))/.test(lines[0].trim())) return null;
+  const timingIndex = lines.findIndex((line, index) => index < 3 && parseCueTiming(line, format));
+  if (timingIndex < 0) return null;
+  const timing = parseCueTiming(lines[timingIndex], format);
+  const body = lines.slice(timingIndex + 1).map(stripSubtitleTags).filter(Boolean).join('\n');
+  const speaker = extractSubtitleSpeaker(body);
+  return timing && speaker.text ? { ...timing, ...speaker } : null;
+}
+
+/**
+ * Parses blank-line-delimited SRT/VTT blocks into monotonic subtitle segments.
+ * @param {string} rawText - UTF-8 subtitle file content.
+ * @param {'srt'|'vtt'} format - Timestamp dialect.
+ * @returns {Array<object>} Parsed subtitle segments.
+ */
+function parseSubtitleBlocks(rawText, format) {
+  const normalized = normalizeSubtitleInput(rawText);
+  const speakerIds = new Map();
+  const segments = [];
+  let lastStart = -1;
+  for (const block of normalized.split(/\n[ \t]*\n+/)) {
+    const cue = parseSubtitleCueBlock(block.trim(), format);
+    if (!cue || cue.start < lastStart || cue.end <= cue.start) continue;
+    lastStart = cue.start;
+    const labelKey = cue.speakerName.toLocaleLowerCase();
+    if (cue.speakerName && !speakerIds.has(labelKey)) speakerIds.set(labelKey, `speaker-${speakerIds.size + 1}`);
+    const speakerId = cue.speakerName ? speakerIds.get(labelKey) : 'speaker-1';
+    segments.push({
+      id: `cue-${segments.length + 1}`,
+      start: cue.start,
+      end: cue.end,
+      text: cue.text,
+      translatedText: '',
+      speakerId,
+      speakerName: cue.speakerName,
+    });
+  }
+  if (!segments.length) throw new ValidationError('No valid subtitle cues were found.', 'file', 'NO_VALID_SUBTITLE_CUES');
+  return segments;
+}
+
+/**
+ * Parses SubRip text into normalized subtitle cues.
+ * @param {string} rawText - UTF-8 SRT text.
+ * @returns {Array<object>} Parsed subtitle segments.
+ */
+export function parseSrt(rawText) {
+  return parseSubtitleBlocks(rawText, 'srt');
+}
+
+/**
+ * Parses WebVTT text into normalized subtitle cues.
+ * @param {string} rawText - UTF-8 VTT text.
+ * @returns {Array<object>} Parsed subtitle segments.
+ */
+export function parseVtt(rawText) {
+  return parseSubtitleBlocks(rawText, 'vtt');
+}
+
+/**
+ * Chooses the subtitle parser from a `.srt` or `.vtt` filename.
+ * @param {string} rawText - UTF-8 subtitle text.
+ * @param {string} fileName - Uploaded subtitle filename.
+ * @returns {Array<object>} Parsed subtitle segments.
+ */
+export function parseSubtitleFileText(rawText, fileName) {
+  const extension = String(fileName || '').toLowerCase().match(/\.(srt|vtt)$/)?.[1];
+  if (extension === 'srt') return parseSrt(rawText);
+  if (extension === 'vtt') return parseVtt(rawText);
+  throw new ValidationError('Choose a .srt or .vtt subtitle file.', 'file', 'UNSUPPORTED_SUBTITLE_FILE');
 }
 
 /**

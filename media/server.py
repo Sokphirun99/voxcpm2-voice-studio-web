@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import math
 import os
 import shutil
 import time
@@ -33,8 +35,8 @@ from languages import (
     is_same_translation_language,
     resolve_nllb_lang_code,
 )
-from subtitles import (
-    SPEAKER_ASS_COLORS,
+from model_cache import inspect_model_readiness
+from subtitles import (    SPEAKER_ASS_COLORS,
     SubtitleSegment,
     align_even_dimensions,
     align_segments_with_speakers,
@@ -42,11 +44,15 @@ from subtitles import (
 )
 from translator import DEFAULT_NLLB_MODEL_ID, LocalTranslator
 from video_io import (
+    DUB_AUDIO_MODES,
+    DubClip,
     MediaProcessingError,
     burn_ass_subtitles,
     check_burnin_support,
     extract_audio_16k_wav,
     has_video_stream,
+    mux_dubbed_audio,
+    probe_media_duration,
     probe_video_dimensions,
 )
 
@@ -54,6 +60,12 @@ SERVICE_NAME = "voxcpm-media-studio"
 DEFAULT_PORT = 8810
 DEFAULT_JOB_DIR = Path(os.environ.get("MEDIA_JOB_DIR", "/tmp/voxcpm-media-jobs"))
 MAX_UPLOAD_BYTES = int(os.environ.get("MEDIA_MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
+MAX_DUB_CLIPS = 120
+MAX_DUB_CLIP_BYTES = 25 * 1024 * 1024
+MAX_DUB_TOTAL_BYTES = 200 * 1024 * 1024
+MAX_DUB_METADATA_CHARS = 64 * 1024
+DUB_TIMESTAMP_TOLERANCE_SECONDS = 0.05
+MIN_WAV_BYTES = 44
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 logger = logging.getLogger(SERVICE_NAME)
@@ -168,7 +180,12 @@ def build_default_services(job_dir: Path = DEFAULT_JOB_DIR) -> MediaServices:
     )
 
 
-async def _save_bounded_upload(upload: UploadFile, dest: Path, max_bytes: int = MAX_UPLOAD_BYTES) -> int:
+async def _save_bounded_upload(
+    upload: UploadFile,
+    dest: Path,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    upload_label: str = "Video",
+) -> int:
     """Stream multipart upload safely to disk while enforcing a strict maximum byte limit."""
     written = 0
     try:
@@ -176,7 +193,7 @@ async def _save_bounded_upload(upload: UploadFile, dest: Path, max_bytes: int = 
             while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
                 written += len(chunk)
                 if written > max_bytes:
-                    raise HTTPException(status_code=413, detail=f"Video exceeds max upload limit ({max_bytes // (1024 * 1024)} MB).")
+                    raise HTTPException(status_code=413, detail=f"{upload_label} exceeds max upload limit ({max_bytes // (1024 * 1024)} MB).")
                 handle.write(chunk)
     except Exception:
         dest.unlink(missing_ok=True)
@@ -278,6 +295,29 @@ def _maybe_translate_aligned(
     return services.translator.translate_lines([s.text for s in aligned], detected_lang, target)
 
 
+def _transcriber_call_kwargs(method: Any, language: str, turns: list, double_check: bool) -> dict[str, Any]:
+    """Build transcriber kwargs from its declared signature without catching inference errors."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+        accepts_arbitrary_keywords = True
+    else:
+        accepts_arbitrary_keywords = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    kwargs: dict[str, Any] = {"language": language}
+    for name, value in (("turns", turns), ("double_check", double_check)):
+        parameter = parameters.get(name)
+        if accepts_arbitrary_keywords or (
+            parameter is not None
+            and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        ):
+            kwargs[name] = value
+    return kwargs
+
+
 def _run_transcriber(
     transcriber: Any,
     wav_path: Path,
@@ -285,14 +325,10 @@ def _run_transcriber(
     turns: list,
     double_check: bool = False,
 ) -> dict:
-    """Invoke transcriber with optional double-check and speaker turns, degrading cleanly for stub signatures."""
-    try:
-        return transcriber.transcribe(wav_path, language=language, turns=turns, double_check=double_check)
-    except TypeError:
-        try:
-            return transcriber.transcribe(wav_path, language=language, turns=turns)
-        except TypeError:
-            return transcriber.transcribe(wav_path, language=language)
+    """Invoke transcriber once, passing only supported optional keyword arguments."""
+    method = transcriber.transcribe
+    kwargs = _transcriber_call_kwargs(method, language, turns, double_check)
+    return method(wav_path, **kwargs)
 
 
 def _run_audio_verifier(transcriber: Any, wav_path: Path, language: str) -> tuple[str, str]:
@@ -362,6 +398,83 @@ def _resolve_video_dimensions(req: BurnRequest, source_video: Path) -> tuple[int
     return align_even_dimensions(raw_w, raw_h, min_size=160)
 
 
+def _is_valid_finite_number(value: Any) -> bool:
+    """Return True when `value` is a finite int or float (excluding booleans)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _parse_dub_metadata_entry(entry: Any, idx: int, file_count: int) -> dict[str, Any]:
+    """Validate a single dubbing metadata item `{segmentId, start, end, fileIndex}`."""
+    if not isinstance(entry, dict):
+        raise HTTPException(status_code=400, detail=f"Dub metadata entry #{idx + 1} must be an object.")
+    raw_start, raw_end, raw_index = entry.get("start"), entry.get("end"), entry.get("fileIndex")
+    if not _is_valid_finite_number(raw_start) or not _is_valid_finite_number(raw_end):
+        raise HTTPException(status_code=400, detail=f"Dub metadata entry #{idx + 1} has invalid start/end timestamps.")
+    start, end = float(raw_start), float(raw_end)
+    if start < 0.0 or end < start:
+        raise HTTPException(status_code=400, detail=f"Dub metadata entry #{idx + 1} must satisfy 0 <= start <= end.")
+    if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index < 0 or raw_index >= file_count:
+        raise HTTPException(status_code=400, detail=f"Dub metadata entry #{idx + 1} has an out-of-range fileIndex.")
+    seg_id = str(entry.get("segmentId") or f"seg-{idx + 1}").strip()[:64] or f"seg-{idx + 1}"
+    return {"segmentId": seg_id, "start": start, "end": end, "fileIndex": raw_index}
+
+
+def _parse_dub_metadata(raw_metadata: str, file_count: int) -> list[dict[str, Any]]:
+    """Parse and validate the JSON metadata array submitted to `POST /dub`."""
+    if len(raw_metadata or "") > MAX_DUB_METADATA_CHARS:
+        raise HTTPException(status_code=400, detail="Dub metadata exceeds the allowed size.")
+    try:
+        parsed = json.loads(raw_metadata or "")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Dub metadata must be valid JSON.") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise HTTPException(status_code=400, detail="Dub metadata must be a non-empty JSON array.")
+    if len(parsed) > MAX_DUB_CLIPS:
+        raise HTTPException(status_code=400, detail=f"Dub metadata exceeds maximum of {MAX_DUB_CLIPS} clips.")
+    return [_parse_dub_metadata_entry(item, idx, file_count) for idx, item in enumerate(parsed)]
+
+
+def _has_wav_magic_bytes(header: bytes) -> bool:
+    """Verify standard RIFF/WAVE magic header bytes."""
+    return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE"
+
+
+async def _save_validated_dub_wavs(files: list[UploadFile], work_dir: Path) -> list[Path]:
+    """Stream uploaded WAV clips to `work_dir`, enforcing per-clip/total limits and RIFF/WAVE headers."""
+    saved: list[Path] = []
+    total_bytes = 0
+    for idx, upload in enumerate(files):
+        dest = work_dir / f"clip-{idx:03d}.wav"
+        remaining_total = MAX_DUB_TOTAL_BYTES - total_bytes
+        if remaining_total <= 0:
+            raise HTTPException(status_code=413, detail=f"Combined dub clips exceed limit ({MAX_DUB_TOTAL_BYTES // (1024 * 1024)} MB).")
+        written = await _save_bounded_upload(
+            upload,
+            dest,
+            max_bytes=min(MAX_DUB_CLIP_BYTES, remaining_total),
+            upload_label="Dubbed audio clip",
+        )
+        total_bytes += written
+        with open(dest, "rb") as handle:
+            header = handle.read(12)
+        if written < MIN_WAV_BYTES or not _has_wav_magic_bytes(header):
+            raise HTTPException(status_code=400, detail=f"Uploaded clip #{idx + 1} is not a valid WAV file.")
+        saved.append(dest)
+    return saved
+
+
+def _execute_dub_pipeline(job: MediaJobPaths, clips: list[DubClip], tmp_mp4: Path, original_audio_mode: str) -> Path:
+    """Mux dubbed audio clips onto `job.source_video` and atomically publish `job.dubbed_mp4`."""
+    mux_dubbed_audio(job.source_video, clips, tmp_mp4, original_audio_mode=original_audio_mode)
+    os.replace(tmp_mp4, job.dubbed_mp4)
+    return job.dubbed_mp4
+
+
 def create_app(services: MediaServices | None = None) -> FastAPI:
     """Build configured FastAPI application with injected or default local AI services."""
     active_services = services or build_default_services()
@@ -387,6 +500,7 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
             "startedAt": started_at,
             "burnInSupported": check_burnin_support(),
             "diarizationReady": are_diarization_models_ready(),
+            "models": inspect_model_readiness(),
             "whisperModel": DEFAULT_WHISPER_REPO,
             "khmerWhisperModel": DEFAULT_KHMER_WHISPER_REPO,
             "khmerVerifierModel": DEFAULT_KHMER_VERIFIER_REPO,
@@ -504,6 +618,58 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
         except Exception as exc:
             _log_json(logging.ERROR, req_id, "Unexpected burn-in error", {"error": str(exc)})
             raise HTTPException(status_code=500, detail="Video subtitle burn-in failed unexpectedly.") from exc
+
+    @app.post("/dub")
+    async def dub_video(
+        request: Request,
+        jobId: str = Form(...),
+        metadata: str = Form(...),
+        originalAudioMode: str = Form("duck"),
+        files: list[UploadFile] = File(...),
+    ) -> FileResponse:
+        req_id = getattr(request.state, "request_id", "-")
+        clean_mode = str(originalAudioMode).strip().lower()
+        if clean_mode not in DUB_AUDIO_MODES:
+            raise HTTPException(status_code=400, detail="originalAudioMode must be 'duck', 'mute', or 'keep'.")
+        job = _resolve_job_safe(active_services.job_store, jobId)
+        if not await asyncio.to_thread(has_video_stream, job.source_video):
+            raise HTTPException(status_code=400, detail="Dubbed MP4 export is only supported for video files.")
+        if not files or len(files) > MAX_DUB_CLIPS:
+            raise HTTPException(status_code=400, detail=f"Upload between 1 and {MAX_DUB_CLIPS} WAV audio clips.")
+        entries = _parse_dub_metadata(metadata, len(files))
+        source_duration = await asyncio.to_thread(probe_media_duration, job.source_video)
+        if source_duration > 0 and any(
+            item["start"] > source_duration + DUB_TIMESTAMP_TOLERANCE_SECONDS
+            or item["end"] > source_duration + DUB_TIMESTAMP_TOLERANCE_SECONDS
+            for item in entries
+        ):
+            raise HTTPException(status_code=400, detail="Dub timestamps must fall within the source video duration.")
+        work_dir = job.root / f"dub-{uuid.uuid4().hex[:8]}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            saved_wavs = await _save_validated_dub_wavs(files, work_dir)
+            dub_clips = [
+                DubClip(
+                    wav_path=saved_wavs[item["fileIndex"]],
+                    start_seconds=item["start"],
+                    end_seconds=item["end"],
+                    segment_id=item["segmentId"],
+                )
+                for item in entries
+            ]
+            tmp_mp4 = work_dir / "dubbed.mp4"
+            out_mp4 = await asyncio.to_thread(_execute_dub_pipeline, job, dub_clips, tmp_mp4, clean_mode)
+            return FileResponse(path=out_mp4, media_type="video/mp4", filename=f"{job.job_id}-dubbed.mp4")
+        except HTTPException:
+            raise
+        except MediaProcessingError as exc:
+            _log_json(logging.ERROR, req_id, "FFmpeg dubbing export failed", {"error": str(exc)})
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            _log_json(logging.ERROR, req_id, "Unexpected dubbed export error", {"error": str(exc)})
+            raise HTTPException(status_code=500, detail="Dubbed video export failed unexpectedly.") from exc
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     @app.exception_handler(HTTPException)
     async def structured_http_error(request: Request, exc: HTTPException) -> JSONResponse:

@@ -7,8 +7,9 @@ import {
   createVoiceAnchorUseCases,
   createVoiceLibraryUseCases,
 } from '../../src/domain/useCases.js';
+import { segmentSingleSpeakerScript } from '../../src/domain/scriptSegmentation.js';
 import { BUILT_IN_VOICES } from '../../src/domain/voiceLibrary.js';
-import { inspectWavBuffer } from '../../src/domain/wavCodec.js';
+import { inspectWavBuffer, readWavDurationSeconds, replaceChunkAndRestitch } from '../../src/domain/wavCodec.js';
 
 const CHAR_NISA = BUILT_IN_VOICES[0];
 
@@ -184,6 +185,143 @@ test('synthesizeSpeech chunks long single-character scripts and auto-anchors chu
   const info = inspectWavBuffer(await result.recording.blob.arrayBuffer());
   assert.equal(info.sampleRate, 48000);
   assert.ok(result.recording.anchorBlob instanceof Blob);
+});
+
+test('synthesizeSpeech exposes ordered chunk metadata with text, seeds, blobs, and durations', async () => {
+  let callCount = 0;
+  const speechGateway = {
+    async uploadReferenceAudio(params) {
+      return { path: `/tmp/${params.fileName}`, orig_name: params.fileName };
+    },
+    async synthesize() {
+      callCount += 1;
+      const sampleCount = callCount === 1 ? 4800 : 9600;
+      return { blob: makePcmWavBlob(new Array(sampleCount).fill(500)), seed: 900 + callCount };
+    },
+  };
+  const useCase = createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 111 });
+  const longText = `${'Sentence one is long enough to exceed the minimum chunk size cleanly. '.repeat(3)}Sentence two keeps the exact same anchored voice.`;
+  const expectedTexts = segmentSingleSpeakerScript(longText);
+
+  const result = await useCase.execute({
+    script: longText,
+    character: CHAR_NISA,
+    anchor: null,
+    guidance: 2,
+    steps: 10,
+    seed: 5,
+    masterAudio: false,
+  });
+
+  assert.equal(expectedTexts.length, 2);
+  assert.equal(result.recording.chunks.length, expectedTexts.length);
+  assert.deepEqual(result.recording.chunks.map(chunk => chunk.index), [0, 1]);
+  assert.deepEqual(result.recording.chunks.map(chunk => chunk.text), expectedTexts);
+  assert.deepEqual(result.recording.chunks.map(chunk => chunk.seed), [901, 902]);
+  assert.ok(result.recording.chunks.every(chunk => chunk.blob instanceof Blob && chunk.blob.size > 0));
+  assert.ok(Math.abs(result.recording.chunks[0].durationSeconds - 0.1) < 0.001);
+  assert.ok(Math.abs(result.recording.chunks[1].durationSeconds - 0.2) < 0.001);
+});
+
+test('replaceChunkAndRestitch swaps one chunk without mutating inputs and produces a valid stitched WAV', async () => {
+  const first = makePcmWavBlob([500, 600]);
+  const second = makePcmWavBlob([700, 800]);
+  const replacement = makePcmWavBlob([900, 1000, 1100, 1200]);
+  const chunks = [
+    { index: 0, text: 'First segment', blob: first, seed: 1, durationSeconds: 0.001 },
+    { index: 1, text: 'Second segment', blob: second, seed: 2, durationSeconds: 0.001 },
+  ];
+
+  const result = await replaceChunkAndRestitch({
+    chunks,
+    index: 1,
+    nextChunk: { index: 1, text: 'Second segment fixed', blob: replacement, seed: 3, durationSeconds: 0.002 },
+    pauseMs: 0,
+  });
+
+  assert.equal(chunks[1].text, 'Second segment');
+  assert.equal(chunks[1].blob, second);
+  assert.equal(result.chunks[0], chunks[0]);
+  assert.equal(result.chunks[1].text, 'Second segment fixed');
+  assert.equal(result.chunks[1].index, 1);
+  assert.equal(result.chunks[1].seed, 3);
+  assert.equal(result.chunks[1].durationSeconds, 0.002);
+
+  const info = inspectWavBuffer(await result.blob.arrayBuffer());
+  assert.equal(info.sampleRate, 48000);
+  assert.equal(info.dataSize, 4 + 8);
+
+  await assert.rejects(
+    () => replaceChunkAndRestitch({ chunks, index: 4, nextChunk: { blob: replacement } }),
+    error => error.code === 'INVALID_CHUNK_INDEX'
+  );
+});
+
+test('regenerateChunk synthesizes one segment with the active anchor and restitches the merged take', async () => {
+  let callCount = 0;
+  let regenerating = false;
+  const calls = [];
+  const uploads = [];
+  const speechGateway = {
+    async uploadReferenceAudio(params) {
+      uploads.push(params);
+      return { path: `/tmp/${params.fileName}`, orig_name: params.fileName };
+    },
+    async synthesize(params) {
+      calls.push(params);
+      callCount += 1;
+      const seconds = regenerating ? 0.3 : callCount === 1 ? 0.1 : 0.2;
+      return { blob: makePcmWavBlob(new Array(Math.round(48000 * seconds)).fill(500)), seed: 300 + callCount };
+    },
+  };
+  const useCase = createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 5 });
+  const longText = `${'Sentence one is long enough to exceed the minimum chunk size cleanly. '.repeat(3)}Sentence two keeps the exact same anchored voice.`;
+  const anchor = {
+    characterId: CHAR_NISA.id, label: CHAR_NISA.name, blob: makePcmWavBlob(new Array(4800).fill(500)),
+    fileName: 'nisa-anchor.wav', source: 'generated', exactClone: false, promptText: '',
+  };
+  const cachedUpload = { path: '/tmp/nisa-anchor.wav', orig_name: 'nisa-anchor.wav', mime_type: 'audio/wav' };
+
+  const first = await useCase.execute({
+    script: longText, character: CHAR_NISA, anchor, cachedUpload,
+    guidance: 2, steps: 10, seed: 5, masterAudio: false,
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(uploads.length, 0);
+  const initialDuration = first.recording.audioDurationSeconds;
+  assert.ok(initialDuration > 0);
+
+  calls.length = 0;
+  callCount = 0;
+  regenerating = true;
+  const updated = await useCase.regenerateChunk({
+    recording: first.recording,
+    index: 1,
+    text: 'A corrected second part.',
+    character: CHAR_NISA,
+    anchor,
+    cachedUpload,
+    options: { guidance: 2, steps: 10, seed: 5, masterAudio: false },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].text, 'A corrected second part.');
+  assert.deepEqual(calls[0].referenceFile, cachedUpload);
+  assert.equal(calls[0].instruction, '');
+  assert.equal(uploads.length, 0);
+  assert.equal(updated.recording.id, first.recording.id);
+  assert.equal(updated.recording.chunks.length, 2);
+  assert.equal(updated.recording.chunks[0].blob, first.recording.chunks[0].blob);
+  assert.equal(updated.recording.chunks[1].text, 'A corrected second part.');
+  assert.ok(updated.recording.audioDurationSeconds > initialDuration);
+  assert.equal(updated.recording.transcript, `${first.recording.chunks[0].text} A corrected second part.`);
+  const info = inspectWavBuffer(await updated.recording.blob.arrayBuffer());
+  assert.equal(info.sampleRate, 48000);
+
+  await assert.rejects(
+    () => useCase.regenerateChunk({ recording: first.recording, index: 9, text: 'x', character: CHAR_NISA }),
+    error => error.code === 'INVALID_CHUNK_INDEX'
+  );
 });
 
 test('lockReferenceAudio validates audio files and returns upload metadata', async () => {
@@ -406,4 +544,105 @@ test('synthesizeSpeech integrates audioMaster and synthesisCache cleanly without
   assert.equal(gatewayCalls, 2);
   assert.equal(masterCalls, 1);
   assert.equal(unmastered.recording.mastered, false);
+});
+
+test('synthesizeSpeech applies injected glossary rules to the spoken text, lets explicit rules override, and skips them for regenerateChunk', async () => {
+  const calls = [];
+  const speechGateway = {
+    async uploadReferenceAudio(params) { return { path: `/tmp/${params.fileName}`, orig_name: params.fileName }; },
+    async synthesize(params) { calls.push(params); return { blob: makePcmWavBlob(new Array(480).fill(500)), seed: 9 }; },
+  };
+  let loads = 0;
+  const glossaryRepository = {
+    async loadRules() { loads += 1; return [{ id: 'r1', source: 'NASA', replacement: 'ណាសា', enabled: true }, { id: 'r2', source: 'Visit', replacement: 'Go', enabled: false }]; },
+  };
+  const useCase = createSynthesizeSpeechUseCase({ speechGateway, glossaryRepository, seedGenerator: () => 5 });
+  const base = { script: 'Visit NASA today', character: CHAR_NISA, guidance: 2, steps: 10, seed: 5, masterAudio: false };
+
+  const first = await useCase.execute(base);
+  assert.equal(loads, 1);
+  assert.equal(calls[0].text, 'Visit ណាសា today');
+  assert.equal(first.recording.transcript, 'Visit ណាសា today');
+
+  await useCase.execute({ ...base, pronunciationRules: [{ source: 'today', replacement: 'tonight' }] });
+  assert.equal(loads, 1);
+  assert.equal(calls[1].text, 'Visit NASA tonight');
+
+  await useCase.execute({ ...base, pronunciationRules: [] });
+  assert.equal(calls[2].text, 'Visit NASA today');
+
+  const withoutGlossary = createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 5 });
+  await withoutGlossary.execute(base);
+  assert.equal(calls[3].text, 'Visit NASA today');
+});
+
+test('synthesizeSpeech does not re-apply glossary rules when regenerating a segment', async () => {
+  const calls = [];
+  const speechGateway = {
+    async uploadReferenceAudio(params) { return { path: `/tmp/${params.fileName}`, orig_name: params.fileName }; },
+    async synthesize(params) { calls.push(params); return { blob: makePcmWavBlob(new Array(4800).fill(500)), seed: 9 }; },
+  };
+  const glossaryRepository = { async loadRules() { return [{ id: 'r1', source: 'one', replacement: 'one one', enabled: true }]; } };
+  const useCase = createSynthesizeSpeechUseCase({ speechGateway, glossaryRepository, seedGenerator: () => 5 });
+  const longText = `${'Sentence ends here and is long enough to exceed the minimum chunk size. '.repeat(3)}Sentence two keeps the voice.`;
+  const first = await useCase.execute({ script: longText, character: CHAR_NISA, guidance: 2, steps: 10, seed: 5, masterAudio: false });
+  assert.ok(first.recording.chunks.length >= 2);
+
+  calls.length = 0;
+  await useCase.regenerateChunk({
+    recording: first.recording, index: 1, text: 'one two', character: CHAR_NISA,
+    options: { guidance: 2, steps: 10, seed: 5, masterAudio: false },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].text, 'one two');
+});
+
+test('createSynthesizeSpeechUseCase validates the glossary repository port contract', () => {
+  const speechGateway = { uploadReferenceAudio() {}, synthesize() {} };
+  assert.throws(() => createSynthesizeSpeechUseCase({ speechGateway, glossaryRepository: {} }), TypeError);
+});
+
+test('synthesizeSpeech splits at inline [pause ...] markers without sending literal tags and stitches exact PCM silence', async () => {
+  const calls = [];
+  const sampleRate = 48000;
+  const clipSeconds = 0.1;
+  const speechGateway = {
+    async uploadReferenceAudio(params) { return { path: `/tmp/${params.fileName}`, orig_name: params.fileName }; },
+    async synthesize(params) {
+      calls.push(params);
+      return { blob: makePcmWavBlob(new Array(Math.round(sampleRate * clipSeconds)).fill(800)), seed: params.seed };
+    },
+  };
+  const useCase = createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 42 });
+  const result = await useCase.execute({
+    script: 'Part one. [pause 0.5s] Part two. [pause 800ms] Part three.',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 10,
+    seed: 42,
+    masterAudio: false,
+  });
+
+  assert.deepEqual(calls.map(call => call.text), ['Part one.', 'Part two.', 'Part three.']);
+  assert.ok(calls.every(call => !/\[pause/i.test(call.text)));
+  assert.equal(result.recording.transcript, 'Part one. Part two. Part three.');
+  assert.deepEqual(result.recording.chunks.map(chunk => chunk.pauseAfterMs), [500, 800, null]);
+
+  const expectedSeconds = (100 + 500 + 100 + 800 + 100) / 1000;
+  assert.equal(readWavDurationSeconds(await result.recording.blob.arrayBuffer()), expectedSeconds);
+  assert.equal(result.recording.audioDurationSeconds, expectedSeconds);
+
+  // Regenerating one segment preserves surrounding explicit pause durations and strips any typed pause marker.
+  calls.length = 0;
+  const updated = await useCase.regenerateChunk({
+    recording: result.recording,
+    index: 1,
+    text: 'Part two [pause 2s] revised.',
+    character: CHAR_NISA,
+    options: { guidance: 2, steps: 10, seed: 42, masterAudio: false },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].text, 'Part two revised.');
+  assert.deepEqual(updated.recording.chunks.map(chunk => chunk.pauseAfterMs), [500, 800, null]);
+  assert.equal(readWavDurationSeconds(await updated.recording.blob.arrayBuffer()), expectedSeconds);
 });

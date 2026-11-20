@@ -3,6 +3,7 @@
 
 # Local runtime logs and build/venv caches
 /logs/
+/backups/
 web/node_modules/
 web/dist/
 web/data/

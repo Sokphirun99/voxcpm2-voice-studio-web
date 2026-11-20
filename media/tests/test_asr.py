@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from asr import (
     MIN_TURN_SEC,
@@ -224,3 +225,18 @@ def test_verifier_failure_degrades_gracefully_and_verify_audio_prefers_whisper_v
     fb_heard, fb_model = local.verify_audio(wav_path, language="km")
     assert fb_heard == "សួស្តី ពី ម៉ូដែល មេ"
     assert "Qwen3-ASR" in fb_model
+
+
+def test_local_transcriber_does_not_retry_internal_type_error(tmp_path: Path) -> None:
+    """An inference TypeError must not be retried with double-check disabled."""
+    local = LocalTranscriber()
+    calls: list[bool] = []
+
+    def broken_transcribe(path: Path, turns=None, double_check: bool = False) -> dict:
+        calls.append(double_check)
+        raise TypeError("Khmer inference failed internally")
+
+    local._khmer.transcribe = broken_transcribe
+    with pytest.raises(TypeError, match="Khmer inference failed internally"):
+        local._transcribe_khmer(tmp_path / "audio.wav", None, double_check=True)
+    assert calls == [True]

@@ -5,10 +5,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
 import {
+  DEFAULT_DUB_AUDIO_MODE,
+  SUBTITLE_VOICEOVER_PAUSE_MS,
   buildCombinedVoiceoverBlob,
+  buildDubDownloadFilename,
+  buildDubExportClips,
   buildSubtitleSpeechSignature,
   buildSubtitleSynthesisCommand,
   buildVoiceoverDownloadFilename,
+  normalizeDubAudioMode,
+  normalizeSubtitleVoiceoverGapMs,
   resolveSubtitleSpeechText,
   selectOrderedSegments,
 } from '../../domain/subtitleTts.js';
@@ -27,7 +33,7 @@ function revokeBlobUrl(url) {
   }
 }
 
-function triggerWavDownload(blob, filename) {
+function triggerFileDownload(blob, filename) {
   if (!blob || typeof document === 'undefined' || typeof URL === 'undefined') return;
   const href = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -157,7 +163,7 @@ function useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, 
   return { togglePlaySegment, stopPlayback };
 }
 
-function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, logger }) {
+function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseGapMs, logger }) {
   const [combinedClip, setCombinedClip] = useState(null);
   const combinedUrlRef = useRef('');
   const seqRef = useRef(0);
@@ -182,7 +188,7 @@ function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, logger
     }
     const clips = matched.map(seg => segmentClips[seg.id]);
     const blobs = clips.map(clip => clip.blob);
-    void buildCombinedVoiceoverBlob(blobs)
+    void buildCombinedVoiceoverBlob(blobs, pauseGapMs)
       .then(async blob => {
         if (seq !== seqRef.current || !blob) return;
         const measuredDuration = typeof blob.arrayBuffer === 'function'
@@ -194,6 +200,7 @@ function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, logger
           url: createBlobUrl(blob),
           count: clips.length,
           scope,
+          pauseGapMs,
           segmentIds: matched.map(seg => seg.id),
           durationSeconds: measuredDuration > 0 ? measuredDuration : sumClipDurations(clips),
           characterName: resolveCombinedVoiceLabel(clips),
@@ -204,7 +211,7 @@ function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, logger
         logger?.warn?.('useSubtitleVoiceover.combine', err?.message || 'Could not combine WAV clips');
         replaceCombined(null);
       });
-  }, [segments, selectedIds, segmentClips, replaceCombined, logger]);
+  }, [segments, selectedIds, segmentClips, pauseGapMs, replaceCombined, logger]);
 
   return { combinedClip, clearCombined: () => replaceCombined(null) };
 }
@@ -351,11 +358,53 @@ function useVoiceSynthesisActions(ctx) {
   return { generateSegmentVoice, generateSelectedVoices, cancelVoiceGeneration };
 }
 
+function useDubExportAction({
+  mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile,
+  segments, selectedIds, segmentClips, dubAudioMode, abortRef,
+  dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound,
+}) {
+  return useCallback(async () => {
+    if (dubBusy || voiceBusy || abortRef.current || !jobId || isAudioOnly || !mediaSubtitleGateway?.exportDubbedVideo) return;
+    const clips = buildDubExportClips(segments, selectedIds, segmentClips);
+    if (!clips.length) return;
+    onUnlockSound?.();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setDubBusy(true);
+    const clipWord = clips.length === 1 ? 'clip' : 'clips';
+    onStatus?.({ message: `Exporting dubbed MP4 (${clips.length} ${clipWord})…`, error: false });
+    try {
+      const mp4Blob = await mediaSubtitleGateway.exportDubbedVideo({
+        jobId,
+        clips,
+        originalAudioMode: dubAudioMode,
+        signal: controller.signal,
+      });
+      triggerFileDownload(mp4Blob, buildDubDownloadFilename(videoFile));
+      const doneMsg = `Dubbed MP4 exported (${clips.length} ${clipWord}).`;
+      onStatus?.({ message: doneMsg, error: false });
+      onNotify?.({ kind: 'success', title: 'Dubbed MP4 exported', message: doneMsg });
+    } catch (err) {
+      if (isCancellationError(err)) {
+        onStatus?.({ message: 'Dubbed video export cancelled.', error: false });
+        return;
+      }
+      const message = err?.message || 'Could not export dubbed MP4. Check that the media service is running.';
+      logger?.error?.('useSubtitleVoiceover.exportDubbedVideo', err, { jobId, clipCount: clips.length, dubAudioMode });
+      onStatus?.({ message, error: true });
+      onNotify?.({ kind: 'error', title: 'Dubbed MP4 export failed', message });
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      setDubBusy(false);
+    }
+  }, [mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, segments, selectedIds, segmentClips, dubAudioMode, abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound]);
+}
+
 /**
- * Coordinates per-frame and multi-selected subtitle Text-to-Speech synthesis, inline audio playback, and combined WAV downloads.
- * Inputs: `{ segments, useTranslation, videoFile, voiceCatalog, onStatus, onNotify, onUnlockSound, onEngineFailure }`.
- * Outputs: selection state, character state, per-frame clip map, combined voiceover clip, playback, and synthesis handlers.
- * Side effects: invokes `services.synthesizeSpeech`, plays browser audio, and manages/revokes `blob:` URLs.
+ * Coordinates per-frame and multi-selected subtitle Text-to-Speech synthesis, inline audio playback, combined WAV downloads, and time-aligned dubbed MP4 export.
+ * Inputs: `{ segments, useTranslation, videoFile, jobId, isAudioOnly, voiceCatalog, onStatus, onNotify, onUnlockSound, onEngineFailure }`.
+ * Outputs: selection state, character state, per-frame clip map, combined voiceover clip, playback, synthesis, and dub export handlers.
+ * Side effects: invokes `services.synthesizeSpeech` and `services.mediaSubtitleGateway.exportDubbedVideo`, plays browser audio, and manages/revokes `blob:` URLs.
  * Failure modes: surfaces validation, cancellation, and engine errors cleanly via status/toasts without discarding prior clips.
  * @param {object} config - Hook configuration.
  * @returns {object} Subtitle voiceover controller.
@@ -364,13 +413,15 @@ export function useSubtitleVoiceover({
   segments = [],
   useTranslation = false,
   videoFile = null,
+  jobId = '',
+  isAudioOnly = false,
   voiceCatalog = null,
   onStatus,
   onNotify,
   onUnlockSound,
   onEngineFailure,
 } = {}) {
-  const { synthesizeSpeech, logger } = useStudioServices();
+  const { synthesizeSpeech, mediaSubtitleGateway, logger } = useStudioServices();
   const characters = useMemo(
     () => (voiceCatalog?.characters?.length ? voiceCatalog.characters : BUILT_IN_VOICES),
     [voiceCatalog?.characters]
@@ -385,10 +436,21 @@ export function useSubtitleVoiceover({
   const anchorTag = buildAnchorTag(activeAnchor);
 
   const [segmentClips, setSegmentClips] = useState({});
+  const [pauseGapMs, setPauseGapMsState] = useState(SUBTITLE_VOICEOVER_PAUSE_MS);
+  const [dubAudioMode, setDubAudioModeState] = useState(DEFAULT_DUB_AUDIO_MODE);
+  const [dubBusy, setDubBusy] = useState(false);
   const [playingSegmentId, setPlayingSegmentId] = useState('');
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [generatingSegmentId, setGeneratingSegmentId] = useState('');
   const [batchProgress, setBatchProgress] = useState(null);
+
+  const setPauseGapMs = useCallback(rawMs => {
+    setPauseGapMsState(normalizeSubtitleVoiceoverGapMs(rawMs));
+  }, []);
+
+  const setDubAudioMode = useCallback(rawMode => {
+    setDubAudioModeState(normalizeDubAudioMode(rawMode));
+  }, []);
 
   const segmentClipsRef = useRef(segmentClips);
   segmentClipsRef.current = segmentClips;
@@ -398,7 +460,7 @@ export function useSubtitleVoiceover({
 
   const { selectedIds, toggleSelectSegment, toggleSelectAll, clearSelection } = useVoiceSelectionState(segments);
   const { togglePlaySegment, stopPlayback } = useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, logger });
-  const { combinedClip, clearCombined } = useCombinedVoiceoverState({ segments, selectedIds, segmentClips, logger });
+  const { combinedClip, clearCombined } = useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseGapMs, logger });
 
   const storeClip = useCallback((segId, clip) => {
     const prevUrl = clipUrlsRef.current.get(segId);
@@ -462,17 +524,25 @@ export function useSubtitleVoiceover({
     onStatus, onNotify, onUnlockSound, onEngineFailure,
   });
 
+  const exportDubbedVideo = useDubExportAction({
+    mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile,
+    segments, selectedIds, segmentClips, dubAudioMode, abortRef,
+    dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound,
+  });
+
+  const canExportDub = Boolean(jobId && !isAudioOnly && combinedClip?.count > 0 && mediaSubtitleGateway?.exportDubbedVideo);
+
   const downloadSegmentVoice = useCallback((segment, index) => {
     const clip = segmentClips[segment?.id];
     if (!clip?.blob) return;
     const tag = String((index ?? 0) + 1).padStart(2, '0');
-    triggerWavDownload(clip.blob, buildVoiceoverDownloadFilename(videoFile, `-frame-${tag}`));
+    triggerFileDownload(clip.blob, buildVoiceoverDownloadFilename(videoFile, `-frame-${tag}`));
   }, [segmentClips, videoFile]);
 
   const downloadCombinedVoice = useCallback(() => {
     if (!combinedClip?.blob) return;
     const suffix = combinedClip.scope === 'selected' ? '-selected-voiceover' : '-voiceover';
-    triggerWavDownload(combinedClip.blob, buildVoiceoverDownloadFilename(videoFile, suffix));
+    triggerFileDownload(combinedClip.blob, buildVoiceoverDownloadFilename(videoFile, suffix));
   }, [combinedClip, videoFile]);
 
   const isClipStale = useCallback(segment => {
@@ -488,6 +558,13 @@ export function useSubtitleVoiceover({
     anchors,
     selectedVoiceId: activeCharacter.id,
     setSelectedVoiceId,
+    pauseGapMs,
+    setPauseGapMs,
+    dubAudioMode,
+    setDubAudioMode,
+    dubBusy,
+    canExportDub,
+    exportDubbedVideo,
     activeCharacter,
     selectedIds,
     selectedCount: selectedIds.length,

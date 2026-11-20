@@ -7,6 +7,7 @@ import { createMediaSubtitleGateway } from '../../data/mediaSubtitleGateway.js';
 import {
   DEFAULT_ENGLISH_TARGET,
   DEFAULT_KHMER_TARGET,
+  MAX_SUBTITLE_FILE_BYTES,
   SUBTITLE_STYLE_DEFAULTS,
   adjustSubtitleSegmentTiming,
   buildBoundedTtsHandoff,
@@ -21,12 +22,15 @@ import {
   isSameSubtitleLanguage,
   mergeSubtitleSegmentWithNext,
   normalizeTargetLanguageCode,
+  parseSubtitleFileText,
   pickDefaultTargetLanguage,
   pickSegmentText,
   replaceTextInSegments,
   resolveTargetLanguageMeta,
   splitSubtitleSegment,
 } from '../../domain/subtitles.js';
+import { ValidationError } from '../../domain/errors.js';
+import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
 const MAX_CLIENT_VIDEO_BYTES = 500 * 1024 * 1024;
@@ -193,7 +197,7 @@ function subscribeVisibilityRecheck(poll) {
 }
 
 function useMediaHealthState(gateway) {
-  const [health, setHealth] = useState({ checked: false, online: true, burnInSupported: true, diarizationReady: false, reason: '' });
+  const [health, setHealth] = useState({ checked: false, online: true, burnInSupported: true, diarizationReady: false, models: null, reason: '' });
   const mountedRef = useRef(true);
   const seqRef = useRef(0);
 
@@ -369,6 +373,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
 
   const extractSubtitles = useCallback(async () => {
     if (!state.videoFile) return;
+    const relinkingProject = Boolean(state.projectId && !state.jobId && state.segments.length);
     const hadTranslation = Boolean(stateRef?.current?.hasTranslation ?? state.hasTranslation);
     const hadTranslatedLanguage = stateRef?.current?.translatedLanguage ?? state.translatedLanguage;
     const targetLanguage = normalizeTargetLanguageCode(state.options.targetLanguage);
@@ -378,11 +383,13 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
     const numSpeakers = diarize ? (Number(state.options.speakerCount) || 0) : 1;
     await runSubtitleTask({
       abortRef, setState, setBusyMeta, busyAction: 'extract',
-      baseMessage: diarize ? 'Extracting subtitles & detecting speakers…' : 'Extracting subtitles…',
+      baseMessage: relinkingProject
+        ? 'Linking video to the saved subtitle project…'
+        : diarize ? 'Extracting subtitles & detecting speakers…' : 'Extracting subtitles…',
       cancelMessage: 'Subtitle extraction cancelled.',
-      errorTitle: 'Subtitle extraction failed',
-      fallbackError: 'Subtitle extraction failed.',
-      resetTranslationOnStart: true,
+      errorTitle: relinkingProject ? 'Video relink failed' : 'Subtitle extraction failed',
+      fallbackError: relinkingProject ? 'Could not link video to the saved subtitle project.' : 'Subtitle extraction failed.',
+      resetTranslationOnStart: !relinkingProject,
       hadTranslation,
       hadTranslatedLanguage,
       onError: () => void refreshHealth(),
@@ -391,11 +398,11 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         const res = await gateway.transcribeVideo({
           file: state.videoFile,
           language: state.options.sourceLanguage,
-          numSpeakers,
-          diarize,
-          doubleCheck: Boolean(state.options.doubleCheckKhmer),
-          translateTo: shouldTranslate ? targetLanguage : '',
-          translateToKhmer: shouldTranslate && targetLanguage === 'khm_Khmr',
+          numSpeakers: relinkingProject ? 1 : numSpeakers,
+          diarize: relinkingProject ? false : diarize,
+          doubleCheck: relinkingProject ? false : Boolean(state.options.doubleCheckKhmer),
+          translateTo: relinkingProject ? '' : shouldTranslate ? targetLanguage : '',
+          translateToKhmer: !relinkingProject && shouldTranslate && targetLanguage === 'khm_Khmr',
           signal,
         });
         assertNotAborted(signal);
@@ -404,6 +411,19 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         const segs = Array.isArray(res.segments) ? res.segments : [];
         const spkCount = Array.isArray(res.speakers) ? res.speakers.length : collectUniqueSpeakers(segs).length;
         setActiveSegmentId('');
+        if (relinkingProject) {
+          setState(prev => ({
+            ...prev,
+            jobId: res.jobId || '',
+            videoSize: res.videoSize || prev.videoSize,
+            hasTranslation: state.hasTranslation,
+            translatedLanguage: state.translatedLanguage,
+            busyAction: '',
+            status: { message: `Video linked to saved project in ${elapsed}s. Existing subtitle edits were preserved.`, error: false },
+          }));
+          onNotify?.({ kind: 'success', title: 'Video linked', message: 'Saved subtitle edits are ready for MP4 burn-in.' });
+          return;
+        }
         setState(prev => applyExtractedSubtitleResult(prev, res, shouldTranslate ? targetLanguage : '', elapsed));
         onNotify?.({ kind: 'success', title: 'Subtitles ready', message: buildExtractSummary(segs.length, spkCount, elapsed, res.verificationSummary) });
       },
@@ -455,7 +475,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
   }, [state.segments, state.detectedLanguage, state.options.sourceLanguage, state.options.targetLanguage, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
   const burnVideo = useCallback(async () => {
-    if (!state.jobId || !hasSubtitleText || state.isAudioOnly) return;
+    if (!state.videoFile || !state.jobId || !hasSubtitleText || state.isAudioOnly) return;
     await runSubtitleTask({
       abortRef, setState, setBusyMeta, busyAction: 'burn',
       baseMessage: 'Rendering MP4 with burned-in subtitles…',
@@ -580,6 +600,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
   const services = useStudioServices();
   const gateway = useMemo(() => resolveSubtitleGateway(services), [services]);
   const [health, refreshHealth, markOnline] = useMediaHealthState(gateway);
+  const projectRepository = services?.projectRepository;
   const videoRef = useRef(null);
   const abortRef = useRef(null);
   const [busyMeta, setBusyMeta] = useState(null);
@@ -587,6 +608,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
   const [ttsSpeakerId, setTtsSpeakerId] = useState('');
   const [state, setState] = useState({
     videoFile: null,
+    videoFileName: null,
     videoUrl: '',
     isAudioOnly: false,
     jobId: '',
@@ -596,6 +618,9 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     hasTranslation: false,
     translatedLanguage: '',
     speakerNames: {},
+    projectId: '',
+    projectTitle: '',
+    projectsReady: false,
     options: DEFAULT_OPTIONS,
     busyAction: '',
     status: { message: '', error: false },
@@ -672,15 +697,16 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     setState(prev => ({
       ...prev,
       videoFile: file,
+      videoFileName: file.name || null,
       videoUrl: nextUrl,
       isAudioOnly: audioOnly,
       jobId: '',
-      detectedLanguage: '',
+      detectedLanguage: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.detectedLanguage : '',
       videoSize: null,
-      segments: [],
-      hasTranslation: false,
-      translatedLanguage: '',
-      speakerNames: {},
+      segments: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.segments : [],
+      hasTranslation: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.hasTranslation : false,
+      translatedLanguage: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.translatedLanguage : '',
+      speakerNames: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.speakerNames : {},
       busyAction: '',
       options: {
         ...prev.options,
@@ -693,6 +719,50 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     }));
   }, [onNotify]);
 
+  const importSubtitleFile = useCallback(async file => {
+    try {
+      if (!file || typeof file.text !== 'function') {
+        throw new ValidationError('Choose a readable .srt or .vtt subtitle file.', 'file', 'INVALID_SUBTITLE_FILE');
+      }
+      if (Number.isFinite(file.size) && file.size > MAX_SUBTITLE_FILE_BYTES) {
+        throw new ValidationError('Subtitle files must be 2 MB or smaller.', 'file', 'SUBTITLE_FILE_TOO_LARGE');
+      }
+      const parsed = parseSubtitleFileText(await file.text(), file.name);
+      const speakerNames = {};
+      const segments = parsed.map(({ speakerName, ...segment }) => {
+        if (speakerName) speakerNames[segment.speakerId] = speakerName;
+        return segment;
+      });
+      setActiveSegmentId('');
+      setTtsSpeakerId('');
+      setState(prev => ({
+        ...prev,
+        isAudioOnly: prev.videoFile ? prev.isAudioOnly : false,
+        jobId: prev.videoFile ? prev.jobId : '',
+        detectedLanguage: '',
+        videoSize: prev.videoFile ? prev.videoSize : null,
+        segments,
+        hasTranslation: false,
+        translatedLanguage: '',
+        speakerNames,
+        options: { ...prev.options, previewMode: 'original' },
+        status: { message: `Imported ${segments.length} subtitle cues from ${file.name}.`, error: false },
+      }));
+      onNotify?.({
+        kind: 'success',
+        title: 'Subtitles imported',
+        message: `Imported ${segments.length} cues. Translate, edit, or generate voice per frame.`,
+      });
+      return true;
+    } catch (error) {
+      const message = error?.message || 'Could not import subtitle file.';
+      services?.logger?.error?.('useVideoSubtitles.importSubtitleFile', error, { fileName: file?.name });
+      setState(prev => ({ ...prev, status: { message, error: true } }));
+      onNotify?.({ kind: 'error', title: 'Subtitle import failed', message });
+      return false;
+    }
+  }, [onNotify, services]);
+
   const clearWorkspace = useCallback(() => {
     const controller = abortRef.current;
     abortRef.current = null;
@@ -703,6 +773,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     setState(prev => ({
       ...prev,
       videoFile: null,
+      videoFileName: null,
       videoUrl: '',
       isAudioOnly: false,
       jobId: '',
@@ -712,6 +783,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
       hasTranslation: false,
       translatedLanguage: '',
       speakerNames: {},
+      projectId: '',
+      projectTitle: '',
       busyAction: '',
       status: { message: '', error: false },
     }));
@@ -817,6 +890,104 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     setState(prev => ({ ...prev, status }));
   }, []);
 
+  const loadProjectFromSnapshot = useCallback(snapshot => {
+    if (!snapshot || snapshot.kind !== 'subtitle') return;
+    const { payload } = snapshot;
+    setState(prev => ({
+      ...prev,
+      projectId: snapshot.id || '',
+      projectTitle: snapshot.title || '',
+      videoFile: null,
+      videoFileName: typeof payload?.videoFileName === 'string' ? payload.videoFileName : null,
+      videoUrl: '',
+      isAudioOnly: false,
+      jobId: '',
+      detectedLanguage: payload?.detectedLanguage || '',
+      segments: Array.isArray(payload?.segments) ? payload.segments : [],
+      hasTranslation: Boolean(payload?.hasTranslation),
+      translatedLanguage: payload?.translatedLanguage || '',
+      speakerNames: typeof payload?.speakerNames === 'object' ? payload.speakerNames : {},
+      options: {
+        ...prev.options,
+        ...(typeof payload?.subtitleOptions === 'object' ? payload.subtitleOptions : {}),
+      },
+      status: { message: `Project loaded: ${snapshot.title}`, error: false },
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!projectRepository) {
+      setState(prev => ({ ...prev, projectsReady: true }));
+      return undefined;
+    }
+    let active = true;
+    const restoreLatestProject = async () => {
+      try {
+        const page = await projectRepository.listProjects({ limit: 50, offset: 0 });
+        const latest = page.items.find(project => project.kind === 'subtitle');
+        if (latest) {
+          const snapshot = await projectRepository.getProject(latest.id);
+          const current = stateRef.current;
+          const hasLocalWork = Boolean(current.projectId || current.videoFile || current.segments.length);
+          if (active && snapshot && !hasLocalWork) loadProjectFromSnapshot(snapshot);
+        }
+      } catch (error) {
+        services?.logger?.error?.('useVideoSubtitles.restoreProject', error);
+      } finally {
+        if (active) setState(prev => ({ ...prev, projectsReady: true }));
+      }
+    };
+    void restoreLatestProject();
+    return () => { active = false; };
+  }, [projectRepository, loadProjectFromSnapshot, services]);
+
+  const buildProjectSnapshot = useCallback(() => createSubtitleProjectSnapshot({
+    id: state.projectId || undefined,
+    title: state.projectTitle || state.videoFileName || state.videoFile?.name || 'Untitled project',
+    videoFileName: state.videoFileName || state.videoFile?.name || null,
+    segments: state.segments,
+    speakerNames: state.speakerNames,
+    subtitleOptions: state.options,
+    detectedLanguage: state.detectedLanguage,
+    translatedLanguage: state.translatedLanguage,
+    hasTranslation: state.hasTranslation,
+  }), [
+    state.projectId,
+    state.projectTitle,
+    state.videoFileName,
+    state.videoFile?.name,
+    state.segments,
+    state.speakerNames,
+    state.options,
+    state.detectedLanguage,
+    state.translatedLanguage,
+    state.hasTranslation,
+  ]);
+
+  const persistCurrentProject = useCallback(async () => {
+    if (!projectRepository) return null;
+    if (!state.projectId && !state.videoFileName && !state.segments.length) return null;
+    const snapshot = buildProjectSnapshot();
+    const saved = await projectRepository.saveProject(snapshot);
+    if (saved?.project?.id && !state.projectId) {
+      setState(prev => prev.projectId ? prev : { ...prev, projectId: saved.project.id, projectTitle: snapshot.title });
+    }
+    return saved;
+  }, [projectRepository, state.projectId, state.videoFileName, state.segments.length, buildProjectSnapshot]);
+
+  useEffect(() => {
+    if (!state.projectsReady || !projectRepository) return undefined;
+    if (!state.projectId && !state.videoFileName && !state.segments.length) return undefined;
+    const timer = globalThis.setTimeout(async () => {
+      try {
+        await persistCurrentProject();
+      } catch (error) {
+        services?.logger?.error?.('useVideoSubtitles.autosave', error, { projectId: state.projectId });
+      }
+    }, 1500);
+    return () => globalThis.clearTimeout?.(timer);
+  }, [projectRepository, state.projectsReady, state.projectId, state.videoFileName, state.segments.length, persistCurrentProject, services]);
+
   const getTtsHandoff = useCallback((speakerId = ttsSpeakerId, selectedIds = null) => {
     const idSet = selectedIds?.length ? new Set(selectedIds) : null;
     const scopedSegments = idSet ? state.segments.filter(seg => idSet.has(seg.id)) : state.segments;
@@ -837,6 +1008,11 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     activeSegmentId,
     ttsSpeakerId,
     setTtsSpeakerId,
+    projectId: state.projectId,
+    projectTitle: state.projectTitle,
+    flushProjectSave: persistCurrentProject,
+    loadProjectFromSnapshot,
+    projectRepository,
     speakers,
     effectiveIncludeSpeaker,
     hasSubtitleText,
@@ -849,6 +1025,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     vttUrl,
     setStatus,
     selectVideoFile,
+    importSubtitleFile,
     clearWorkspace,
     updateOption,
     updateSubtitleStyle,

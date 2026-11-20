@@ -652,6 +652,275 @@ test('mounted AudioPlayer unlocks Play from WAV/WebAudio duration across Take 1 
   }
 });
 
+test('mounted Studio A/B switches take pills, syncs pin state to the selected take, and revokes every take URL', async () => {
+  const dom = installTestDom();
+  const prevCreate = URL.createObjectURL;
+  const prevRevoke = URL.revokeObjectURL;
+  const createdUrls = [];
+  const revokedUrls = [];
+  let urlCounter = 0;
+  URL.createObjectURL = blob => {
+    const url = `blob:http://127.0.0.1:8087/session-take-${++urlCounter}`;
+    createdUrls.push(url);
+    return url;
+  };
+  URL.revokeObjectURL = url => revokedUrls.push(url);
+
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+    const { createSynthesizeSpeechUseCase } = await import('../../src/domain/useCases.js');
+
+    const anchorMap = new Map();
+    let callIndex = 0;
+    const speechGateway = {
+      checkAvailability: async () => true,
+      uploadReferenceAudio: async params => ({ path: '/tmp/ref.wav', orig_name: params.fileName, mime_type: 'audio/wav' }),
+      async synthesize(params) {
+        callIndex += 1;
+        return { blob: buildPcmWavBlob({ seconds: callIndex === 1 ? 2 : 3 }), seed: params.seed };
+      },
+    };
+    const services = {
+      speechGateway,
+      audioDecoder: { decodePeaks: async () => [0.2, 0.8] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 777 }),
+      lockReferenceAudio: { execute: async f => ({ blob: f, fileName: f.name }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: {
+          loadAllAnchors: async () => Object.fromEntries(anchorMap.entries()),
+          saveAnchor: async (id, rec) => anchorMap.set(id, rec),
+          deleteAnchor: async id => anchorMap.delete(id),
+        },
+      }),
+    };
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+
+    const scriptInput = container.querySelector('#script');
+    const speak = async text => {
+      await act(async () => {
+        setControlledText(scriptInput, text, text.length);
+      });
+      await act(async () => {
+        container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+        await new Promise(r => setTimeout(r, 25));
+      });
+    };
+
+    await speak('Take one script');
+    assert.equal(container.querySelectorAll('.take-pill').length, 0);
+    assert.ok(anchorMap.get(CHAR_NISA.id)?.takeId);
+
+    await speak('Take two script');
+
+    let pills = container.querySelectorAll('.take-pill');
+    assert.equal(pills.length, 2);
+    assert.equal(pills[0].textContent, 'Take 1 · 0:02');
+    assert.equal(pills[1].textContent, 'Take 2 · 0:03');
+    assert.equal(pills[0].getAttribute('aria-pressed'), 'false');
+    assert.equal(pills[1].getAttribute('aria-pressed'), 'true');
+    assert.equal(container.querySelector('#duration').textContent, '0:03');
+    assert.match(container.querySelector('#lock-voice').textContent, /Use as Nisa's voice/);
+
+    // Switching to Take 1 makes the pinned Take 1 anchor the active lock state and swaps playback media.
+    await act(async () => {
+      pills[0].dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+    pills = container.querySelectorAll('.take-pill');
+    assert.equal(pills[0].getAttribute('aria-pressed'), 'true');
+    assert.equal(pills[1].getAttribute('aria-pressed'), 'false');
+    assert.equal(container.querySelector('#duration').textContent, '0:02');
+    assert.match(container.querySelector('#lock-voice').textContent, /Locked to Nisa/);
+    assert.equal(container.querySelector('#lock-voice').hasAttribute('disabled'), true);
+
+    // Switching back to Take 2 re-enables pinning and swaps playback media again.
+    await act(async () => {
+      pills[1].dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+    pills = container.querySelectorAll('.take-pill');
+    assert.equal(pills[1].getAttribute('aria-pressed'), 'true');
+    assert.equal(container.querySelector('#duration').textContent, '0:03');
+    assert.match(container.querySelector('#lock-voice').textContent, /Use as Nisa's voice/);
+
+    // Deleting the active Take 2 falls back to Take 1, which is still the pinned anchor.
+    await act(async () => {
+      container.querySelector('.take-pill-delete').dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(container.querySelector('.take-pill'), null);
+    assert.equal(container.querySelector('#duration').textContent, '0:02');
+    assert.match(container.querySelector('#lock-voice').textContent, /Locked to Nisa/);
+
+    // A fresh generation restores the A/B strip and keeps Take 1 as the older pinned take.
+    await speak('Take three script');
+    pills = container.querySelectorAll('.take-pill');
+    assert.equal(pills.length, 2);
+    assert.equal(pills[0].textContent, 'Take 1 · 0:02');
+    assert.equal(pills[1].textContent, 'Take 2 · 0:03');
+    assert.equal(pills[1].getAttribute('aria-pressed'), 'true');
+    assert.match(container.querySelector('#lock-voice').textContent, /Use as Nisa's voice/);
+
+    await act(async () => { root.unmount(); });
+    root = null;
+    assert.deepEqual(new Set(revokedUrls), new Set(createdUrls));
+    assert.equal(revokedUrls.length, createdUrls.length);
+  } finally {
+    URL.createObjectURL = prevCreate;
+    URL.revokeObjectURL = prevRevoke;
+    if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});
+
+test('mounted Studio regenerates only segment 2 of a chunked script and swaps the merged player immediately', async () => {
+  const dom = installTestDom();
+  const prevCreate = URL.createObjectURL;
+  const prevRevoke = URL.revokeObjectURL;
+  const createdUrls = [];
+  const revokedUrls = [];
+  let urlCounter = 0;
+  URL.createObjectURL = blob => {
+    const url = `blob:http://127.0.0.1:8087/segment-take-${++urlCounter}`;
+    createdUrls.push(url);
+    return url;
+  };
+  URL.revokeObjectURL = url => revokedUrls.push(url);
+
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+    const { createSynthesizeSpeechUseCase } = await import('../../src/domain/useCases.js');
+
+    const anchorMap = new Map();
+    let synthesizeCalls = 0;
+    let isRegenerating = false;
+    const speechGateway = {
+      checkAvailability: async () => true,
+      uploadReferenceAudio: async params => ({ path: '/tmp/ref.wav', orig_name: params.fileName, mime_type: 'audio/wav' }),
+      async synthesize(params) {
+        synthesizeCalls += 1;
+        return { blob: buildPcmWavBlob({ seconds: isRegenerating ? 7 : 2 }), seed: params.seed };
+      },
+    };
+    const services = {
+      speechGateway,
+      audioDecoder: { decodePeaks: async () => [0.2, 0.8] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, seedGenerator: () => 777 }),
+      lockReferenceAudio: { execute: async f => ({ blob: f, fileName: f.name }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: {
+          loadAllAnchors: async () => Object.fromEntries(anchorMap.entries()),
+          saveAnchor: async (id, rec) => anchorMap.set(id, rec),
+          deleteAnchor: async id => anchorMap.delete(id),
+        },
+      }),
+    };
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+    });
+
+    const longScript = `${'Sentence one is long enough to exceed the minimum chunk size cleanly. '.repeat(3)}Sentence two keeps the exact same anchored voice.`;
+    await act(async () => {
+      setControlledText(container.querySelector('#script'), longScript, longScript.length);
+    });
+    await act(async () => {
+      container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 45));
+    });
+
+    assert.equal(synthesizeCalls, 2);
+    assert.match(container.querySelector('.segments-summary').textContent, /Segments \(2\)/);
+    let rows = container.querySelectorAll('.segment-row');
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].querySelector('.segment-duration').textContent, '0:02');
+    assert.equal(rows[1].querySelector('.segment-duration').textContent, '0:02');
+    assert.equal(container.querySelector('#duration').textContent, '0:04');
+    const firstDownloadUrl = container.querySelector('#download').getAttribute('href');
+    assert.match(firstDownloadUrl, /^blob:/);
+
+    const correctedText = 'A corrected second part.';
+    await act(async () => {
+      setControlledText(rows[1].querySelector('.segment-text'), correctedText, correctedText.length);
+    });
+    assert.equal(rows[1].querySelector('.segment-text').value, correctedText);
+
+    const callsBeforeRegenerate = synthesizeCalls;
+    isRegenerating = true;
+    await act(async () => {
+      rows[1].querySelector('.segment-regenerate').dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 70));
+    });
+
+    assert.equal(synthesizeCalls - callsBeforeRegenerate, 1);
+    rows = container.querySelectorAll('.segment-row');
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].querySelector('.segment-text').value, 'Sentence one is long enough to exceed the minimum chunk size cleanly. Sentence one is long enough to exceed the minimum chunk size cleanly.');
+    assert.equal(rows[1].querySelector('.segment-text').value, correctedText);
+    assert.equal(rows[0].querySelector('.segment-duration').textContent, '0:02');
+    assert.equal(rows[1].querySelector('.segment-duration').textContent, '0:07');
+    assert.equal(container.querySelector('#duration').textContent, '0:09');
+    const secondDownloadUrl = container.querySelector('#download').getAttribute('href');
+    assert.match(secondDownloadUrl, /^blob:/);
+    assert.notEqual(secondDownloadUrl, firstDownloadUrl);
+    assert.equal(revokedUrls.includes(firstDownloadUrl), true);
+
+    await act(async () => { root.unmount(); });
+    root = null;
+    assert.equal(container.querySelector('.segments-drawer'), null);
+    assert.deepEqual(new Set(revokedUrls), new Set(createdUrls));
+    assert.equal(revokedUrls.length, createdUrls.length);
+  } finally {
+    URL.createObjectURL = prevCreate;
+    URL.revokeObjectURL = prevRevoke;
+    if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});
+
 test('mounted Studio pops up top offline banner with root cause and hides automatically when online', async () => {
   const dom = installTestDom();
   const React = (await import('react')).default;
@@ -918,6 +1187,190 @@ test('mounted Studio supports on-demand and optional auto Whisper word check for
     assert.ok(container.querySelector('.speech-verify-card'));
   } finally {
     if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});
+
+test('mounted Studio edits pronunciation rules, applies them only to synthesized text, and keeps #script untouched', async () => {
+  const dom = installTestDom();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+
+  let root;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { Studio } = await vite.ssrLoadModule('/src/presentation/components/Studio.jsx');
+    const { createSynthesizeSpeechUseCase } = await import('../../src/domain/useCases.js');
+    const { createHttpGlossaryRepository } = await import('../../src/data/httpGlossaryRepository.js');
+    const { normalizeGlossaryRules } = await import('../../src/domain/pronunciationRules.js');
+
+    let storedRules = [];
+    const putBodies = [];
+    const fetchImpl = async (url, options = {}) => {
+      assert.equal(url, '/api/v1/glossary');
+      if (options.method === 'PUT') {
+        const body = JSON.parse(options.body);
+        putBodies.push(body);
+        storedRules = normalizeGlossaryRules(body.rules);
+      }
+      return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({ data: { rules: storedRules }, error: null, meta: {} }) };
+    };
+    const glossaryRepository = createHttpGlossaryRepository({ baseUrl: '/api/v1', fetchImpl, storage: null });
+
+    const anchorMap = new Map();
+    const spokenTexts = [];
+    const speechGateway = {
+      checkAvailability: async () => true,
+      uploadReferenceAudio: async params => ({ path: '/tmp/ref.wav', orig_name: params.fileName, mime_type: 'audio/wav' }),
+      async synthesize(params) {
+        spokenTexts.push(params.text);
+        return { blob: buildPcmWavBlob({ seconds: 1 }), seed: params.seed };
+      },
+    };
+    const services = {
+      speechGateway,
+      glossaryRepository,
+      audioDecoder: { decodePeaks: async () => [0.2, 0.8] },
+      logger: { debug() {}, warn() {}, error() {} },
+      synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, glossaryRepository, seedGenerator: () => 777 }),
+      lockReferenceAudio: { execute: async f => ({ blob: f, fileName: f.name }) },
+      voiceLibrary: createVoiceLibraryUseCases({
+        voiceRepository: { loadSavedEntries: () => ({ entries: [], warning: null }), saveEntries() {} },
+      }),
+      voiceAnchors: createVoiceAnchorUseCases({
+        anchorRepository: {
+          loadAllAnchors: async () => Object.fromEntries(anchorMap.entries()),
+          saveAnchor: async (id, rec) => anchorMap.set(id, rec),
+          deleteAnchor: async id => anchorMap.delete(id),
+        },
+      }),
+    };
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services }, React.createElement(Studio)));
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    const click = async selector => act(async () => {
+      container.querySelector(selector).dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 20));
+    });
+    const submit = async () => act(async () => {
+      container.querySelector('#speech-form').dispatchEvent({ type: 'submit', bubbles: true });
+      await new Promise(r => setTimeout(r, 45));
+    });
+
+    assert.equal(container.querySelector('#pronunciation-rules-toggle').textContent, 'Pronunciation rules');
+    await click('#pronunciation-rules-toggle');
+    assert.equal(container.querySelector('#pronunciation-rules-toggle').getAttribute('aria-expanded'), 'true');
+
+    // A half-filled row is rejected inline and never reaches the server.
+    await click('#add-pronunciation-rule');
+    await act(async () => {
+      const replacement = container.querySelector('.pronunciation-replacement');
+      setControlledText(replacement, 'ណាសា', 4);
+    });
+    await click('#save-pronunciation-rules');
+    assert.equal(putBodies.length, 0);
+    assert.match(container.querySelector('.pronunciation-status').textContent, /Enter the word or phrase to replace/);
+
+    await act(async () => { setControlledText(container.querySelector('.pronunciation-source'), 'NASA', 4); });
+    await click('#save-pronunciation-rules');
+    assert.equal(putBodies.length, 1);
+    assert.deepEqual(putBodies[0].rules.map(rule => [rule.source, rule.replacement, rule.enabled]), [['NASA', 'ណាសា', true]]);
+    assert.equal(container.querySelector('#pronunciation-rules-toggle').textContent, 'Pronunciation rules (1)');
+    assert.match(container.querySelector('.pronunciation-status').textContent, /saved/i);
+
+    const script = 'Visit NASA today';
+    await act(async () => { setControlledText(container.querySelector('#script'), script, script.length); });
+    await submit();
+    assert.deepEqual(spokenTexts, ['Visit ណាសា today']);
+    assert.equal(container.querySelector('#script').value, script);
+
+    // Disabling the rule restores the original spoken text on the next take.
+    const enabledToggle = container.querySelector('.pronunciation-enabled');
+    await act(async () => {
+      enabledToggle.checked = false;
+      enabledToggle.dispatchEvent({ type: 'click', bubbles: true, target: enabledToggle });
+    });
+    await click('#save-pronunciation-rules');
+    assert.equal(putBodies.length, 2);
+    assert.equal(putBodies[1].rules[0].enabled, false);
+    await submit();
+    assert.deepEqual(spokenTexts, ['Visit ណាសា today', 'Visit NASA today']);
+
+    // Deleting the only rule and saving empties the dictionary.
+    await click('.pronunciation-delete');
+    await click('#save-pronunciation-rules');
+    assert.deepEqual(putBodies[2].rules, []);
+    assert.equal(container.querySelectorAll('.pronunciation-row').length, 0);
+  } finally {
+    if (root) await act(async () => { root.unmount(); });
+    dom.restore();
+    await vite.close();
+  }
+});
+
+test('speech verification requires the injected media gateway and never creates a network fallback', async () => {
+  const dom = installTestDom();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  let root;
+
+  try {
+    globalThis.fetch = async () => { fetchCalls += 1; throw new Error('unexpected network request'); };
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { useSpeechVerification } = await vite.ssrLoadModule('/src/presentation/hooks/useSpeechVerification.js');
+    const recording = {
+      id: 'recording-without-gateway',
+      blob: new Blob(['RIFF'], { type: 'audio/wav' }),
+      transcript: 'សួស្តី',
+    };
+    function Probe() {
+      const verification = useSpeechVerification({ recording });
+      return React.createElement(React.Fragment, null,
+        React.createElement('button', { id: 'verify-speech', onClick: verification.onVerify }, 'Verify'),
+        React.createElement('p', { id: 'verification-error' }, verification.error));
+    }
+
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, {
+        services: { mediaSubtitleGateway: {}, logger: { debug() {}, warn() {}, error() {} } },
+      }, React.createElement(Probe)));
+    });
+    await act(async () => {
+      container.querySelector('#verify-speech').dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+
+    assert.match(container.querySelector('#verification-error').textContent, /unavailable in this environment/);
+    assert.equal(fetchCalls, 0);
+  } finally {
+    if (root) await act(async () => { root.unmount(); });
+    globalThis.fetch = originalFetch;
     dom.restore();
     await vite.close();
   }

@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { SynthesisError } from '../../src/domain/errors.js';
 import {
   concatenateWavBlobs,
+  concatenateWavBlobsWithPauses,
   ensureAudioWavBlob,
   inspectWavBuffer,
   readWavDurationSeconds,
+  replaceChunkAndRestitch,
   smoothAndTrimWavBlob,
   tryReadWavDurationSeconds,
   trySmoothWavBlob,
@@ -102,4 +104,85 @@ test('smoothAndTrimWavBlob trims excessive edge silence and fades edges while pr
   const safeStub = await trySmoothWavBlob(stubBlob);
   assert.equal(safeStub.type, 'audio/wav');
   assert.equal(safeStub.size, 8);
+});
+
+test('concatenateWavBlobsWithPauses inserts exact per-entry PCM silence durations and preserves concatenateWavBlobs parity', async () => {
+  const sampleRate = 48000;
+  const clipA = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.2).fill(1200) });
+  const clipB = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.3).fill(1500) });
+  const clipC = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.15).fill(1800) });
+
+  // Trailing pauseAfterMs on the final entry is ignored (pauses separate clips only).
+  const varied = await concatenateWavBlobsWithPauses([
+    { blob: clipA, pauseAfterMs: 500 },
+    { blob: clipB, pauseAfterMs: 800 },
+    { blob: clipC, pauseAfterMs: 2500 },
+  ]);
+  const variedBuf = await varied.arrayBuffer();
+  const variedInfo = inspectWavBuffer(variedBuf);
+  assert.equal(varied.type, 'audio/wav');
+  assert.equal(variedInfo.sampleRate, sampleRate);
+  const expectedDuration = (200 + 500 + 300 + 800 + 150) / 1000;
+  assert.equal(readWavDurationSeconds(variedBuf), expectedDuration);
+  assert.equal(variedInfo.dataSize, Math.round(expectedDuration * sampleRate) * 2);
+
+  // Verify the 500ms silence window between clipA and clipB is all zero PCM bytes.
+  const silenceStart = variedInfo.dataOffset + Math.round(0.2 * sampleRate) * 2;
+  const silenceBytes = new Uint8Array(variedBuf, silenceStart, Math.round(0.5 * sampleRate) * 2);
+  assert.ok(silenceBytes.every(byte => byte === 0));
+
+  // Explicit 0ms gap stitches back-to-back with zero inserted silence.
+  const zeroGap = await concatenateWavBlobsWithPauses([
+    { blob: clipA, pauseAfterMs: 0 },
+    { blob: clipB, pauseAfterMs: 0 },
+  ]);
+  assert.equal(readWavDurationSeconds(await zeroGap.arrayBuffer()), 0.5);
+
+  // Missing/null pauseAfterMs falls back to defaultPauseMs (160ms) and matches concatenateWavBlobs byte-for-byte.
+  const viaPauses = await concatenateWavBlobsWithPauses([
+    { blob: clipA, pauseAfterMs: null },
+    { blob: clipB },
+    { blob: clipC },
+  ], 200);
+  const viaUniform = await concatenateWavBlobs([clipA, clipB, clipC], 200);
+  assert.deepEqual(new Uint8Array(await viaPauses.arrayBuffer()), new Uint8Array(await viaUniform.arrayBuffer()));
+  assert.equal(readWavDurationSeconds(await viaPauses.arrayBuffer()), (200 + 200 + 300 + 200 + 150) / 1000);
+
+  // Single clip returns normalized WAV unchanged.
+  const single = await concatenateWavBlobsWithPauses([{ blob: clipA, pauseAfterMs: 1000 }]);
+  assert.equal(readWavDurationSeconds(await single.arrayBuffer()), 0.2);
+
+  // Invalid inputs reject with typed SynthesisError codes.
+  await assert.rejects(() => concatenateWavBlobsWithPauses([]), err => err instanceof SynthesisError && err.code === 'EMPTY_AUDIO_SEGMENTS');
+  await assert.rejects(() => concatenateWavBlobsWithPauses([{ blob: clipA }, { blob: null }]), err => err instanceof SynthesisError && err.code === 'EMPTY_AUDIO_SEGMENTS');
+  const mismatched = makeTestWavBlob({ sampleRate: 16000, samples: new Array(1600).fill(500) });
+  await assert.rejects(
+    () => concatenateWavBlobsWithPauses([{ blob: clipA, pauseAfterMs: 300 }, { blob: mismatched }]),
+    err => err instanceof SynthesisError && err.code === 'WAV_FORMAT_MISMATCH'
+  );
+});
+
+test('replaceChunkAndRestitch preserves per-chunk pauseAfterMs when replacing one segment', async () => {
+  const sampleRate = 48000;
+  const clipA = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.2).fill(900) });
+  const clipB = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.2).fill(900) });
+  const clipBReplaced = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.4).fill(900) });
+  const clipC = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.1).fill(900) });
+
+  const chunks = [
+    { index: 0, text: 'First', blob: clipA, pauseAfterMs: 500 },
+    { index: 1, text: 'Second', blob: clipB, pauseAfterMs: 800 },
+    { index: 2, text: 'Third', blob: clipC, pauseAfterMs: null },
+  ];
+  const { chunks: updated, blob } = await replaceChunkAndRestitch({
+    chunks,
+    index: 1,
+    nextChunk: { text: 'Second updated', blob: clipBReplaced },
+    pauseMs: 160,
+  });
+
+  assert.equal(updated[0].pauseAfterMs, 500);
+  assert.equal(updated[1].pauseAfterMs, 800);
+  assert.equal(updated[2].pauseAfterMs, null);
+  assert.equal(readWavDurationSeconds(await blob.arrayBuffer()), (200 + 500 + 400 + 800 + 100) / 1000);
 });

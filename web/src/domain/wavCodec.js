@@ -16,6 +16,7 @@ const TRIM_HEAD_PAD_MS = 45;
 const TRIM_TAIL_PAD_MS = 80;
 const MIN_FADE_DURATION_MS = 50;
 const EDGE_FADE_MS = 5;
+const DEFAULT_PAUSE_MS = 160;
 
 /**
  * Reads a 4-character ASCII tag from a DataView.
@@ -355,23 +356,92 @@ function decodeWavSegments(blobs) {
  * @param {number} [pauseMs=160] - Silence gap inserted between segments.
  * @returns {Promise<Blob>} Single stitched WAV Blob.
  */
-export async function concatenateWavBlobs(blobs, pauseMs = 160) {
+export async function concatenateWavBlobs(blobs, pauseMs = DEFAULT_PAUSE_MS) {
   if (!Array.isArray(blobs) || blobs.length === 0) {
     throw new SynthesisError('No generated audio segments to combine.', { code: 'EMPTY_AUDIO_SEGMENTS' });
   }
   if (blobs.length === 1) return ensureAudioWavBlob(blobs[0]);
-  const decoded = await decodeWavSegments(blobs);
+  return stitchDecodedSegments(await decodeWavSegments(blobs), blobs.map(() => pauseMs));
+}
+
+/**
+ * Stitches decoded PCM slices into one WAV, inserting frame-aligned silence between neighbours.
+ * @param {Array<{ info: object, pcm: Uint8Array }>} decoded - Decoded segments (2 or more).
+ * @param {number[]} gapsAfterMs - `gapsAfterMs[i]` is the silence inserted after segment `i`; the last value is unused.
+ * @returns {Blob} Combined `audio/wav` Blob.
+ */
+function stitchDecodedSegments(decoded, gapsAfterMs) {
   const base = decoded[0].info;
-  const silence = buildSilenceBytes({ byteRate: base.byteRate, blockAlign: base.blockAlign, pauseMs });
   const parts = [];
   let dataLength = 0;
   for (let i = 0; i < decoded.length; i++) {
     if (!hasMatchingWaveFormat(base, decoded[i].info)) {
       throw new SynthesisError('Generated segments have mismatched WAV audio formats.', { code: 'WAV_FORMAT_MISMATCH' });
     }
-    if (i > 0 && silence.byteLength > 0) { parts.push(silence); dataLength += silence.byteLength; }
+    const silence = i > 0 ? buildSilenceBytes({ byteRate: base.byteRate, blockAlign: base.blockAlign, pauseMs: gapsAfterMs[i - 1] }) : null;
+    if (silence && silence.byteLength > 0) { parts.push(silence); dataLength += silence.byteLength; }
     parts.push(decoded[i].pcm);
     dataLength += decoded[i].pcm.byteLength;
   }
   return new Blob([buildWaveHeader({ ...base, dataLength }), ...parts], { type: 'audio/wav' });
+}
+
+/**
+ * Resolves the silence after one entry: non-finite values fall back to `defaultPauseMs`, negatives become 0.
+ * @param {unknown} pauseAfterMs - Entry pause in milliseconds.
+ * @param {number} defaultPauseMs - Fallback gap.
+ * @returns {number} Gap in milliseconds (`>= 0`).
+ */
+function resolveEntryPauseMs(pauseAfterMs, defaultPauseMs) {
+  return Number.isFinite(pauseAfterMs) ? Math.max(0, pauseAfterMs) : defaultPauseMs;
+}
+
+/**
+ * Concatenates PCM WAV Blobs with an individually specified silence after each clip.
+ * Inputs: ordered entries `{ blob, pauseAfterMs }` and an optional `defaultPauseMs` (160) used when an entry omits `pauseAfterMs`.
+ * Outputs: combined `audio/wav` Blob; a single entry returns its MIME-normalized Blob unchanged.
+ * Side effects: reads binary buffers from each entry's Blob.
+ * Failure modes: throws SynthesisError for an empty list, an entry without a Blob, invalid WAV headers, or mismatched formats.
+ * Notes: `pauseAfterMs` is the gap *between* clips, so the last entry's value is ignored; `0` means no gap.
+ * Gaps are zero-filled PCM rounded down to whole sample frames (exact for common rates such as 16/24/48 kHz).
+ * @param {Array<{ blob: Blob, pauseAfterMs?: number|null }>} entries - Ordered clips with trailing pauses.
+ * @param {number} [defaultPauseMs=160] - Gap used when `pauseAfterMs` is missing or not a finite number.
+ * @returns {Promise<Blob>} Single stitched WAV Blob.
+ */
+export async function concatenateWavBlobsWithPauses(entries, defaultPauseMs = DEFAULT_PAUSE_MS) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new SynthesisError('No generated audio segments to combine.', { code: 'EMPTY_AUDIO_SEGMENTS' });
+  }
+  if (entries.some(entry => !entry?.blob)) {
+    throw new SynthesisError('A generated audio segment is missing its audio.', { code: 'EMPTY_AUDIO_SEGMENTS' });
+  }
+  if (entries.length === 1) return ensureAudioWavBlob(entries[0].blob);
+  const decoded = await decodeWavSegments(entries.map(entry => entry.blob));
+  return stitchDecodedSegments(decoded, entries.map(entry => resolveEntryPauseMs(entry.pauseAfterMs, defaultPauseMs)));
+}
+
+/**
+ * Replaces one generated chunk and re-stitches the full ordered PCM WAV without mutating the input chunks.
+ * Inputs: `{ chunks, index, nextChunk, pauseMs }`; `pauseMs` is the default gap, and each chunk's own `pauseAfterMs` (from `[pause ...]` markers) is preserved.
+ * Outputs: `{ chunks, blob }` with the swapped chunk metadata and freshly concatenated WAV.
+ * Side effects: reads binary WAV data from each chunk Blob.
+ * Failure modes: throws SynthesisError when the chunk list, index, or replacement audio is invalid.
+ * @param {{ chunks: object[], index: number, nextChunk: object, pauseMs?: number }} params - Replacement spec.
+ * @returns {Promise<{ chunks: object[], blob: Blob }>} Updated chunks and stitched WAV.
+ */
+export async function replaceChunkAndRestitch({ chunks, index, nextChunk, pauseMs = DEFAULT_PAUSE_MS } = {}) {
+  if (!Array.isArray(chunks) || chunks.length === 0) {
+    throw new SynthesisError('No generated segments to restitch.', { code: 'EMPTY_AUDIO_SEGMENTS' });
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= chunks.length) {
+    throw new SynthesisError('Choose a valid generated segment to replace.', { code: 'INVALID_CHUNK_INDEX' });
+  }
+  if (!nextChunk?.blob) {
+    throw new SynthesisError('Regenerated segment is missing audio.', { code: 'EMPTY_AUDIO_SEGMENTS' });
+  }
+  const nextChunks = chunks.map((chunk, chunkIndex) => (
+    chunkIndex === index ? { ...chunk, ...nextChunk, index } : chunk
+  ));
+  const blob = await concatenateWavBlobsWithPauses(nextChunks.map(chunk => ({ blob: chunk.blob, pauseAfterMs: chunk.pauseAfterMs })), pauseMs);
+  return { chunks: nextChunks, blob };
 }

@@ -21,6 +21,12 @@ MEDIA_PLIST="${HOME}/Library/LaunchAgents/${MEDIA_LABEL}.plist"
 MEDIA_PORT="8810"
 
 STUDIO_PORT="${VOICE_STUDIO_PORT:-8087}"
+
+VOLUME_NAME="voxcpm_voice_studio_data"  # Must match the named volume in web/compose.prod.yaml
+STORAGE_SERVICE="storage"
+BACKUP_IMAGE="alpine:3.20"
+BACKUP_DIR="${ROOT_DIR}/backups"
+
 if [[ -x "/usr/bin/curl" ]]; then
   CURL_BIN="/usr/bin/curl"
 else
@@ -282,6 +288,176 @@ show_logs() {
   tail -n 50 -f "${LOG_DIR}/engine.log" "${LOG_DIR}/engine.err.log" "${LOG_DIR}/media.log" "${LOG_DIR}/media.err.log"
 }
 
+usage() {
+  cat <<'EOF'
+Usage: ./studio.sh <command> [arguments]
+
+Commands:
+  start                            Start native services and the Docker stack
+  stop                             Stop native services and Docker containers
+  restart                          Rebuild and restart the full stack
+  status                           Show launchd, Docker, port, and proxy status
+  logs                             Tail engine and media logs
+  backup [output.tar.gz]           Back up Docker volume voxcpm_voice_studio_data
+  restore <backup.tar.gz> [--yes]  Restore a backup (replaces volume contents)
+  cleanup [args...]                Delegate to cleanup.sh
+  help                             Show this help
+
+Backups default to ./backups/voice-studio-YYYYMMDD-HHMMSS.tar.gz.
+Restore requires --yes when stdin is not interactive and the volume is not empty.
+EOF
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Missing docker CLI. Install Docker Desktop and retry."
+  docker info >/dev/null 2>&1 || die "Cannot reach the Docker daemon. Start Docker Desktop and retry."
+}
+
+require_volume() {
+  docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1 \
+    || die "Docker volume '${VOLUME_NAME}' does not exist. Start the stack once with './studio.sh start'."
+}
+
+ensure_volume() {
+  if docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
+    return 0
+  fi
+  docker volume create "${VOLUME_NAME}" >/dev/null \
+    || die "Could not create Docker volume '${VOLUME_NAME}'."
+}
+
+validate_archive() {
+  local archive="$1"
+  local entries unsafe
+  entries="$(tar -tzf "${archive}")" || die "Not a valid .tar.gz archive: ${archive}"
+  [[ -n "${entries}" ]] || die "Backup archive is empty: ${archive}"
+  unsafe="$(printf '%s\n' "${entries}" | awk '
+    /^\// { print; exit }
+    {
+      count = split($0, parts, "/")
+      for (i = 1; i <= count; i++) {
+        if (parts[i] == "..") { print; exit }
+      }
+    }
+  ')"
+  [[ -z "${unsafe}" ]] || die "Unsafe path in archive (absolute or '..'): ${unsafe}"
+}
+
+create_backup() {
+  local output="$1"
+  local partial="${output}.partial"
+  mkdir -p "$(dirname "${output}")" || die "Could not create backup directory for ${output}."
+  rm -f "${partial}"
+  if ! docker run --rm --volume "${VOLUME_NAME}:/data:ro" "${BACKUP_IMAGE}" \
+      tar -czf - -C /data . >"${partial}"; then
+    rm -f "${partial}"
+    die "Backup failed. Is Docker running and the volume readable?"
+  fi
+  mv "${partial}" "${output}" || { rm -f "${partial}"; die "Could not write ${output}."; }
+  echo "Backup written: ${output}"
+}
+
+run_backup() {
+  local output="" arg
+  for arg in "$@"; do
+    case "${arg}" in
+      -*) die "Unknown backup option: ${arg}" ;;
+      *) [[ -z "${output}" ]] || die "backup accepts at most one output path."
+         output="${arg}" ;;
+    esac
+  done
+  if [[ -z "${output}" ]]; then
+    output="${BACKUP_DIR}/voice-studio-$(date -u +%Y%m%d-%H%M%S).tar.gz"
+  fi
+  [[ ! -d "${output}" ]] || die "Backup output is a directory: ${output}"
+  require_docker
+  require_volume
+  create_backup "${output}"
+}
+
+volume_has_data() {
+  local entries
+  entries="$(docker run --rm --volume "${VOLUME_NAME}:/data:ro" "${BACKUP_IMAGE}" ls -A /data)" \
+    || die "Could not inspect Docker volume '${VOLUME_NAME}'."
+  [[ -n "${entries}" ]]
+}
+
+confirm_overwrite() {
+  local archive="$1"
+  local assume_yes="$2"
+  local reply=""
+  if [[ "${assume_yes}" -eq 1 ]] || ! volume_has_data; then
+    return 0
+  fi
+  [[ -t 0 ]] || die "Volume '${VOLUME_NAME}' contains data. Re-run with --yes to overwrite it."
+  printf 'Replace all data in volume %s with %s? [y/N] ' "${VOLUME_NAME}" "${archive}" >&2
+  read -r reply || die "Restore cancelled."
+  case "${reply}" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) die "Restore cancelled." ;;
+  esac
+}
+
+storage_is_running() {
+  local container_id
+  container_id="$(docker compose -f "${COMPOSE_FILE}" ps -q "${STORAGE_SERVICE}")" \
+    || die "Could not query the '${STORAGE_SERVICE}' container state."
+  [[ -n "${container_id}" ]]
+}
+
+clear_volume() {
+  docker run --rm --volume "${VOLUME_NAME}:/data" "${BACKUP_IMAGE}" \
+    sh -c 'rm -rf /data/* /data/.[!.]* /data/..?*' \
+    || die "Could not clear Docker volume '${VOLUME_NAME}'."
+}
+
+extract_archive() {
+  docker run --rm -i --volume "${VOLUME_NAME}:/data" "${BACKUP_IMAGE}" \
+    tar -xzf - -C /data <"$1" \
+    || die "Could not extract ${1}. The storage container remains stopped."
+}
+
+restore_volume() {
+  local archive="$1"
+  local was_running=0
+  if storage_is_running; then
+    was_running=1
+  fi
+  if [[ "${was_running}" -eq 1 ]]; then
+    docker compose -f "${COMPOSE_FILE}" stop "${STORAGE_SERVICE}" \
+      || die "Could not stop the '${STORAGE_SERVICE}' container."
+  fi
+  clear_volume
+  extract_archive "${archive}"
+  if [[ "${was_running}" -eq 1 ]]; then
+    docker compose -f "${COMPOSE_FILE}" up -d "${STORAGE_SERVICE}" \
+      || die "Restored data, but failed to restart the '${STORAGE_SERVICE}' container."
+  fi
+  echo "Restored ${archive} into Docker volume ${VOLUME_NAME}."
+}
+
+run_restore() {
+  local archive=""
+  local assume_yes=0
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --yes|-y) assume_yes=1 ;;
+      -*) die "Unknown restore option: ${arg}" ;;
+      *) [[ -z "${archive}" ]] || die "restore accepts exactly one archive path."
+         archive="${arg}" ;;
+    esac
+  done
+  [[ -n "${archive}" ]] || die "Usage: $0 restore <backup.tar.gz> [--yes]"
+  [[ -f "${archive}" ]] || die "Backup archive not found: ${archive}"
+  validate_archive "${archive}"
+  require_docker
+  [[ -f "${COMPOSE_FILE}" ]] || die "Missing compose file: ${COMPOSE_FILE}"
+  ensure_volume
+  confirm_overwrite "${archive}" "${assume_yes}"
+  restore_volume "${archive}"
+}
+
 main() {
   local action="${1:-status}"
   case "${action}" in
@@ -290,11 +466,11 @@ main() {
     restart) restart_stack ;;
     status) show_status ;;
     logs) show_logs ;;
+    backup) shift; run_backup "$@" ;;
+    restore) shift; run_restore "$@" ;;
     cleanup) shift; exec "${ROOT_DIR}/cleanup.sh" "$@" ;;
-    *)
-      echo "Usage: $0 {start|stop|restart|status|logs|cleanup}" >&2
-      exit 1
-      ;;
+    -h|--help|help) usage ;;
+    *) die "Unknown command: ${action}. Run '$0 --help' for usage." ;;
   esac
 }
 

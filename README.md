@@ -62,6 +62,8 @@ Other setup options:
 ./studio.sh restart   # restart native services and rebuild/recreate Docker containers
 ./studio.sh logs      # tail engine & media logs (logs/*.log)
 ./studio.sh stop      # stop native services and Docker containers
+./studio.sh backup    # back up the Docker volume to ./backups/voice-studio-<timestamp>.tar.gz
+./studio.sh restore <backup.tar.gz>  # restore a backup (prompts before replacing data)
 ```
 
 ### Updating Upstream Open-Source `engine/`
@@ -82,9 +84,22 @@ media/.venv/bin/pytest -v media/tests
 ./cleanup.sh --unused --dry-run     # preview unused model/cache cleanup (see CLEANUP.md)
 ```
 
+### Backing Up & Restoring Voice Studio Data
+
+Characters, locked voice anchors, and generated audio live in the Docker volume `voxcpm_voice_studio_data` (declared in `web/compose.prod.yaml`).
+
+```sh
+./studio.sh backup                                 # ./backups/voice-studio-YYYYMMDD-HHMMSS.tar.gz
+./studio.sh backup ~/Desktop/voice-studio.tar.gz   # custom output path
+./studio.sh restore ./backups/voice-studio-20260101-120000.tar.gz
+./studio.sh restore ./backups/voice-studio-20260101-120000.tar.gz --yes   # non-interactive
+```
+
+`backup` streams the volume from an ephemeral container mounted read-only (`:ro`). `restore` rejects archives containing absolute paths or `..` entries, stops the `storage` container, replaces the volume contents, and restarts `storage` if it was running. Restore asks for confirmation when the volume already contains data; non-interactive runs must pass `--yes`.
+
 ### Migrating Saved Custom Voices to Another Computer
 
-Code and scripts come straight from Git, and AI models re-download automatically on first run. If you saved custom characters or locked voice anchors in Docker, copy the `voxcpm-voice-studio_storage-data` Docker volume (or keep your original reference `.wav` clips) when moving to a new Mac.
+Code and scripts come straight from Git, and AI models re-download automatically on first run. Use `./studio.sh backup` on the old Mac and `./studio.sh restore <backup.tar.gz>` on the new one to carry over custom characters, locked voice anchors, and generated audio (or keep your original reference `.wav` clips).
 
 ---
 

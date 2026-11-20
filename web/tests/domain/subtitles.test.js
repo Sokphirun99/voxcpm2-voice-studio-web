@@ -28,12 +28,16 @@ import {
   mergeSubtitleSegmentWithNext,
   normalizeTargetLanguageCode,
   parseEditableTimestamp,
+  parseSrt,
+  parseSubtitleFileText,
+  parseVtt,
   pickDefaultTargetLanguage,
   replaceTextInSegments,
   resolveSpeakerLabel,
   resolveTargetLanguageMeta,
   splitSubtitleSegment,
 } from '../../src/domain/subtitles.js';
+import { ValidationError } from '../../src/domain/errors.js';
 
 const SAMPLE_SEGMENTS = [
   { start: 0.5, end: 3.2, text: 'Welcome to the evening news.', translatedText: 'សូមស្វាគមន៍មកកាន់ព័ត៌មានពេលល្ងាច។', speakerId: 'speaker-1' },
@@ -69,6 +73,51 @@ test('buildSrt, buildVtt, buildDialogueText, and buildTtsScriptFromSegments supp
 
   const ttsOnlySpeaker2 = buildTtsScriptFromSegments({ segments: SAMPLE_SEGMENTS, useTranslation: true, speakerId: 'speaker-2' });
   assert.equal(ttsOnlySpeaker2, 'អរគុណដែលបានអញ្ជើញខ្ញុំ។');
+});
+
+test('SRT and VTT builders roundtrip timings, text, and speaker prefixes', () => {
+  const segments = [
+    { start: 0.25, end: 1.75, text: 'First line\nSecond line', speakerId: 'speaker-1' },
+    { start: 62.1, end: 63.5, text: 'Another cue', speakerId: 'speaker-2' },
+  ];
+  const names = { 'speaker-1': 'Host', 'speaker-2': 'Guest' };
+  for (const [build, parse] of [[buildSrt, parseSrt], [buildVtt, parseVtt]]) {
+    const parsed = parse(build({ segments, speakerNames: names }));
+    assert.deepEqual(parsed.map(({ start, end, text, speakerName }) => ({ start, end, text, speakerName })), [
+      { start: 0.25, end: 1.75, text: 'First line\nSecond line', speakerName: 'Host' },
+      { start: 62.1, end: 63.5, text: 'Another cue', speakerName: 'Guest' },
+    ]);
+  }
+});
+
+test('subtitle parsers normalize BOM and CRLF, strip tags, and skip malformed cues', () => {
+  const srt = '\uFEFF1\r\n00:00:00,000 --> 00:00:01,200\r\n<i>[Narrator]</i> Hello <b>there</b>\r\nSecond line\r\n\r\n2\r\n00:00:02,000 --> 00:00:01,000\r\ninvalid end\r\n\r\n3\r\nbad time\r\nignored';
+  const parsed = parseSrt(srt);
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(parsed[0], {
+    id: 'cue-1',
+    start: 0,
+    end: 1.2,
+    text: 'Hello there\nSecond line',
+    translatedText: '',
+    speakerId: 'speaker-1',
+    speakerName: 'Narrator',
+  });
+  assert.equal(parseVtt('WEBVTT\n\nNOTE ignore me\n\n01:02.500 --> 01:04.000\n<c.yellow>Hi</c>')[0].start, 62.5);
+  assert.equal(parseSubtitleFileText('WEBVTT\n\n00:01.000 --> 00:02.000\nA<br>B', 'CAPTIONS.VTT')[0].text, 'A\nB');
+  assert.equal(parseSrt('1\r00:00:01,000 --> 00:00:02,000\rOne\rTwo')[0].text, 'One\nTwo');
+});
+
+test('subtitle parsers reject empty, corrupt, unsupported, and oversized files', () => {
+  for (const [parse, text] of [[parseSrt, ''], [parseVtt, 'not a subtitle']]) {
+    assert.throws(() => parse(text), error => error instanceof ValidationError && error.code === 'NO_VALID_SUBTITLE_CUES');
+  }
+  assert.throws(() => parseSrt('a'.repeat(2 * 1024 * 1024 + 1)), error =>
+    error instanceof ValidationError && error.code === 'SUBTITLE_FILE_TOO_LARGE'
+  );
+  assert.throws(() => parseSubtitleFileText('', 'captions.txt'), error =>
+    error instanceof ValidationError && error.code === 'UNSUPPORTED_SUBTITLE_FILE'
+  );
 });
 
 test('isAudioOnlyFile, bilingual exports, and includeSpeaker=false dialogue formatting', () => {

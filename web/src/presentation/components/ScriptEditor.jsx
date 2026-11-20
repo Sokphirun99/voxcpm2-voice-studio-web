@@ -11,14 +11,14 @@ const KHMER_EXAMPLE = 'សួស្តីអ្នកទាំងអស់គ្
 
 /**
  * Renders the text script input area, Khmer sample button, number-word helper, character counter, and clear button.
- * Inputs: `{ scriptInput, script, count, isOverLimit, onReplaceScript, onScriptChange, onScriptKey }`.
+ * Inputs: `{ scriptInput, script, count, isOverLimit, onReplaceScript, onScriptChange, onScriptKey, segmentsPanel }`.
  * Outputs: `<section className="editor">` element.
  * Side effects: updates controlled script state and focuses textarea on example/clear/format actions.
  * Failure modes: none.
  * @param {object} props - Script editor props.
  * @returns {React.ReactElement} Script editor section.
  */
-export function ScriptEditor({ scriptInput, script, count, isOverLimit, onReplaceScript, onScriptChange, onScriptKey }) {
+export function ScriptEditor({ scriptInput, script, count, isOverLimit, onReplaceScript, onScriptChange, onScriptKey, segmentsPanel = null }) {
   const canFormatNumbers = hasConvertibleKhmerNumbers(script);
   return (
     <section className="editor" aria-labelledby="editor-title">
@@ -47,6 +47,7 @@ export function ScriptEditor({ scriptInput, script, count, isOverLimit, onReplac
         <button type="button" className="button subtle-button clear-button" id="clear-script"
           disabled={!script} onClick={() => onReplaceScript('')}>Clear</button>
       </div>
+      {segmentsPanel}
     </section>
   );
 }

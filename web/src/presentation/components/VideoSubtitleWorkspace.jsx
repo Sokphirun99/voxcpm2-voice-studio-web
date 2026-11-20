@@ -15,8 +15,10 @@ import {
   getSpeakerColor,
   groupLanguageOptions,
   isSameSubtitleLanguage,
+  resolveModelReadinessHints,
   resolveSpeakerLabel,
 } from '../../domain/subtitles.js';
+import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
@@ -34,7 +36,7 @@ const SPEAKER_COUNT_OPTIONS = Object.freeze([
   { id: '6', label: '5+ speakers' },
 ]);
 
-function SubtitleToolbar({ busy, extracting, hasFile, hasSegments, onClear, onCancel, onExtract }) {
+function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract }) {
   return (
     <header className="studio-toolbar">
       <h1>Video to subtitle</h1>
@@ -51,7 +53,7 @@ function SubtitleToolbar({ busy, extracting, hasFile, hasSegments, onClear, onCa
         <button type="button" id="subtitle-extract-btn" className={extracting ? 'button generate is-generating' : 'button generate'}
           disabled={!hasFile || busy} aria-busy={extracting || undefined} onClick={onExtract}>
           {extracting ? <Blocks size={GENERATE_SPINNER_SIZE_PX} className="generate-spinner" /> : <Icon name="subtitles" />}
-          <span>{extracting ? 'Extracting…' : 'Extract subtitles'}</span>
+          <span>{extracting ? (relinking ? 'Linking…' : 'Extracting…') : relinking ? 'Link video for burn-in' : 'Extract subtitles'}</span>
         </button>
       </div>
     </header>
@@ -74,10 +76,11 @@ function MediaOfflineBanner({ health, onRefresh }) {
   );
 }
 
-function VideoPreviewCard({ ctrl, busy = false, onSelectFile }) {
+function VideoPreviewCard({ ctrl, busy = false, onSelectFile, onImportSubtitle }) {
   const { videoRef, vttUrl, useTranslation, bilingual, translatedLanguageMeta, handleVideoMetadata, handleVideoTimeUpdate } = ctrl;
-  const { videoFile, videoUrl, videoSize, isAudioOnly, detectedLanguage } = ctrl.state;
+  const { videoFile, videoFileName, videoUrl, videoSize, isAudioOnly, detectedLanguage } = ctrl.state;
   const trackRef = useRef(null);
+  const subtitleFileInputRef = useRef(null);
   const isPortrait = Boolean(videoSize && videoSize.height > videoSize.width);
   const aspectStyle = videoSize ? { '--video-aspect': `${videoSize.width} / ${videoSize.height}` } : undefined;
   const targetShort = translatedLanguageMeta?.shortLabel || 'Khmer';
@@ -130,10 +133,33 @@ function VideoPreviewCard({ ctrl, busy = false, onSelectFile }) {
           disabled={busy} onChange={e => { onSelectFile(e.target.files?.[0]); e.target.value = ''; }} />
         <Icon name="upload" />
         <span className="subtitle-upload-copy">
-          <strong>{videoFile ? videoFile.name : 'Choose a video or audio clip'}</strong>
-          <span>{videoFile ? 'Click to replace file (.mp4, .mov, .mkv, .webm, .mp3, .wav)' : 'Movies, news, podcasts, or audio clips (max 500 MB)'}</span>
+          <strong>{videoFile?.name || (videoFileName ? `Re-link ${videoFileName}` : 'Choose a video or audio clip')}</strong>
+          <span>{videoFile || videoFileName ? 'Click to replace or re-link file (.mp4, .mov, .mkv, .webm, .mp3, .wav)' : 'Movies, news, podcasts, or audio clips (max 500 MB)'}</span>
         </span>
       </label>
+      <div className="subtitle-file-import">
+        <input
+          ref={subtitleFileInputRef}
+          id="subtitle-file-input"
+          type="file"
+          accept=".srt,.vtt,text/vtt,application/x-subrip"
+          hidden
+          disabled={busy}
+          onChange={e => {
+            const file = e.target.files?.[0];
+            if (file) void onImportSubtitle?.(file);
+            e.target.value = '';
+          }}
+        />
+        <button
+          type="button"
+          className="button subtle-button subtitle-file-import-button"
+          disabled={busy}
+          onClick={() => subtitleFileInputRef.current?.click()}
+        >
+          Import .srt / .vtt
+        </button>
+      </div>
     </section>
   );
 }
@@ -237,7 +263,7 @@ function GroupedLanguageOptions({ grouped }) {
   );
 }
 
-function SubtitleSettingsForm({ ctrl }) {
+function SubtitleSettingsForm({ ctrl, modelHints = [] }) {
   const { options, segments, busyAction, videoFile, isAudioOnly, translatedLanguage } = ctrl.state;
   const busy = Boolean(busyAction);
   const hasTranslation = Boolean(ctrl.hasTranslation);
@@ -304,6 +330,11 @@ function SubtitleSettingsForm({ ctrl }) {
           onChange={checked => ctrl.updateOption('includeSpeaker', checked)}
         />
       </div>
+      {modelHints.length > 0 && (
+        <div className="subtitle-model-hints" aria-label="First-time model downloads">
+          {modelHints.map(hint => <p key={hint}>{hint}</p>)}
+        </div>
+      )}
       {showTargetSelector && (
         <div className="field field-compact">
           <label className="field-label" htmlFor="subtitle-target-lang">Translate to</label>
@@ -352,6 +383,125 @@ function SubtitleSettingsForm({ ctrl }) {
   );
 }
 
+function ProjectSelector({ ctrl }) {
+  const { state, projectId, projectRepository, loadProjectFromSnapshot, flushProjectSave } = ctrl;
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState(projectId || '');
+  const [newTitle, setNewTitle] = useState('');
+  const [error, setError] = useState('');
+  const [refreshKey, setRefreshKey] = useState(0);
+  const busy = Boolean(state.busyAction);
+
+  useEffect(() => {
+    if (!projectRepository) return undefined;
+    let mounted = true;
+    projectRepository.listProjects({ limit: 50, offset: 0 }).then(page => {
+      if (!mounted) return;
+      setProjects(page.items);
+      setSelectedProjectId(prev => {
+        const preferred = projectId || prev;
+        return preferred && page.items.some(project => project.id === preferred) ? preferred : '';
+      });
+    }).catch(err => {
+      if (mounted) setError(err?.message || 'Failed to load saved projects.');
+    });
+    return () => { mounted = false; };
+  }, [projectRepository, projectId, refreshKey]);
+
+  const handleLoadProject = async project => {
+    if (!project || !project.id || !projectRepository) return;
+    try {
+      await flushProjectSave?.();
+      const snapshot = await projectRepository.getProject(project.id);
+      if (!snapshot) {
+        setSelectedProjectId(projectId || '');
+        setError('Project not found.');
+        return;
+      }
+      loadProjectFromSnapshot(snapshot);
+      setSelectedProjectId(project.id);
+      setError('');
+    } catch (err) {
+      setSelectedProjectId(projectId || '');
+      setError(err?.message || 'Failed to open project.');
+    }
+  };
+
+  const handleDeleteProject = async project => {
+    if (!project || !project.id || !projectRepository) return;
+    const confirmFn = globalThis.confirm;
+    if (typeof confirmFn === 'function' && !confirmFn(`Delete project "${project.title}"?`)) return;
+    try {
+      await projectRepository.deleteProject(project.id);
+      setProjects(prev => prev.filter(item => item.id !== project.id));
+      if (projectId === project.id) ctrl.clearWorkspace();
+      if (selectedProjectId === project.id) setSelectedProjectId('');
+      setRefreshKey(k => k + 1);
+      setError('');
+    } catch (err) {
+      setError(err?.message || 'Failed to delete project.');
+    }
+  };
+
+  const handleNewProject = async () => {
+    const title = newTitle.trim();
+    if (!title) { setError('Enter a project title.'); return; }
+    if (!projectRepository) { setError('Project storage is unavailable.'); return; }
+    try {
+      await flushProjectSave?.();
+      const saved = await projectRepository.saveProject(createSubtitleProjectSnapshot({ title }));
+      setNewTitle('');
+      setError('');
+      setRefreshKey(k => k + 1);
+      if (saved.project?.id) {
+        loadProjectFromSnapshot(saved.project);
+        setSelectedProjectId(saved.project.id);
+      }
+    } catch (err) {
+      setError(err?.message || 'Failed to create project.');
+    }
+  };
+
+  return (
+    <div className="subtitle-project-selector">
+      <label className="subtitle-project-label" htmlFor="subtitle-project-select">Saved projects</label>
+      <div className="subtitle-project-row">
+        <select id="subtitle-project-select" disabled={busy} value={selectedProjectId} onChange={e => {
+          const id = e.target.value;
+          setSelectedProjectId(id);
+          if (!id) return;
+          const project = projects.find(p => p.id === id);
+          void handleLoadProject(project);
+        }}>
+          <option value="">Projects…</option>
+          {projects.map(project => (
+            <option key={project.id} value={project.id}>{project.title}</option>
+          ))}
+        </select>
+        <input
+          id="subtitle-new-project-title"
+          type="text"
+          placeholder="New project title"
+          value={newTitle}
+          disabled={busy}
+          onChange={e => setNewTitle(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') void handleNewProject(); }}
+        />
+        <button type="button" id="subtitle-new-project-btn" className="button button-secondary" disabled={busy || !newTitle.trim() || !projectRepository} onClick={() => void handleNewProject()}>
+          New
+        </button>
+        <button type="button" id="subtitle-delete-project-btn" className="button button-secondary" disabled={busy || !selectedProjectId} onClick={() => {
+          const selected = projects.find(project => project.id === selectedProjectId);
+          if (selected) void handleDeleteProject(selected);
+        }}>
+          Delete
+        </button>
+      </div>
+      {error && <span className="subtitle-project-error" role="alert">{error}</span>}
+    </div>
+  );
+}
+
 function FindReplaceBar({ busy, countMatches, onReplace }) {
   const [findText, setFindText] = useState('');
   const [replaceText, setReplaceText] = useState('');
@@ -392,7 +542,7 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
   const { segments, speakerNames, detectedLanguage, busyAction } = ctrl.state;
   const [showFind, setShowFind] = useState(false);
   const mediaBusy = Boolean(busyAction);
-  const busy = mediaBusy || voice.voiceBusy;
+  const busy = mediaBusy || voice.voiceBusy || voice.dubBusy;
   const selectedSet = new Set(voice.selectedIds);
   if (!segments.length) {
     return (
@@ -426,12 +576,14 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
         characters={voice.characters}
         anchors={voice.anchors}
         selectedVoiceId={voice.selectedVoiceId}
+        pauseGapMs={voice.pauseGapMs}
         busy={mediaBusy}
         voiceBusy={voice.voiceBusy}
         batchProgress={voice.batchProgress}
         onToggleSelectAll={voice.toggleSelectAll}
         onClearSelection={voice.clearSelection}
         onChangeVoice={voice.setSelectedVoiceId}
+        onChangePauseGap={voice.setPauseGapMs}
         onGenerateSelected={() => void voice.generateSelectedVoices()}
         onCancelVoice={voice.cancelVoiceGeneration}
       />
@@ -472,7 +624,14 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
       <SubtitleVoiceOutputCard
         combinedClip={voice.combinedClip}
         busy={busy || voice.voiceBusy}
+        dubAudioMode={voice.dubAudioMode}
+        dubBusy={voice.dubBusy}
+        canExportDub={voice.canExportDub}
+        isAudioOnly={Boolean(ctrl.state.isAudioOnly)}
+        hasJobId={Boolean(ctrl.state.jobId)}
         onDownload={voice.downloadCombinedVoice}
+        onChangeDubAudioMode={voice.setDubAudioMode}
+        onExportDub={() => void voice.exportDubbedVideo()}
       />
     </div>
   );
@@ -503,6 +662,8 @@ export function VideoSubtitleWorkspace({
     segments: state.segments,
     useTranslation: ctrl.useTranslation,
     videoFile: state.videoFile,
+    jobId: state.jobId,
+    isAudioOnly: state.isAudioOnly,
     voiceCatalog,
     onStatus: ctrl.setStatus,
     onNotify,
@@ -510,7 +671,8 @@ export function VideoSubtitleWorkspace({
     onEngineFailure: onRefreshEngine,
   });
   const mediaBusy = Boolean(state.busyAction);
-  const busy = mediaBusy || voice.voiceBusy;
+  const busy = mediaBusy || voice.voiceBusy || voice.dubBusy;
+  const modelHints = resolveModelReadinessHints(health.models, state.options);
 
   useEffect(() => {
     onStateChange?.({ busy, hasVideo: Boolean(state.videoFile || state.segments.length) });
@@ -520,6 +682,9 @@ export function VideoSubtitleWorkspace({
     if (!file) return;
     voice.resetVoiceover();
     ctrl.selectVideoFile(file);
+  };
+  const handleImportSubtitle = async file => {
+    if (await ctrl.importSubtitleFile(file)) voice.resetVoiceover();
   };
   const handleClear = () => {
     voice.resetVoiceover();
@@ -556,6 +721,7 @@ export function VideoSubtitleWorkspace({
       <SubtitleToolbar
         busy={busy}
         extracting={mediaBusy}
+        relinking={Boolean(state.projectId && !state.jobId && state.segments.length)}
         hasFile={Boolean(state.videoFile)}
         hasSegments={state.segments.length > 0}
         onClear={handleClear}
@@ -564,8 +730,9 @@ export function VideoSubtitleWorkspace({
       />
       <div className="studio-grid subtitle-grid">
         <section className="subtitle-left-pane" aria-label="Video and controls">
-          <VideoPreviewCard ctrl={ctrl} busy={busy} onSelectFile={handleSelectFile} />
-          <SubtitleSettingsForm ctrl={ctrl} />
+          <VideoPreviewCard ctrl={ctrl} busy={busy} onSelectFile={handleSelectFile} onImportSubtitle={handleImportSubtitle} />
+          <ProjectSelector ctrl={ctrl} />
+          <SubtitleSettingsForm ctrl={ctrl} modelHints={modelHints} />
           <SpeakerRosterCard
             speakers={speakers}
             speakerNames={state.speakerNames}
@@ -583,6 +750,7 @@ export function VideoSubtitleWorkspace({
         hasSubtitleText={ctrl.hasSubtitleText}
         selectedCount={voice.selectedCount}
         canBurn={Boolean(state.jobId) && health.burnInSupported !== false}
+        hasVideoJob={Boolean(state.videoFile && state.jobId)}
         isAudioOnly={state.isAudioOnly}
         speakers={speakers}
         speakerNames={state.speakerNames}

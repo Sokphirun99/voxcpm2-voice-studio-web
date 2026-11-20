@@ -16,6 +16,8 @@ import { createHttpVoiceRepository } from './data/httpVoiceRepository.js';
 import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepository.js';
 import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
 import { createMediaSubtitleGateway } from './data/mediaSubtitleGateway.js';
+import { createHttpGlossaryRepository } from './data/httpGlossaryRepository.js';
+import { createHttpProjectRepository } from './data/httpProjectRepository.js';
 import { createNotificationSoundPlayer } from './data/notificationSound.js';
 import { createWebAudioDecoder } from './data/webAudioDecoder.js';
 import {
@@ -48,16 +50,20 @@ function createStudioServices() {
   const audioDecoder = createWebAudioDecoder();
   const versionChecker = createHttpVersionChecker({ logger });
   const mediaSubtitleGateway = createMediaSubtitleGateway({ logger });
+  const projectRepository = createHttpProjectRepository({ logger });
+  const glossaryRepository = createHttpGlossaryRepository({ logger });
   const notificationSound = createNotificationSoundPlayer({ logger });
 
   return {
     speechGateway,
     mediaSubtitleGateway,
+    projectRepository,
+    glossaryRepository,
     notificationSound,
     audioDecoder,
     versionChecker,
     logger,
-    synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, audioMaster, synthesisCache }),
+    synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, audioMaster, synthesisCache, glossaryRepository }),
     lockReferenceAudio: createLockReferenceAudioUseCase(),
     voiceLibrary: createVoiceLibraryUseCases({ voiceRepository: localVoices, remoteRepository: remoteVoices }),
     voiceAnchors: createVoiceAnchorUseCases({ anchorRepository }),

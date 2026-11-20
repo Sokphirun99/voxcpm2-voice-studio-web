@@ -16,6 +16,7 @@ import {
 } from '../../domain/presets.js';
 import { formatCharacterOptionLabel, groupCharactersByCategory } from '../../domain/voiceLibrary.js';
 import { Icon } from './Icon.jsx';
+import { PronunciationRulesControl } from './PronunciationRulesControl.jsx';
 
 /**
  * Renders the Character dropdown grouped by category alongside a New-character button.
@@ -332,14 +333,14 @@ function AdvancedSection({ options, lastSeed, lockedSeed = null, isExactClone = 
 
 /**
  * Renders the Narakeet-style Character Voice inspector panel.
- * Inputs: `{ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed, transcriptRef, actions }`.
+ * Inputs: `{ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed, transcriptRef, actions, glossaryRepository }`.
  * Outputs: `<div className="voice-body">` element.
  * Side effects: triggers callbacks on character selection, sample upload, reset, or option updates.
  * Failure modes: displays storage warnings if persisted voice clips fail to load.
  * @param {object} props - Voice inspector props.
  * @returns {React.ReactElement} Voice controls panel.
  */
-export function VoiceControls({ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed = null, transcriptRef, actions }) {
+export function VoiceControls({ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed = null, transcriptRef, actions, glossaryRepository = null }) {
   const isExactClone = Boolean(activeAnchor?.blob && activeAnchor?.exactClone);
   return (
     <div className="voice-body">
@@ -348,6 +349,7 @@ export function VoiceControls({ characters, anchors, activeCharacter, activeAnch
         onSelectId={actions.onSelectCharacter} onNewCharacter={actions.onOpenNewCharacter} />
       <CharacterIdentityCard character={activeCharacter} anchor={activeAnchor} busy={busy} transcriptRef={transcriptRef}
         onUploadSample={actions.onUploadSample} onResetVoice={actions.onResetVoice} onUpdateAnchor={actions.onUpdateAnchor} />
+      <PronunciationRulesControl glossaryRepository={glossaryRepository} disabled={busy} />
       <AdvancedSection options={options} lastSeed={lastSeed} lockedSeed={lockedSeed}
         isExactClone={isExactClone} onChange={actions.onChangeOption} />
     </div>

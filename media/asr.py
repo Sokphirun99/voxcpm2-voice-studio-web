@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import sys
@@ -410,11 +411,21 @@ class LocalTranscriber:
         }
 
     def _transcribe_khmer(self, path: Path, turns: list[SpeakerTurn] | None, double_check: bool) -> dict:
-        """Invoke primary Khmer transcriber with backward-compatible fallback for 2-arg test stubs."""
+        """Invoke the primary Khmer transcriber with the requested verification mode."""
+        method = self._khmer.transcribe
         try:
-            return self._khmer.transcribe(path, turns=turns, double_check=double_check)
-        except TypeError:
-            return self._khmer.transcribe(path, turns=turns)
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            supports_double_check = True
+        else:
+            supports_double_check = "double_check" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        kwargs = {"turns": turns}
+        if supports_double_check:
+            kwargs["double_check"] = double_check
+        return method(path, **kwargs)
 
     def transcribe(
         self,

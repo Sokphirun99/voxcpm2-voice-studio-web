@@ -2,9 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDockerVoiceAnchorRepository } from '../../src/data/httpAudioRepository.js';
 import { createHttpAudioMaster } from '../../src/data/httpAudioMaster.js';
+import { createHttpProjectRepository } from '../../src/data/httpProjectRepository.js';
 import { createHttpSynthesisCache, pureSha256Hex } from '../../src/data/httpSynthesisCache.js';
 import { createHttpVoiceRepository } from '../../src/data/httpVoiceRepository.js';
 import { StorageError } from '../../src/domain/errors.js';
+import { createSubtitleProjectSnapshot } from '../../src/domain/projects.js';
 
 function createMemoryStorage() {
   const map = new Map();
@@ -276,6 +278,61 @@ test('createHttpVoiceRepository fetchStats retrieves /api/v1/stats and degrades 
       assert.equal(url, '/api/v1/stats');
       return new Response(JSON.stringify({ data: statsPayload, error: null, meta: {} }), {
         status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+
+      test('createHttpProjectRepository persists UUID snapshots in memory/localStorage while storage is offline', async () => {
+        const storage = createMemoryStorage();
+        const logged = [];
+        const repository = createHttpProjectRepository({
+          fetchImpl: async () => { throw new TypeError('connect ECONNREFUSED'); },
+          storage,
+          logger: {
+            warn: (...args) => logged.push(['warn', ...args]),
+            error: (...args) => logged.push(['error', ...args]),
+          },
+        });
+        const saved = await repository.saveProject(createSubtitleProjectSnapshot({
+          title: 'Offline subtitles',
+          videoFileName: 'clip.mp4',
+          segments: [{ id: 'seg-1', text: 'Edited frame', translatedText: 'បកប្រែ' }],
+          speakerNames: { speaker1: 'Host' },
+        }));
+        assert.match(saved.project.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+        assert.equal((await repository.getProject(saved.project.id)).payload.segments[0].text, 'Edited frame');
+        assert.equal((await repository.listProjects()).items[0].id, saved.project.id);
+        assert.ok(logged.some(entry => entry[0] === 'warn'));
+
+        const recoveredRepository = createHttpProjectRepository({
+          storage,
+          logger: { warn() {}, error() {} },
+          fetchImpl: async (url, init = {}) => {
+            if (url.startsWith('/api/v1/projects?')) {
+              return new Response(JSON.stringify({ data: { items: [] }, error: null, meta: { total: 0 } }), {
+                status: 200, headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            if (url.endsWith(saved.project.id) && init.method === 'DELETE') {
+              return new Response(JSON.stringify({ data: null, error: { code: 'PROJECT_NOT_FOUND', message: 'missing' }, meta: {} }), {
+                status: 404, headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            return new Response(JSON.stringify({ data: null, error: { code: 'PROJECT_NOT_FOUND', message: 'missing' }, meta: {} }), {
+              status: 404, headers: { 'Content-Type': 'application/json' },
+            });
+          },
+        });
+        assert.equal((await recoveredRepository.listProjects()).items[0].id, saved.project.id);
+        assert.equal((await recoveredRepository.getProject(saved.project.id)).payload.segments[0].text, 'Edited frame');
+        await recoveredRepository.deleteProject(saved.project.id);
+        assert.equal((await recoveredRepository.listProjects()).total, 0);
+
+        const noStorage = createHttpProjectRepository({
+          fetchImpl: async () => { throw new TypeError('offline'); },
+          storage: null,
+          logger: { warn() {}, error() {} },
+        });
+        const memorySaved = await noStorage.saveProject(createSubtitleProjectSnapshot({ title: 'Memory fallback' }));
+        assert.equal((await noStorage.getProject(memorySaved.project.id)).title, 'Memory fallback');
       });
     },
   });

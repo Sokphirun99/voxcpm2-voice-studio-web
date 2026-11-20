@@ -22,7 +22,7 @@ export function StudioProvider({ services, children }) {
 /**
  * Retrieves injected studio domain use cases and ports from context.
  * Inputs: none.
- * Outputs: services bundle `{ speechGateway, audioDecoder, logger, synthesizeSpeech, lockReferenceAudio, voiceLibrary }`.
+ * Outputs: services bundle including speech, voice, media subtitle, and project repositories.
  * Side effects: none.
  * Failure modes: throws Error when called outside `<StudioProvider>`.
  * @returns {object} Injected service container.

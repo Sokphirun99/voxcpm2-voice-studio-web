@@ -6,9 +6,9 @@ import { validateAudioFile } from './audioValidation.js';
 import { ValidationError } from './errors.js';
 import { assertPort } from './ports.js';
 import { validateGenerationInput } from './presets.js';
-import { segmentSingleSpeakerScript } from './scriptSegmentation.js';
+import { hasPauseMarkers, segmentScriptWithPauses, stripPauseMarkers } from './scriptSegmentation.js';
 import { createSavedVoiceEntry } from './voiceLibrary.js';
-import { concatenateWavBlobs, tryReadWavDurationSeconds, trySmoothWavBlob } from './wavCodec.js';
+import { concatenateWavBlobsWithPauses, replaceChunkAndRestitch, tryReadWavDurationSeconds, trySmoothWavBlob } from './wavCodec.js';
 
 const SINGLE_VOICE_PAUSE_MS = 160;
 const EXPIRED_REF_PATTERN = /expired on the server/i;
@@ -130,14 +130,23 @@ async function runChunkedSynthesis(params) {
   let activeRef = params.initialRef;
   let firstSeed = params.payload.seed;
   const blobs = [];
+  const chunks = [];
   for (let i = 0; i < params.chunks.length; i++) {
     const step = await processSynthesisChunk({ ...params, index: i, activeRef });
     if (i === 0) firstSeed = step.seed;
     blobs.push(step.blob);
+    chunks.push({
+      index: i,
+      text: params.chunks[i],
+      blob: step.blob,
+      seed: step.seed,
+      durationSeconds: await readRecordingDurationSeconds(step.blob),
+      pauseAfterMs: params.pausesAfterMs?.[i] ?? null,
+    });
     activeRef = step.activeRef;
   }
-  const merged = await concatenateWavBlobs(blobs, SINGLE_VOICE_PAUSE_MS);
-  return { blob: merged, seed: firstSeed, anchorBlob: blobs[0], anchorTranscript: params.chunks[0], uploadedFileData: activeRef };
+  const merged = await concatenateWavBlobsWithPauses(chunks.map(chunk => ({ blob: chunk.blob, pauseAfterMs: chunk.pauseAfterMs })), SINGLE_VOICE_PAUSE_MS);
+  return { blob: merged, seed: firstSeed, anchorBlob: blobs[0], anchorTranscript: params.chunks[0], uploadedFileData: activeRef, chunks };
 }
 
 /**
@@ -147,12 +156,13 @@ async function runChunkedSynthesis(params) {
  */
 function buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio }) {
   const seed = hit.seed ?? payload.seed;
+  const transcript = hasPauseMarkers(payload.text) ? stripPauseMarkers(payload.text) : payload.text;
   return {
     recording: {
       id: `take-${Date.now()}-${seed ?? 'cached'}`,
       characterId: character.id,
       characterName: character.name,
-      transcript: payload.text,
+      transcript,
       blob: hit.blob,
       seed,
       anchorBlob: hit.blob,
@@ -160,6 +170,7 @@ function buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpl
       uploadedFileData: cachedUpload || null,
       fromCache: true,
       mastered: Boolean(masterAudio),
+      chunks: [],
     },
     uploadedFileData: cachedUpload || null,
   };
@@ -223,39 +234,152 @@ async function attachRecordingMetrics(result, startedAt) {
  * @param {object} params - Synthesis command parameters.
  * @returns {Promise<object>} Recording metadata and uploaded FileData cache.
  */
-async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, seedGenerator }, params) {
-  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, signal, onProgress, onReferenceUploaded } = params || {};
+async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, seedGenerator }, params) {
+  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, pronunciationRules, signal, onProgress, onReferenceUploaded } = params || {};
+  const rules = pronunciationRules ?? (glossaryRepository ? await glossaryRepository.loadRules() : []);
   const payload = validateGenerationInput(
-    { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed, autoFormatKhmer, styleMode, customStyle },
+    { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed, autoFormatKhmer, styleMode, customStyle, pronunciationRules: rules },
     seedGenerator
   );
   const startedAt = Date.now();
-  const chunks = segmentSingleSpeakerScript(payload.text);
+  const segments = segmentScriptWithPauses(payload.text);
+  const chunks = segments.map(segment => segment.text);
+  const pausesAfterMs = segments.map(segment => segment.pauseAfterMs);
   const cacheSpec = { ...payload, characterId: character.id, anchor, denoiseReference: Boolean(denoiseReference), masterAudio: Boolean(masterAudio) };
   const { cacheKey, hit } = await tryLookupSynthesisCache({ synthesisCache, cacheSpec, signal });
   if (hit) return attachRecordingMetrics(buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio }), startedAt);
   const { fileData: initialRef, wasCached } = await resolveInitialReference({ speechGateway, anchor, cachedUpload, signal, onReferenceUploaded });
-  const combined = await runChunkedSynthesis({ speechGateway, payload: { ...payload, characterId: character.id }, chunks, anchor, initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onReferenceUploaded });
+  const combined = await runChunkedSynthesis({ speechGateway, payload: { ...payload, characterId: character.id }, chunks, pausesAfterMs, anchor, initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onReferenceUploaded });
   const polished = await applySynthesisMastering({ blob: combined.blob, anchorBlob: combined.anchorBlob, masterAudio: Boolean(masterAudio), audioMaster, signal });
   if (synthesisCache && cacheKey) await synthesisCache.putCachedAudio(cacheKey, polished.blob, { characterId: character.id, seed: combined.seed });
+  const transcript = hasPauseMarkers(payload.text) ? stripPauseMarkers(payload.text) : payload.text;
   return attachRecordingMetrics({
-    recording: { id: `take-${Date.now()}-${combined.seed ?? 'rand'}`, characterId: character.id, characterName: character.name, transcript: payload.text, ...combined, ...polished, fromCache: false },
+    recording: { id: `take-${Date.now()}-${combined.seed ?? 'rand'}`, characterId: character.id, characterName: character.name, transcript, ...combined, ...polished, fromCache: false },
     uploadedFileData: combined.uploadedFileData,
+  }, startedAt);
+}
+
+/**
+ * Resolves the reference upload used to regenerate one chunk with the active character timbre.
+ * @param {object} params - Reference resolution inputs.
+ * @returns {Promise<{ fileData: object|null, wasCached: boolean, retryAnchor: object|null }>} Reference state.
+ */
+async function resolveChunkReference({ speechGateway, recording, anchor, cachedUpload, character, signal, onReferenceUploaded }) {
+  const retryAnchor = anchor?.blob
+    ? anchor
+    : recording?.anchorBlob
+      ? { characterId: character.id, blob: recording.anchorBlob, fileName: `anchor-${character.id}.wav` }
+      : null;
+  if (cachedUpload) return { fileData: cachedUpload, wasCached: true, retryAnchor };
+  if (anchor?.blob) {
+    const fileData = await uploadAnchorBlob({ speechGateway, anchor, signal, onReferenceUploaded });
+    return { fileData, wasCached: false, retryAnchor };
+  }
+  if (recording?.uploadedFileData) return { fileData: recording.uploadedFileData, wasCached: true, retryAnchor };
+  if (retryAnchor) {
+    const fileData = await uploadAnchorBlob({ speechGateway, anchor: retryAnchor, signal, onReferenceUploaded });
+    return { fileData, wasCached: false, retryAnchor };
+  }
+  return { fileData: null, wasCached: false, retryAnchor: null };
+}
+
+/**
+ * Re-synthesizes exactly one segment with the active voice anchor and restitches the merged take.
+ * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, seedGenerator?: () => number }} deps - Injected ports.
+ * @param {object} params - `{ recording, index, text, character, anchor, cachedUpload, options, signal }`.
+ * @returns {Promise<object>} Updated recording and uploaded FileData cache.
+ */
+async function regenerateSpeechChunk({ speechGateway, audioMaster = null, seedGenerator }, params) {
+  const { recording, index, text, character, anchor = null, cachedUpload = null, options = {}, signal, onReferenceUploaded } = params || {};
+  if (!Array.isArray(recording?.chunks) || recording.chunks.length === 0) {
+    throw new ValidationError('Generate a segmented script before regenerating a segment.', 'script', 'MISSING_CHUNKS');
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= recording.chunks.length) {
+    throw new ValidationError('Choose a valid generated segment to replace.', 'script', 'INVALID_CHUNK_INDEX');
+  }
+  const payload = validateGenerationInput({
+    script: text,
+    character,
+    hasLockedAudio: Boolean(anchor?.blob || cachedUpload),
+    exactClone: Boolean(anchor?.exactClone),
+    promptText: anchor?.promptText || '',
+    guidance: options.guidance,
+    steps: options.steps,
+    seed: options.seed,
+    autoFormatKhmer: options.autoFormatKhmer !== false,
+    styleMode: options.styleMode,
+    customStyle: options.customStyle || '',
+  }, seedGenerator);
+  const spokenText = stripPauseMarkers(payload.text);
+  if (!spokenText) throw new ValidationError('Enter text to generate speech.', 'script', 'EMPTY_SCRIPT');
+  const startedAt = Date.now();
+  const reference = await resolveChunkReference({ speechGateway, recording, anchor, cachedUpload, character, signal, onReferenceUploaded });
+  const chunkPayload = buildChunkPayload({
+    payload: { ...payload, characterId: character.id },
+    text: spokenText,
+    index,
+    hasInitialAnchor: Boolean(anchor),
+    denoiseReference: Boolean(options.denoiseReference),
+  });
+  const regenerated = await synthesizeChunkWithRetry({
+    speechGateway,
+    payload: chunkPayload,
+    referenceFile: reference.fileData,
+    wasCached: reference.wasCached,
+    anchor: reference.retryAnchor,
+    signal,
+  });
+  const nextChunk = {
+    index,
+    text: spokenText,
+    blob: regenerated.blob,
+    seed: regenerated.seed ?? payload.seed,
+    durationSeconds: await readRecordingDurationSeconds(regenerated.blob),
+  };
+  const restitched = await replaceChunkAndRestitch({
+    chunks: recording.chunks,
+    index,
+    nextChunk,
+    pauseMs: SINGLE_VOICE_PAUSE_MS,
+  });
+  const polished = await applySynthesisMastering({
+    blob: restitched.blob,
+    masterAudio: options.masterAudio !== false,
+    audioMaster,
+    signal,
+  });
+  return attachRecordingMetrics({
+    recording: {
+      ...recording,
+      blob: polished.blob,
+      mastered: polished.mastered,
+      chunks: restitched.chunks,
+      transcript: restitched.chunks.map(chunk => chunk.text).join(' '),
+      fromCache: false,
+    },
+    uploadedFileData: regenerated.referenceFile || cachedUpload || recording.uploadedFileData || null,
   }, startedAt);
 }
 
 /**
  * Creates the single-character speech synthesis use case.
  * Inputs: `{ speechGateway, audioMaster, synthesisCache, seedGenerator }`.
- * Outputs: `{ execute(command) }` use-case object.
+ * Outputs: `{ execute(command), regenerateChunk(command) }` use-case object.
  * Side effects: delegates synthesis, mastering, and caching exclusively to injected ports.
  * Failure modes: throws ValidationError, SynthesisCancelledError, or SynthesisError.
- * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, seedGenerator?: () => number }} deps - Injected ports.
- * @returns {{ execute: (params: object) => Promise<object> }} Synthesis use case.
+ * When `glossaryRepository` is injected, its enabled pronunciation rules rewrite the spoken text of `execute`
+ * (an explicit `pronunciationRules` param overrides it). `regenerateChunk` never re-applies rules because
+ * segment text is already the spoken text and a second pass could rewrite a replacement.
+ * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, glossaryRepository?: import('./ports.js').GlossaryRepositoryPort|null, seedGenerator?: () => number }} deps - Injected ports.
+ * @returns {{ execute: (params: object) => Promise<object>, regenerateChunk: (params: object) => Promise<object> }} Synthesis use case.
  */
-export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = null, synthesisCache = null, seedGenerator }) {
+export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, seedGenerator }) {
   assertPort(speechGateway, 'speechGateway', ['uploadReferenceAudio', 'synthesize']);
-  return { execute: params => executeSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, seedGenerator }, params) };
+  if (glossaryRepository) assertPort(glossaryRepository, 'glossaryRepository', ['loadRules']);
+  return {
+    execute: params => executeSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
+    regenerateChunk: params => regenerateSpeechChunk({ speechGateway, audioMaster, seedGenerator }, params),
+  };
 }
 
 /**
