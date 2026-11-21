@@ -83,3 +83,26 @@ export class StorageError extends Error {
     this.code = 'STORAGE_ERROR';
   }
 }
+
+/**
+ * Error thrown when a revision mismatch or concurrent modification occurs.
+ */
+export class ConflictError extends Error {
+  /**
+   * Creates a ConflictError.
+   * Inputs: human-readable message and conflict metadata `{ currentRevision, expectedRevision, code }`.
+   * Outputs: ConflictError instance.
+   * Side effects: none.
+   * Failure modes: none.
+   * @param {string} [message='Resource revision conflict.'] - User-facing conflict message.
+   * @param {{ currentRevision?: number, expectedRevision?: number, code?: string }} [meta] - Conflict metadata.
+   */
+  constructor(message = 'Resource revision conflict.', meta = {}) {
+    super(message);
+    this.name = 'ConflictError';
+    this.code = meta.code || 'REVISION_CONFLICT';
+    this.currentRevision = meta.currentRevision;
+    this.expectedRevision = meta.expectedRevision;
+  }
+}
+

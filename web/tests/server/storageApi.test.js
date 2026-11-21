@@ -407,9 +407,38 @@ test('storage API creates, lists, gets, updates, and soft-deletes subtitle proje
     });
     assert.equal(updateRes.status, 200);
     assert.equal(updateRes.json().data.project.title, 'News Clip Subtitles (revised)');
+    assert.equal(updateRes.json().data.project.revision, 2);
     const createdAtBefore = createRes.json().data.project.createdAt;
     assert.equal(updateRes.json().data.project.createdAt, createdAtBefore);
     assert.notEqual(updateRes.json().data.project.updatedAt, createRes.json().data.project.updatedAt);
+
+    // Stale expectedRevision returns HTTP 409 Conflict
+    const staleRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=1`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'subtitle',
+        title: 'Stale attempt',
+        payload: {},
+      }),
+    });
+    assert.equal(staleRes.status, 409);
+    assert.equal(staleRes.json().error.code, 'REVISION_CONFLICT');
+
+    // Matching expectedRevision succeeds
+    const matchRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=2`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'subtitle',
+        title: 'News Clip Subtitles (revised)',
+        payload: { videoFileName: 'news.mp4', segments: [], speakerNames: {}, subtitleOptions: {} },
+      }),
+    });
+    assert.equal(matchRes.status, 200);
+    assert.equal(matchRes.json().data.project.revision, 3);
 
     // Restart persistence: new store against same dataDir
     const restartedStore = createStorageStore({ dataDir });
@@ -418,8 +447,19 @@ test('storage API creates, lists, gets, updates, and soft-deletes subtitle proje
     assert.equal(persisted.title, 'News Clip Subtitles (revised)');
     assert.equal(persisted.createdAt, createdAtBefore);
 
-    // Soft-delete
-    const delRes = await invokeApp(handler, { method: 'DELETE', urlPath: `/api/v1/projects/${projectId}` });
+    // Stale expectedRevision on DELETE returns HTTP 409 Conflict
+    const staleDel = await invokeApp(handler, {
+      method: 'DELETE',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=1`,
+    });
+    assert.equal(staleDel.status, 409);
+    assert.equal(staleDel.json().error.code, 'REVISION_CONFLICT');
+
+    // Matching expectedRevision on Soft-delete succeeds
+    const delRes = await invokeApp(handler, {
+      method: 'DELETE',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=3`,
+    });
     assert.equal(delRes.status, 200);
     assert.equal(delRes.json().data.deleted, true);
 

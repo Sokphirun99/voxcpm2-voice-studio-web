@@ -22,6 +22,7 @@ import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
+import { ProjectAutosaveBadge } from './ProjectAutosaveBadge.jsx';
 import { SubtitleExportDock } from './SubtitleExportDock.jsx';
 import { SubtitleSegmentRow } from './SubtitleSegmentRow.jsx';
 import { SubtitleVoiceOutputCard, SubtitleVoiceToolbar } from './SubtitleVoiceControls.jsx';
@@ -36,10 +37,13 @@ const SPEAKER_COUNT_OPTIONS = Object.freeze([
   { id: '6', label: '5+ speakers' },
 ]);
 
-function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract }) {
+function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract, autosave }) {
   return (
     <header className="studio-toolbar">
-      <h1>Video to subtitle</h1>
+      <div className="toolbar-heading-group">
+        <h1>Video to subtitle</h1>
+        {autosave && <ProjectAutosaveBadge autosave={autosave} />}
+      </div>
       <div className="toolbar-actions">
         {!busy && (
           <button type="button" id="subtitle-clear-btn" className="button subtle-button cancel-button"
@@ -650,13 +654,23 @@ export function VideoSubtitleWorkspace({
   notices,
   hidden = false,
   voiceCatalog = null,
+  actionsRef = null,
   onRefreshEngine,
   onSendToTts,
   onStateChange,
   onNotify,
   onUnlockSound,
 }) {
-  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound });
+  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden });
+  if (actionsRef) {
+    actionsRef.current = {
+      loadProject: snapshot => {
+        ctrl.autosave?.resetProject?.(snapshot?.id || '', snapshot?.revision || 1);
+        ctrl.loadProjectFromSnapshot(snapshot);
+      },
+      autosave: ctrl.autosave,
+    };
+  }
   const { state, health, speakers } = ctrl;
   const voice = useSubtitleVoiceover({
     segments: state.segments,
@@ -727,6 +741,7 @@ export function VideoSubtitleWorkspace({
         onClear={handleClear}
         onCancel={handleCancel}
         onExtract={() => void ctrl.extractSubtitles()}
+        autosave={ctrl.autosave}
       />
       <div className="studio-grid subtitle-grid">
         <section className="subtitle-left-pane" aria-label="Video and controls">

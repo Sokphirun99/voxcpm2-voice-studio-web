@@ -4,6 +4,7 @@
 
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
+import { useStudioServices } from '../StudioContext.jsx';
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
 import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
@@ -11,6 +12,7 @@ import { useNotifications } from '../hooks/useNotifications.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { Icon } from './Icon.jsx';
+import { ProjectsWorkspace } from './ProjectsWorkspace.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
 import { ToastRegion } from './ToastRegion.jsx';
@@ -101,6 +103,40 @@ function useSharedCharacterCatalog({ ttsRef, onNotify, onUnlockSound }) {
   return { library, anchorApi, activeCharacter, activeAnchor, lockedSeeds, setLockedSeeds, actions };
 }
 
+async function resolveProjectSnapshot(project, repo, logger) {
+  if (!project) return null;
+  if (!repo || project.payload || project.segments) return project;
+  try {
+    const fetched = await repo.getProject(project.id);
+    return fetched || project;
+  } catch (error) {
+    logger?.error?.('Studio.resolveProjectSnapshot', error, { projectId: project.id });
+    return project;
+  }
+}
+
+async function flushWorkspaceBeforeProjectSwitch(ttsRef, subtitlesRef) {
+  const saves = [];
+  if (ttsRef.current?.autosave?.isDirty) saves.push(ttsRef.current.autosave.saveNow());
+  if (subtitlesRef.current?.autosave?.isDirty) saves.push(subtitlesRef.current.autosave.saveNow());
+  if (saves.length > 0) await Promise.all(saves);
+}
+
+async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRef, setActiveWorkspace }) {
+  if (!project) return;
+  await flushWorkspaceBeforeProjectSwitch(ttsRef, subtitlesRef);
+  const snapshot = await resolveProjectSnapshot(project, repo, logger);
+  const type = snapshot?.type || (snapshot?.kind === 'subtitle' ? 'subtitles' : 'tts');
+  if (type === 'tts') {
+    ttsRef.current?.loadProject?.(snapshot);
+    setActiveWorkspace('tts');
+    ttsRef.current?.focusScript?.();
+    return;
+  }
+  subtitlesRef.current?.loadProject?.(snapshot);
+  setActiveWorkspace('subtitles');
+}
+
 /**
  * Coordinates the top-level Voice Studio function workspaces (`Text to speech`, `Video to subtitle`) and shared character data.
  * Inputs: none (consumes Studio services via hooks).
@@ -111,11 +147,13 @@ function useSharedCharacterCatalog({ ttsRef, onNotify, onUnlockSound }) {
  */
 export function Studio() {
   const ttsRef = useRef(null);
+  const subtitlesRef = useRef(null);
   const [activeWorkspace, setActiveWorkspace] = useState('tts');
   const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false, libraryOpen: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
   const notifications = useNotifications();
+  const services = useStudioServices();
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
   }, []);
@@ -126,6 +164,9 @@ export function Studio() {
     setExternalScript(script);
     selectWorkspace('tts', setActiveWorkspace, ttsRef);
   }, []);
+  const handleOpenProject = useCallback(project => {
+    void openWorkspaceProject({ project, repo: services?.projectRepository, logger: services?.logger, ttsRef, subtitlesRef, setActiveWorkspace });
+  }, [services, setActiveWorkspace]);
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
   const catalog = useSharedCharacterCatalog({
@@ -168,12 +209,19 @@ export function Studio() {
         onToggleSoundMuted={notifications.toggleSoundMuted}
       />
       <main className="studio-workspace">
+        <ProjectsWorkspace
+          hidden={activeWorkspace !== 'projects'}
+          onOpenProject={handleOpenProject}
+          onNotify={notifications.notify}
+          projectRepository={services?.projectRepository}
+        />
         <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
           externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
         <VideoSubtitleWorkspace
           notices={updateBanner}
           hidden={activeWorkspace !== 'subtitles'}
           voiceCatalog={subtitleVoiceCatalog}
+          actionsRef={subtitlesRef}
           onRefreshEngine={refreshEngine}
           onSendToTts={handleSendToTts}
           onStateChange={handleSubtitleStateChange}

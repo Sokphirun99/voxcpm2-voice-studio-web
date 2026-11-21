@@ -6,6 +6,7 @@ import React from 'react';
 import { Icon } from './Icon.jsx';
 
 export const DEFAULT_WORKSPACES = Object.freeze([
+  { id: 'projects', label: 'Projects', icon: 'folder' },
   { id: 'tts', label: 'Text to speech', icon: 'square_pencil' },
   { id: 'subtitles', label: 'Video to subtitle', icon: 'subtitles' },
 ]);

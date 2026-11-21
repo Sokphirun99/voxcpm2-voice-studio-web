@@ -30,6 +30,16 @@ const ICON_PATHS = {
       {...STROKE_STYLE}
     />
   ),
+  // Iconoir: folder
+  folder: (
+    <g {...STROKE_STYLE}>
+      <path d="M2 6V18C2 19.1046 2.89543 20 4 20H20C21.1046 20 22 19.1046 22 18V8C22 6.89543 21.1046 6 20 6H13L11 4H4C2.89543 4 2 4.89543 2 6Z" />
+    </g>
+  ),
+  // Iconoir: plus
+  plus: (
+    <path d="M12 5V19M5 12H19" {...STROKE_STYLE} />
+  ),
   // Iconoir: list
   list_bullet: (
     <g {...STROKE_STYLE}>
@@ -204,6 +214,13 @@ const ICON_PATHS = {
     <g {...STROKE_STYLE}>
       <circle cx="12" cy="12" r="8.5" />
       <path d="M12 7.5V12L15 13.5" />
+    </g>
+  ),
+  // Iconoir: refresh
+  refresh: (
+    <g {...STROKE_STYLE}>
+      <path d="M21.8883 13.5C21.1645 17.6521 17.5815 20.75 13.3137 20.75C8.89543 20.75 5.31371 17.1683 5.31371 12.75C5.31371 8.33172 8.89543 4.75 13.3137 4.75C16.5498 4.75 19.3496 6.66699 20.6137 9.42188" />
+      <path d="M17 10H21.4C21.7314 10 22 9.73137 22 9.4V5" />
     </g>
   ),
 };

@@ -2,11 +2,12 @@
  * @fileoverview Standalone Text-to-Speech function workspace managing scripts, character voices, library modal, and playback.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
 import { createTtsProjectSnapshot } from '../../domain/projects.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
+import { useProjectAutosave } from '../hooks/useProjectAutosave.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
 import { useSpeechVerification } from '../hooks/useSpeechVerification.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
@@ -208,6 +209,20 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
   );
 }
 
+function applyProjectSnapshotToTts(snapshot, setters) {
+  if (!snapshot) return;
+  setters.setProjectId(snapshot.id || '');
+  setters.setProjectTitle(snapshot.title || snapshot.name || '');
+  if (setters.setProjectRevision) setters.setProjectRevision(snapshot.revision || 1);
+  setters.setScript(snapshot.payload?.script || snapshot.settings?.script || '');
+  const opts = snapshot.payload?.ttsOptions || snapshot.settings?.ttsOptions;
+  if (opts && typeof opts === 'object') setters.setOptions(prev => ({ ...prev, ...opts }));
+  const voiceId = snapshot.payload?.voiceId || snapshot.settings?.voiceId;
+  if (voiceId && setters.allVoices.some(voice => voice.id === voiceId)) {
+    setters.characterActions?.handleSelectCharacter?.(voiceId);
+  }
+}
+
 function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume }) {
   const {
     library, anchorApi, activeCharacter, activeAnchor,
@@ -224,6 +239,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const [options, setOptions] = useState(INITIAL_OPTIONS);
   const [projectId, setProjectId] = useState('');
   const [projectTitle, setProjectTitle] = useState('');
+  const [projectRevision, setProjectRevision] = useState(1);
   const [projectsReady, setProjectsReady] = useState(false);
   const scriptValueRef = useRef(script);
   scriptValueRef.current = script;
@@ -258,6 +274,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         if (!active || !snapshot || receivedExternalScriptRef.current || scriptValueRef.current.trim()) return;
         setProjectId(snapshot.id);
         setProjectTitle(snapshot.title);
+        setProjectRevision(snapshot.revision || 1);
         setScript(snapshot.payload?.script || '');
         if (snapshot.payload?.ttsOptions && typeof snapshot.payload.ttsOptions === 'object') {
           setOptions(prev => ({ ...prev, ...snapshot.payload.ttsOptions }));
@@ -276,28 +293,42 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     return () => { active = false; };
   }, [projectRepository, logger]);
 
-  useEffect(() => {
-    if (!projectsReady || !projectRepository || (!projectId && !script.trim())) return undefined;
-    const timer = globalThis.setTimeout(async () => {
-      try {
-        const title = projectTitle || script.split(/\r?\n/, 1)[0].trim().slice(0, 60) || 'Untitled TTS project';
-        const saved = await projectRepository.saveProject(createTtsProjectSnapshot({
-          id: projectId || undefined,
-          title,
-          script,
-          voiceId: activeCharacter.id,
-          ttsOptions: options,
-        }));
-        if (saved.project?.id && !projectId) {
-          setProjectId(saved.project.id);
-          setProjectTitle(saved.project.title);
-        }
-      } catch (error) {
-        logger?.error?.('TextToSpeechWorkspace.autosave', error, { projectId });
+  const buildSnapshot = useCallback(() => {
+    if (!projectId && !script.trim()) return null;
+    const title = projectTitle || script.split(/\r?\n/, 1)[0].trim().slice(0, 60) || 'Untitled TTS project';
+    return createTtsProjectSnapshot({
+      id: projectId || undefined,
+      title,
+      script,
+      voiceId: activeCharacter.id,
+      ttsOptions: options,
+    });
+  }, [projectId, projectTitle, script, activeCharacter.id, options]);
+
+  const autosave = useProjectAutosave({
+    projectId,
+    initialRevision: projectRevision,
+    buildSnapshot,
+    enabled: projectsReady,
+    debounceMs: 1500,
+    deps: [script, projectTitle, activeCharacter.id, options],
+    hidden,
+    projectRepository,
+    logger,
+    onSaveSuccess: saved => {
+      if (saved?.id && !projectId) {
+        setProjectId(saved.id);
+        setProjectTitle(saved.title || projectTitle);
       }
-    }, 1500);
-    return () => globalThis.clearTimeout?.(timer);
-  }, [projectsReady, projectRepository, projectId, projectTitle, script, activeCharacter.id, options, logger]);
+      if (saved?.revision) setProjectRevision(saved.revision);
+    },
+    onConflict: () => {
+      shared.onNotify?.({
+        type: 'warning',
+        message: 'This project was modified in another session. Unsaved edits remain in memory.',
+      });
+    },
+  });
 
   useEffect(() => {
     if (prevHiddenRef.current && !hidden) {
@@ -323,13 +354,26 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       cancelIfCharacter: id => { if (synthesis.activeCharacterId === id) synthesis.cancel(); },
       setStatus: synthesis.setStatus,
       closeLibrary: () => setLibraryModal({ open: false, openForm: false }),
+      loadProject: snapshot => {
+        autosave.resetProject(snapshot?.id || '', snapshot?.revision || 1);
+        applyProjectSnapshotToTts(snapshot, {
+          setProjectId,
+          setProjectTitle,
+          setProjectRevision,
+          setScript,
+          setOptions,
+          allVoices: allVoicesRef.current,
+          characterActions: characterActionsRef.current,
+        });
+      },
+      autosave,
     };
   }
   const count = countGraphemes(script);
   const isOverLimit = count > MAX_SCRIPT_LENGTH;
   const generateDisabled = synthesis.busy || Boolean(synthesis.regeneratingChunk) || !anchorApi.isLoaded || !hasScript || isOverLimit;
   const state = { scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi, charactersRef, libraryModal, setLibraryModal };
-  const ctrl = { logger, glossaryRepository, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled };
+  const ctrl = { logger, glossaryRepository, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled, autosave };
   return { state, ctrl };
 }
 
@@ -356,7 +400,8 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
     <div className="workspace-panel" hidden={hidden}>
       {notices}
       <Toolbar busy={ctrl.synthesis.busy} generateDisabled={ctrl.generateDisabled}
-        shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel} />
+        shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel}
+        autosave={ctrl.autosave} />
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
         onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
       <AudioPlayer recording={ctrl.synthesis.recording} takes={ctrl.synthesis.takes}

@@ -32,6 +32,7 @@ import {
 import { ValidationError } from '../../domain/errors.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useStudioServices } from '../StudioContext.jsx';
+import { useProjectAutosave } from './useProjectAutosave.js';
 
 const MAX_CLIENT_VIDEO_BYTES = 500 * 1024 * 1024;
 const ALLOWED_EXT_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi|mp3|wav|m4a|aac|ogg|flac)$/i;
@@ -596,7 +597,7 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
  * @param {{ onStateChange?: Function, onNotify?: Function, onUnlockSound?: Function }} [config] - Hook callbacks.
  * @returns {object} Subtitle workspace controller bundle.
  */
-export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {}) {
+export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidden = false } = {}) {
   const services = useStudioServices();
   const gateway = useMemo(() => resolveSubtitleGateway(services), [services]);
   const [health, refreshHealth, markOnline] = useMediaHealthState(gateway);
@@ -620,6 +621,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     speakerNames: {},
     projectId: '',
     projectTitle: '',
+    revision: 1,
     projectsReady: false,
     options: DEFAULT_OPTIONS,
     busyAction: '',
@@ -891,27 +893,31 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
   }, []);
 
   const loadProjectFromSnapshot = useCallback(snapshot => {
-    if (!snapshot || snapshot.kind !== 'subtitle') return;
-    const { payload } = snapshot;
+    if (!snapshot) return;
+    const isSubtitleType = snapshot.kind === 'subtitle' || snapshot.type === 'subtitles' || snapshot.type === 'dubbing';
+    if (!isSubtitleType) return;
+    const payload = snapshot.payload || {};
+    const title = snapshot.title || snapshot.name || 'Untitled project';
     setState(prev => ({
       ...prev,
       projectId: snapshot.id || '',
-      projectTitle: snapshot.title || '',
+      projectTitle: title,
+      revision: snapshot.revision || 1,
       videoFile: null,
-      videoFileName: typeof payload?.videoFileName === 'string' ? payload.videoFileName : null,
+      videoFileName: typeof payload.videoFileName === 'string' ? payload.videoFileName : null,
       videoUrl: '',
       isAudioOnly: false,
       jobId: '',
-      detectedLanguage: payload?.detectedLanguage || '',
-      segments: Array.isArray(payload?.segments) ? payload.segments : [],
-      hasTranslation: Boolean(payload?.hasTranslation),
-      translatedLanguage: payload?.translatedLanguage || '',
-      speakerNames: typeof payload?.speakerNames === 'object' ? payload.speakerNames : {},
+      detectedLanguage: payload.detectedLanguage || '',
+      segments: Array.isArray(payload.segments) ? payload.segments : (Array.isArray(snapshot.segments) ? snapshot.segments : []),
+      hasTranslation: Boolean(payload.hasTranslation),
+      translatedLanguage: payload.translatedLanguage || '',
+      speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : {},
       options: {
         ...prev.options,
-        ...(typeof payload?.subtitleOptions === 'object' ? payload.subtitleOptions : {}),
+        ...(typeof payload.subtitleOptions === 'object' && payload.subtitleOptions ? payload.subtitleOptions : {}),
       },
-      status: { message: `Project loaded: ${snapshot.title}`, error: false },
+      status: { message: `Project loaded: ${title}`, error: false },
     }));
   }, []);
 
@@ -964,29 +970,51 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     state.hasTranslation,
   ]);
 
-  const persistCurrentProject = useCallback(async () => {
-    if (!projectRepository) return null;
+  const buildSnapshot = useCallback(() => {
     if (!state.projectId && !state.videoFileName && !state.segments.length) return null;
-    const snapshot = buildProjectSnapshot();
-    const saved = await projectRepository.saveProject(snapshot);
-    if (saved?.project?.id && !state.projectId) {
-      setState(prev => prev.projectId ? prev : { ...prev, projectId: saved.project.id, projectTitle: snapshot.title });
-    }
-    return saved;
-  }, [projectRepository, state.projectId, state.videoFileName, state.segments.length, buildProjectSnapshot]);
+    return buildProjectSnapshot();
+  }, [state.projectId, state.videoFileName, state.segments.length, buildProjectSnapshot]);
 
-  useEffect(() => {
-    if (!state.projectsReady || !projectRepository) return undefined;
-    if (!state.projectId && !state.videoFileName && !state.segments.length) return undefined;
-    const timer = globalThis.setTimeout(async () => {
-      try {
-        await persistCurrentProject();
-      } catch (error) {
-        services?.logger?.error?.('useVideoSubtitles.autosave', error, { projectId: state.projectId });
-      }
-    }, 1500);
-    return () => globalThis.clearTimeout?.(timer);
-  }, [projectRepository, state.projectsReady, state.projectId, state.videoFileName, state.segments.length, persistCurrentProject, services]);
+  const autosave = useProjectAutosave({
+    projectId: state.projectId,
+    initialRevision: state.revision || 1,
+    buildSnapshot,
+    enabled: Boolean(state.projectsReady),
+    debounceMs: 1500,
+    deps: [
+      state.segments,
+      state.videoFileName,
+      state.speakerNames,
+      state.options,
+      state.projectTitle,
+      state.detectedLanguage,
+      state.translatedLanguage,
+    ],
+    hidden,
+    projectRepository,
+    logger: services?.logger,
+    onSaveSuccess: saved => {
+      const nextId = saved?.id;
+      const nextTitle = saved?.title || state.projectTitle || buildSnapshot()?.title;
+      const nextRev = saved?.revision;
+      setState(prev => ({
+        ...prev,
+        ...(nextId && !prev.projectId ? { projectId: nextId, projectTitle: nextTitle } : {}),
+        ...(nextRev ? { revision: nextRev } : {}),
+      }));
+    },
+    onConflict: () => {
+      onNotify?.({
+        kind: 'warning',
+        title: 'Project Conflict',
+        message: 'This subtitle project was modified in another session. Unsaved edits remain in memory.',
+      });
+    },
+  });
+
+  const persistCurrentProject = useCallback(async () => {
+    return autosave.saveNow();
+  }, [autosave]);
 
   const getTtsHandoff = useCallback((speakerId = ttsSpeakerId, selectedIds = null) => {
     const idSet = selectedIds?.length ? new Set(selectedIds) : null;
@@ -1010,6 +1038,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound } = {
     setTtsSpeakerId,
     projectId: state.projectId,
     projectTitle: state.projectTitle,
+    autosave,
     flushProjectSave: persistCurrentProject,
     loadProjectFromSnapshot,
     projectRepository,
