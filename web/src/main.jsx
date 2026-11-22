@@ -10,6 +10,7 @@ import { createConsoleLogger } from './data/consoleLogger.js';
 import { createGradioSpeechGateway } from './data/gradioSpeechGateway.js';
 import { createHttpAudioMaster } from './data/httpAudioMaster.js';
 import { createDockerVoiceAnchorRepository } from './data/httpAudioRepository.js';
+import { createDiagnosticsGateway } from './data/diagnosticsGateway.js';
 import { createHttpSynthesisCache } from './data/httpSynthesisCache.js';
 import { createHttpVersionChecker } from './data/httpVersionChecker.js';
 import { createHttpVoiceRepository } from './data/httpVoiceRepository.js';
@@ -18,6 +19,7 @@ import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
 import { createMediaSubtitleGateway } from './data/mediaSubtitleGateway.js';
 import { createHttpGlossaryRepository } from './data/httpGlossaryRepository.js';
 import { createHttpProjectRepository } from './data/httpProjectRepository.js';
+import { createHttpAssetRepository } from './data/httpAssetRepository.js';
 import { createNotificationSoundPlayer } from './data/notificationSound.js';
 import { createWebAudioDecoder } from './data/webAudioDecoder.js';
 import {
@@ -51,13 +53,17 @@ function createStudioServices() {
   const versionChecker = createHttpVersionChecker({ logger });
   const mediaSubtitleGateway = createMediaSubtitleGateway({ logger });
   const projectRepository = createHttpProjectRepository({ logger });
+  const assetRepository = createHttpAssetRepository({ logger });
   const glossaryRepository = createHttpGlossaryRepository({ logger });
   const notificationSound = createNotificationSoundPlayer({ logger });
+  const diagnosticsGateway = createDiagnosticsGateway({ speechGateway, mediaSubtitleGateway, logger });
 
   return {
     speechGateway,
     mediaSubtitleGateway,
+    diagnosticsGateway,
     projectRepository,
+    assetRepository,
     glossaryRepository,
     notificationSound,
     audioDecoder,

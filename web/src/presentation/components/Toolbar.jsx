@@ -6,6 +6,7 @@ import React from 'react';
 import { Blocks } from 'loading-dev';
 import { Icon } from './Icon.jsx';
 import { ProjectAutosaveBadge } from './ProjectAutosaveBadge.jsx';
+import { OfflineReadinessBadge } from './OfflineReadinessBadge.jsx';
 
 const GENERATE_SPINNER_SIZE_PX = 16;
 
@@ -22,19 +23,20 @@ function GenerateButton({ busy, generateDisabled, shortcut }) {
 
 /**
  * Renders the top workspace toolbar with synthesis submit, cancel, and autosave status controls.
- * Inputs: `{ busy, generateDisabled, shortcut, onCancel, autosave }`.
+ * Inputs: `{ busy, generateDisabled, shortcut, onCancel, autosave, offlineReadiness, onSelectModels }`.
  * Outputs: `<header className="studio-toolbar">` element.
  * Side effects: invokes `onCancel` when Cancel is clicked.
  * Failure modes: none.
- * @param {{ busy: boolean, generateDisabled: boolean, shortcut: string, onCancel: () => void, autosave?: object }} props - Toolbar props.
+ * @param {{ busy: boolean, generateDisabled: boolean, shortcut: string, onCancel: () => void, autosave?: object, offlineReadiness?: object, onSelectModels?: () => void }} props - Toolbar props.
  * @returns {React.ReactElement} Toolbar element.
  */
-export function Toolbar({ busy, generateDisabled, shortcut, onCancel, autosave }) {
+export function Toolbar({ busy, generateDisabled, shortcut, onCancel, autosave, offlineReadiness, onSelectModels }) {
   return (
     <header className="studio-toolbar">
       <div className="toolbar-heading-group">
         <h1>Text to speech</h1>
         {autosave && <ProjectAutosaveBadge autosave={autosave} />}
+        {offlineReadiness && <OfflineReadinessBadge readiness={offlineReadiness} onSelect={onSelectModels} />}
       </div>
       <div className="toolbar-actions">
         {busy && (

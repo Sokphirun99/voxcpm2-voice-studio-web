@@ -4,6 +4,7 @@
 
 import { validateAudioFile } from './audioValidation.js';
 import { ValidationError } from './errors.js';
+import { assertFeatureOfflineReady } from './offlineReadiness.js';
 import { assertPort } from './ports.js';
 import { validateGenerationInput } from './presets.js';
 import { hasPauseMarkers, segmentScriptWithPauses, stripPauseMarkers } from './scriptSegmentation.js';
@@ -228,6 +229,12 @@ async function attachRecordingMetrics(result, startedAt) {
   };
 }
 
+function assertOfflineReadyIfSpecified(featureId, models, isOnline) {
+  if (models === undefined) return;
+  const online = isOnline ?? (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true);
+  assertFeatureOfflineReady({ featureId, models, isOnline: online });
+}
+
 /**
  * Executes single-character synthesis validation, cache lookup, chunking, mastering, and voice anchoring.
  * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, seedGenerator?: () => number }} deps - Use-case ports.
@@ -235,7 +242,8 @@ async function attachRecordingMetrics(result, startedAt) {
  * @returns {Promise<object>} Recording metadata and uploaded FileData cache.
  */
 async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, seedGenerator }, params) {
-  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, pronunciationRules, signal, onProgress, onReferenceUploaded } = params || {};
+  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, pronunciationRules, signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
+  assertOfflineReadyIfSpecified('tts', models, isOnline);
   const rules = pronunciationRules ?? (glossaryRepository ? await glossaryRepository.loadRules() : []);
   const payload = validateGenerationInput(
     { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed, autoFormatKhmer, styleMode, customStyle, pronunciationRules: rules },
@@ -290,7 +298,8 @@ async function resolveChunkReference({ speechGateway, recording, anchor, cachedU
  * @returns {Promise<object>} Updated recording and uploaded FileData cache.
  */
 async function regenerateSpeechChunk({ speechGateway, audioMaster = null, seedGenerator }, params) {
-  const { recording, index, text, character, anchor = null, cachedUpload = null, options = {}, signal, onReferenceUploaded } = params || {};
+  const { recording, index, text, character, anchor = null, cachedUpload = null, options = {}, signal, onReferenceUploaded, models, isOnline } = params || {};
+  assertOfflineReadyIfSpecified('tts', models, isOnline);
   if (!Array.isArray(recording?.chunks) || recording.chunks.length === 0) {
     throw new ValidationError('Generate a segmented script before regenerating a segment.', 'script', 'MISSING_CHUNKS');
   }

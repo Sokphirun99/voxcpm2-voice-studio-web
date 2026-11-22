@@ -22,6 +22,9 @@ import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
+import { DraftRecoveryBanner } from './DraftRecoveryBanner.jsx';
+import { MissingAssetBanner } from './MissingAssetBanner.jsx';
+import { OfflineReadinessBadge } from './OfflineReadinessBadge.jsx';
 import { ProjectAutosaveBadge } from './ProjectAutosaveBadge.jsx';
 import { SubtitleExportDock } from './SubtitleExportDock.jsx';
 import { SubtitleSegmentRow } from './SubtitleSegmentRow.jsx';
@@ -37,12 +40,13 @@ const SPEAKER_COUNT_OPTIONS = Object.freeze([
   { id: '6', label: '5+ speakers' },
 ]);
 
-function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract, autosave }) {
+function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract, autosave, offlineReadiness, onSelectModels }) {
   return (
     <header className="studio-toolbar">
       <div className="toolbar-heading-group">
         <h1>Video to subtitle</h1>
         {autosave && <ProjectAutosaveBadge autosave={autosave} />}
+        {offlineReadiness && <OfflineReadinessBadge readiness={offlineReadiness} onSelect={onSelectModels} />}
       </div>
       <div className="toolbar-actions">
         {!busy && (
@@ -660,6 +664,8 @@ export function VideoSubtitleWorkspace({
   onStateChange,
   onNotify,
   onUnlockSound,
+  offlineReadiness = null,
+  onSelectModels = null,
 }) {
   const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden });
   if (actionsRef) {
@@ -667,6 +673,8 @@ export function VideoSubtitleWorkspace({
       loadProject: snapshot => {
         ctrl.autosave?.resetProject?.(snapshot?.id || '', snapshot?.revision || 1);
         ctrl.loadProjectFromSnapshot(snapshot);
+        ctrl.recovery?.checkForDraft?.(snapshot);
+        void ctrl.recovery?.verifyAssets?.(snapshot);
       },
       autosave: ctrl.autosave,
     };
@@ -731,6 +739,20 @@ export function VideoSubtitleWorkspace({
       <div className="workspace-notices">
         {notices}
         <MediaOfflineBanner health={health} onRefresh={() => void ctrl.refreshHealth()} />
+        <DraftRecoveryBanner
+          visible={ctrl.recovery?.showDraftBanner}
+          timestamp={ctrl.recovery?.recoveredDraft?.timestamp}
+          onRestore={ctrl.recovery?.restoreDraft}
+          onDiscard={ctrl.recovery?.discardDraft}
+          workspace="subtitles"
+        />
+        <MissingAssetBanner
+          visible={ctrl.recovery?.showMissingAssetBanner}
+          missingAssets={ctrl.recovery?.missingAssets}
+          onRelinkFile={ctrl.recovery?.relinkAssetFile}
+          onDismiss={ctrl.recovery?.dismissMissingAssets}
+          workspace="subtitles"
+        />
       </div>
       <SubtitleToolbar
         busy={busy}
@@ -742,6 +764,8 @@ export function VideoSubtitleWorkspace({
         onCancel={handleCancel}
         onExtract={() => void ctrl.extractSubtitles()}
         autosave={ctrl.autosave}
+        offlineReadiness={offlineReadiness}
+        onSelectModels={onSelectModels}
       />
       <div className="studio-grid subtitle-grid">
         <section className="subtitle-left-pane" aria-label="Video and controls">

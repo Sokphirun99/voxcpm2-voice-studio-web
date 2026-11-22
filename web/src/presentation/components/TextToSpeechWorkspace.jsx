@@ -2,17 +2,20 @@
  * @fileoverview Standalone Text-to-Speech function workspace managing scripts, character voices, library modal, and playback.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
 import { createTtsProjectSnapshot } from '../../domain/projects.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
 import { useProjectAutosave } from '../hooks/useProjectAutosave.js';
+import { useProjectRecovery } from '../hooks/useProjectRecovery.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
 import { useSpeechVerification } from '../hooks/useSpeechVerification.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
 import { ChunkSegmentsPanel } from './ChunkSegmentsPanel.jsx';
+import { DraftRecoveryBanner } from './DraftRecoveryBanner.jsx';
 import { Icon } from './Icon.jsx';
+import { MissingAssetBanner } from './MissingAssetBanner.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
 import { Toolbar } from './Toolbar.jsx';
 import { VoiceControls } from './VoiceControls.jsx';
@@ -231,7 +234,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   } = shared;
   const externalScript = propExternalScript || sharedScript || '';
   const onConsumeExternalScript = propConsume || sharedConsume;
-  const { logger, projectRepository, glossaryRepository = null } = useStudioServices();
+  const services = useStudioServices();
+  const { logger, projectRepository, glossaryRepository = null, assetRepository = null } = services;
   const scriptRef = useRef(null);
   const transcriptRef = useRef(null);
   const prevHiddenRef = useRef(hidden);
@@ -342,11 +346,44 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     onValidationFieldError: field => focusValidationField({ scriptRef, transcriptRef }, field),
     onNotify: shared.onNotify,
     onUnlockSound: shared.onUnlockSound,
+    offlineReadiness: shared?.offlineReadiness,
   });
   const hasScript = Boolean(script.trim());
   useEffect(() => {
     onTtsStateChange?.({ busy: synthesis.busy, hasScript, libraryOpen: libraryModal.open });
   }, [synthesis.busy, hasScript, libraryModal.open, onTtsStateChange]);
+
+  const handleRestoreDraft = useCallback(snapshot => {
+    autosave.resetProject(snapshot?.id || '', snapshot?.revision || 1);
+    applyProjectSnapshotToTts(snapshot, {
+      setProjectId,
+      setProjectTitle,
+      setProjectRevision,
+      setScript,
+      setOptions,
+      allVoices: allVoicesRef.current,
+      characterActions: characterActionsRef.current,
+    });
+    autosave.markDirty();
+  }, [autosave]);
+
+  const currentProjectSnapshot = useMemo(() => ({
+    id: projectId,
+    title: projectTitle,
+    revision: projectRevision,
+    payload: { script, ttsOptions: options, voiceId: activeCharacter.id },
+  }), [projectId, projectTitle, projectRevision, script, options, activeCharacter.id]);
+
+  const recovery = useProjectRecovery({
+    projectId,
+    workspace: 'tts',
+    currentProject: currentProjectSnapshot,
+    onRestoreDraft: handleRestoreDraft,
+    projectRepository,
+    assetRepository,
+    logger,
+    onNotify: shared.onNotify,
+  });
 
   if (actionsRef) {
     actionsRef.current = {
@@ -365,6 +402,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
           allVoices: allVoicesRef.current,
           characterActions: characterActionsRef.current,
         });
+        recovery.checkForDraft(snapshot);
+        void recovery.verifyAssets(snapshot);
       },
       autosave,
     };
@@ -373,7 +412,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const isOverLimit = count > MAX_SCRIPT_LENGTH;
   const generateDisabled = synthesis.busy || Boolean(synthesis.regeneratingChunk) || !anchorApi.isLoaded || !hasScript || isOverLimit;
   const state = { scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi, charactersRef, libraryModal, setLibraryModal };
-  const ctrl = { logger, glossaryRepository, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled, autosave };
+  const ctrl = { logger, glossaryRepository, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled, autosave, recovery };
   return { state, ctrl };
 }
 
@@ -398,10 +437,28 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
   });
   return (
     <div className="workspace-panel" hidden={hidden}>
-      {notices}
+      <div className="workspace-notices">
+        {notices}
+        <DraftRecoveryBanner
+          visible={ctrl.recovery.showDraftBanner}
+          timestamp={ctrl.recovery.recoveredDraft?.timestamp}
+          onRestore={ctrl.recovery.restoreDraft}
+          onDiscard={ctrl.recovery.discardDraft}
+          workspace="tts"
+        />
+        <MissingAssetBanner
+          visible={ctrl.recovery.showMissingAssetBanner}
+          missingAssets={ctrl.recovery.missingAssets}
+          onRelinkFile={ctrl.recovery.relinkAssetFile}
+          onDismiss={ctrl.recovery.dismissMissingAssets}
+          workspace="tts"
+        />
+      </div>
       <Toolbar busy={ctrl.synthesis.busy} generateDisabled={ctrl.generateDisabled}
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel}
-        autosave={ctrl.autosave} />
+        autosave={ctrl.autosave}
+        offlineReadiness={shared?.offlineReadiness}
+        onSelectModels={shared?.onSelectModels} />
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
         onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
       <AudioPlayer recording={ctrl.synthesis.recording} takes={ctrl.synthesis.takes}

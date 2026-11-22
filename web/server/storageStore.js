@@ -15,8 +15,22 @@ import { normalizeGlossaryRules } from '../src/domain/pronunciationRules.js';
 import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
 import { createProjectStore, assertSafeProjectId, resolveSafeProjectPath } from './projectStore.js';
 import { createAssetStore } from './assetStore.js';
+import {
+  runStorageMigrations,
+  verifyStorageIntegrity,
+  detectStorageMigrationsNeeded,
+  createStorageBackup,
+  rollbackStorageBackup,
+} from './storageMigration.js';
 
 export { assertSafeProjectId, resolveSafeProjectPath } from './projectStore.js';
+export {
+  runStorageMigrations,
+  verifyStorageIntegrity,
+  detectStorageMigrationsNeeded,
+  createStorageBackup,
+  rollbackStorageBackup,
+} from './storageMigration.js';
 
 
 const CATALOG_VERSION = 1;
@@ -578,7 +592,7 @@ async function readStoreStats(ctx) {
  * @param {{ dataDir: string, maxCacheEntries?: number }} config - Storage configuration.
  * @returns {object} Persistent storage store.
  */
-export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIES }) {
+export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIES, autoMigrate = true }) {
   const rootDir = path.resolve(dataDir);
   const anchorsDir = path.join(rootDir, ANCHORS_DIR_NAME);
   const cacheDir = path.join(rootDir, CACHE_DIR_NAME);
@@ -595,12 +609,24 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
   };
   const projectStore = createProjectStore({ projectsDir, enqueueWrite });
   const assetStore = createAssetStore({ assetsDir, dataDir: rootDir, enqueueWrite });
-  const init = async () => {
-    await mkdir(anchorsDir, { recursive: true });
-    await mkdir(cacheDir, { recursive: true });
-    await projectStore.init();
-    await assetStore.init();
-    await stat(anchorsDir);
+  let initPromise = null;
+  const init = () => {
+    if (!initPromise) {
+      initPromise = (async () => {
+        await mkdir(anchorsDir, { recursive: true });
+        await mkdir(cacheDir, { recursive: true });
+        await projectStore.init();
+        await assetStore.init();
+        if (autoMigrate) {
+          await runStorageMigrations({ dataDir: rootDir });
+        }
+        await stat(anchorsDir);
+      })().catch(error => {
+        initPromise = null;
+        throw error;
+      });
+    }
+    return initPromise;
   };
   const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, maxCacheEntries, enqueueWrite, init };
   return {
@@ -608,6 +634,9 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     dataDir: rootDir,
     projectStore,
     assetStore,
+    migrate: options => enqueueWrite(() => runStorageMigrations({ dataDir: rootDir, ...options })),
+    verifyIntegrity: () => verifyStorageIntegrity({ dataDir: rootDir }),
+    detectMigrations: () => detectStorageMigrationsNeeded({ dataDir: rootDir }),
     listCharacters: async query => paginateActiveRecords((await loadCatalog(catalogPath)).characters, query),
     upsertCharacter: (rawId, input) => saveCharacterRecord(ctx, rawId, input),
     deleteCharacter: rawId => softDeleteCharacterRecord(ctx, rawId),

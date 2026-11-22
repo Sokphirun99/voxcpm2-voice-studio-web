@@ -2,16 +2,19 @@
  * @fileoverview Top-level Voice Studio shell coordinating top-level function workspaces and shared Character Domain state.
  */
 
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
+import { clearLastActiveProject, getLastActiveProject, saveLastActiveProject } from '../../data/projectRecoveryStorage.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
 import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useNotifications } from '../hooks/useNotifications.js';
+import { useOfflineReadiness } from '../hooks/useOfflineReadiness.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { Icon } from './Icon.jsx';
+import { ModelsSetupWorkspace } from './ModelsSetupWorkspace.jsx';
 import { ProjectsWorkspace } from './ProjectsWorkspace.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
@@ -127,6 +130,7 @@ async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRe
   await flushWorkspaceBeforeProjectSwitch(ttsRef, subtitlesRef);
   const snapshot = await resolveProjectSnapshot(project, repo, logger);
   const type = snapshot?.type || (snapshot?.kind === 'subtitle' ? 'subtitles' : 'tts');
+  if (snapshot?.id) saveLastActiveProject({ projectId: snapshot.id, workspace: type, logger });
   if (type === 'tts') {
     ttsRef.current?.loadProject?.(snapshot);
     setActiveWorkspace('tts');
@@ -135,6 +139,33 @@ async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRe
   }
   subtitlesRef.current?.loadProject?.(snapshot);
   setActiveWorkspace('subtitles');
+}
+
+function useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace }) {
+  useEffect(() => {
+    let mounted = true;
+    const restoreActive = async () => {
+      const record = getLastActiveProject({ logger: services?.logger });
+      if (!record?.projectId || !services?.projectRepository) return;
+      try {
+        const project = await services.projectRepository.getProject(record.projectId);
+        if (!mounted || !project) return;
+        await openWorkspaceProject({
+          project,
+          repo: services.projectRepository,
+          logger: services.logger,
+          ttsRef,
+          subtitlesRef,
+          setActiveWorkspace,
+        });
+      } catch (err) {
+        services?.logger?.error?.('Studio.restoreLastActiveProject', err, { projectId: record.projectId });
+        clearLastActiveProject({ logger: services?.logger });
+      }
+    };
+    void restoreActive();
+    return () => { mounted = false; };
+  }, [services, ttsRef, subtitlesRef, setActiveWorkspace]);
 }
 
 /**
@@ -148,12 +179,16 @@ async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRe
 export function Studio() {
   const ttsRef = useRef(null);
   const subtitlesRef = useRef(null);
-  const [activeWorkspace, setActiveWorkspace] = useState('tts');
+  const [activeWorkspace, setActiveWorkspace] = useState(() => {
+    const initial = getLastActiveProject();
+    return initial?.workspace === 'subtitles' ? 'subtitles' : 'tts';
+  });
   const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false, libraryOpen: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
   const notifications = useNotifications();
   const services = useStudioServices();
+  useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace });
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
   }, []);
@@ -169,6 +204,10 @@ export function Studio() {
   }, [services, setActiveWorkspace]);
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
+  const { readiness: offlineReadiness } = useOfflineReadiness({ gateway: services?.diagnosticsGateway });
+  const handleSelectModels = useCallback(() => {
+    selectWorkspace('models', setActiveWorkspace, ttsRef);
+  }, []);
   const catalog = useSharedCharacterCatalog({
     ttsRef,
     onNotify: notifications.notify,
@@ -187,6 +226,8 @@ export function Studio() {
     setLockedSeeds: catalog.setLockedSeeds,
     characterActions: catalog.actions,
     refreshEngine,
+    offlineReadiness,
+    onSelectModels: handleSelectModels,
     onTtsStateChange: handleTtsStateChange,
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
@@ -227,6 +268,12 @@ export function Studio() {
           onStateChange={handleSubtitleStateChange}
           onNotify={notifications.notify}
           onUnlockSound={notifications.unlockSound}
+          offlineReadiness={offlineReadiness}
+          onSelectModels={handleSelectModels}
+        />
+        <ModelsSetupWorkspace
+          hidden={activeWorkspace !== 'models'}
+          diagnosticsGateway={services?.diagnosticsGateway}
         />
       </main>
       <ToastRegion toasts={notifications.toasts} onDismiss={notifications.dismiss} />

@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useStudioServices } from '../StudioContext.jsx';
+import { clearProjectDraft, saveProjectDraft } from '../../data/projectRecoveryStorage.js';
 
 export const AUTOSAVE_STATUS = Object.freeze({
   IDLE: 'idle',
@@ -73,7 +74,7 @@ async function resolveLatestRevisionIfConflict(repo, id, isConflict) {
     const remote = await repo.getProject(id);
     const remoteRev = Number(remote?.revision);
     return Number.isFinite(remoteRev) && remoteRev > 0 ? remoteRev : undefined;
-  } catch {
+  } catch (err) {
     return undefined;
   }
 }
@@ -92,7 +93,7 @@ function useAutosaveServices(customRepo, customLogger) {
   let contextServices = null;
   try {
     contextServices = useStudioServices();
-  } catch {
+  } catch (err) {
     contextServices = null;
   }
   const activeRepo = customRepo || contextServices?.projectRepository || null;
@@ -135,6 +136,34 @@ function handlePostSuccessDirty(refs, debounceMs, isUnmounting, updateStatus, sc
     return;
   }
   scheduleDebouncedSave(debounceMs);
+}
+
+function backupLocalDraft(refs, workspace, logger) {
+  try {
+    const snap = refs.buildSnapshotRef.current?.();
+    if (!snap) return;
+    saveProjectDraft({
+      draft: {
+        projectId: refs.projectIdRef.current || snap.id || null,
+        workspace,
+        snapshot: snap,
+        revision: refs.revisionRef.current || 1,
+        timestamp: new Date().toISOString(),
+      },
+      logger,
+    });
+  } catch (err) {
+    logger?.error?.('useProjectAutosave.backupDraftFailed', err);
+  }
+}
+
+function clearLocalDraft(refs, workspace, nextId, logger) {
+  try {
+    const id = nextId || refs.projectIdRef.current || null;
+    clearProjectDraft({ projectId: id, workspace, logger });
+  } catch (err) {
+    logger?.error?.('useProjectAutosave.clearDraftFailed', err);
+  }
 }
 
 async function prepareSaveContext(refs, repo, snapshot) {
@@ -186,6 +215,8 @@ export function useProjectAutosave({
   onSaveSuccess,
   onSaveError,
   onConflict,
+  workspace = 'tts',
+  enableDraftBackup = true,
 } = {}) {
   const services = useAutosaveServices(projectRepository, logger);
   const [status, setStatus] = useState(AUTOSAVE_STATUS.IDLE);
@@ -227,6 +258,7 @@ export function useProjectAutosave({
   const scheduleDebouncedSave = useCallback(delayMs => {
     dirtyRef.current = true;
     updateStatus(AUTOSAVE_STATUS.DIRTY, false);
+    if (enableDraftBackup) backupLocalDraft(refs, workspace, callbacks.current.logger);
     if (timerRef.current) {
       globalThis.clearTimeout(timerRef.current);
       timerRef.current = null;
@@ -235,7 +267,7 @@ export function useProjectAutosave({
       timerRef.current = null;
       void executeSaveRef.current?.();
     }, delayMs);
-  }, [updateStatus]);
+  }, [updateStatus, enableDraftBackup, workspace]);
 
   const applySaveSuccess = useCallback((outcome, isUnmounting) => {
     const { saved, nextRevision, nextId, result } = outcome;
@@ -243,6 +275,7 @@ export function useProjectAutosave({
     isConflictRef.current = false;
     revisionRef.current = nextRevision;
     if (nextId) projectIdRef.current = nextId;
+    if (enableDraftBackup) clearLocalDraft(refs, workspace, nextId, callbacks.current.logger);
     if (!isUnmounting && isMountedRef.current) {
       setRevision(nextRevision);
       if (nextId) setProjectId(nextId);
@@ -253,7 +286,7 @@ export function useProjectAutosave({
     callbacks.current.onSaveSuccess?.(saved);
     handlePostSuccessDirty(refs, debounceMs, isUnmounting, updateStatus, scheduleDebouncedSave, executeSaveRef);
     return result;
-  }, [debounceMs, updateStatus, scheduleDebouncedSave]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [debounceMs, updateStatus, scheduleDebouncedSave, enableDraftBackup, workspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const applySaveFailure = useCallback((err, isUnmounting) => {
     dirtyRef.current = true;

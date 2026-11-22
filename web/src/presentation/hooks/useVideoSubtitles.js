@@ -30,9 +30,11 @@ import {
   splitSubtitleSegment,
 } from '../../domain/subtitles.js';
 import { ValidationError } from '../../domain/errors.js';
+import { assertFeatureOfflineReady } from '../../domain/offlineReadiness.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { useProjectAutosave } from './useProjectAutosave.js';
+import { useProjectRecovery } from './useProjectRecovery.js';
 
 const MAX_CLIENT_VIDEO_BYTES = 500 * 1024 * 1024;
 const ALLOWED_EXT_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi|mp3|wav|m4a|aac|ogg|flac)$/i;
@@ -79,8 +81,10 @@ function handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTr
     }));
     return;
   }
+  const isMissingModel = err?.name === 'OfflineModelMissingError' || err?.code === 'OFFLINE_MODEL_MISSING';
   const errMsg = err?.message || fallbackError;
-  onError?.();
+  const title = isMissingModel ? 'Model download required' : errorTitle;
+  if (!isMissingModel) onError?.();
   setState(prev => ({
     ...prev,
     busyAction: '',
@@ -88,7 +92,7 @@ function handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTr
     translatedLanguage: restoreTaskTranslatedLang(prev, resetTranslationOnStart, hadTranslatedLanguage),
     status: { message: errMsg, error: true },
   }));
-  onNotify?.({ kind: 'error', title: errorTitle, message: errMsg });
+  onNotify?.({ kind: 'error', title, message: errMsg });
 }
 
 function assertNotAborted(signal) {
@@ -153,6 +157,19 @@ function buildExportPayload(format, videoFile, spec) {
     mimeType: 'text/plain;charset=utf-8',
     filename: buildExportName(videoFile, '-dialogue.txt'),
   };
+}
+
+function assertExtractionOfflineReady(options, models, isOnline) {
+  assertFeatureOfflineReady({ featureId: 'transcription_whisper', models, isOnline });
+  if (options.sourceLanguage === 'km' || Boolean(options.doubleCheckKhmer)) {
+    assertFeatureOfflineReady({ featureId: 'transcription_khmer', models, isOnline });
+  }
+  if (Boolean(options.detectSpeakers) && options.speakerCount !== '1') {
+    assertFeatureOfflineReady({ featureId: 'diarization', models, isOnline });
+  }
+  if (Boolean(options.translateToKhmer)) {
+    assertFeatureOfflineReady({ featureId: 'translation', models, isOnline });
+  }
 }
 
 function downloadBlobOrText({ data, mimeType, filename }) {
@@ -367,7 +384,7 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
   };
 }
 
-function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, refreshHealth, markOnline, onNotify, onUnlockSound }) {
+function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
   const cancel = useCallback(() => {
     abortRef.current?.abort();
   }, [abortRef]);
@@ -396,6 +413,10 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
       onError: () => void refreshHealth(),
       onNotify, onUnlockSound,
       run: async (signal, elapsedSecs) => {
+        const isOnline = typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+        if (!relinkingProject) {
+          assertExtractionOfflineReady(state.options, health.models, isOnline);
+        }
         const res = await gateway.transcribeVideo({
           file: state.videoFile,
           language: state.options.sourceLanguage,
@@ -445,6 +466,8 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
       onError: () => void refreshHealth(),
       onNotify, onUnlockSound,
       run: async (signal, elapsedSecs) => {
+        const isOnline = typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+        assertFeatureOfflineReady({ featureId: 'translation', models: health.models, isOnline });
         const res = await gateway.translateSegments({
           segments: state.segments,
           sourceLanguage: sourceLang === 'auto' ? 'en' : sourceLang,
@@ -486,6 +509,8 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
       onError: () => void refreshHealth(),
       onNotify, onUnlockSound,
       run: async (signal, elapsedSecs) => {
+        const isOnline = typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+        assertFeatureOfflineReady({ featureId: 'burn_in', models: { burnIn: health.burnInSupported }, isOnline });
         const { bilingual, useTranslation } = resolveTranslationFlags(state.hasTranslation, state.options.previewMode);
         const blob = await gateway.burnSubtitles({
           jobId: state.jobId,
@@ -981,6 +1006,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     buildSnapshot,
     enabled: Boolean(state.projectsReady),
     debounceMs: 1500,
+    workspace: 'subtitles',
     deps: [
       state.segments,
       state.videoFileName,
@@ -1012,6 +1038,39 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     },
   });
 
+  const handleRestoreDraft = useCallback(snapshot => {
+    autosave.resetProject(snapshot?.id || '', snapshot?.revision || 1);
+    loadProjectFromSnapshot(snapshot);
+    autosave.markDirty();
+  }, [autosave, loadProjectFromSnapshot]);
+
+  const currentProjectSnapshot = useMemo(() => ({
+    id: state.projectId,
+    title: state.projectTitle,
+    revision: state.revision || 1,
+    sourceAssetId: state.sourceAssetId || null,
+    sourceAsset: state.sourceAsset || null,
+    segments: state.segments,
+    payload: {
+      segments: state.segments,
+      videoFileName: state.videoFileName,
+      speakerNames: state.speakerNames,
+      subtitleOptions: state.options,
+    },
+  }), [state.projectId, state.projectTitle, state.revision, state.sourceAssetId, state.sourceAsset, state.segments, state.videoFileName, state.speakerNames, state.options]);
+
+  const recovery = useProjectRecovery({
+    projectId: state.projectId,
+    workspace: 'subtitles',
+    currentProject: currentProjectSnapshot,
+    onRestoreDraft: handleRestoreDraft,
+    onProjectUpdated: loadProjectFromSnapshot,
+    projectRepository,
+    assetRepository: services?.assetRepository,
+    logger: services?.logger,
+    onNotify,
+  });
+
   const persistCurrentProject = useCallback(async () => {
     return autosave.saveNow();
   }, [autosave]);
@@ -1024,7 +1083,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
 
   const editActions = useSegmentEditingActions({ segments: state.segments, setState, setActiveSegmentId, useTranslation });
   const asyncActions = useSubtitleAsyncActions({
-    state, stateRef, setState, setBusyMeta, setActiveSegmentId, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, refreshHealth, markOnline, onNotify, onUnlockSound,
+    state, stateRef, setState, setBusyMeta, setActiveSegmentId, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
   });
 
   return {
@@ -1039,6 +1098,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     projectId: state.projectId,
     projectTitle: state.projectTitle,
     autosave,
+    recovery,
     flushProjectSave: persistCurrentProject,
     loadProjectFromSnapshot,
     projectRepository,

@@ -106,3 +106,30 @@ export class ConflictError extends Error {
   }
 }
 
+/**
+ * Error thrown when an offline action is attempted without its required model cached locally.
+ */
+export class OfflineModelMissingError extends Error {
+  /**
+   * Creates an OfflineModelMissingError.
+   * Inputs: metadata object `{ featureId, featureName, modelId, modelName, repo, approxSize, message }`.
+   * Outputs: OfflineModelMissingError instance.
+   * Side effects: none.
+   * Failure modes: none.
+   * @param {object} meta - Error metadata.
+   */
+  constructor({ featureId, featureName, modelId, modelName, repo, approxSize, message } = {}) {
+    const defaultMsg = `${modelName || 'Model'} (${repo || 'unknown'}) is not cached locally (~${approxSize || 'unknown'}). A one-time internet connection is required to download this model before working offline.`;
+    super(message || defaultMsg);
+    this.name = 'OfflineModelMissingError';
+    this.code = 'OFFLINE_MODEL_MISSING';
+    this.featureId = featureId;
+    this.featureName = featureName;
+    this.modelId = modelId;
+    this.modelName = modelName;
+    this.repo = repo;
+    this.approxSize = approxSize;
+  }
+}
+
+

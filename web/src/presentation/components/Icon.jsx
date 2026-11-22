@@ -223,6 +223,38 @@ const ICON_PATHS = {
       <path d="M17 10H21.4C21.7314 10 22 9.73137 22 9.4V5" />
     </g>
   ),
+  // Iconoir: cpu
+  cpu: (
+    <g {...STROKE_STYLE}>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path d="M9 9H15V15H9V9Z" />
+      <path d="M9 1V4" />
+      <path d="M15 1V4" />
+      <path d="M9 20V23" />
+      <path d="M15 20V23" />
+      <path d="M20 9H23" />
+      <path d="M20 15H23" />
+      <path d="M1 9H4" />
+      <path d="M1 15H4" />
+    </g>
+  ),
+  // Iconoir: server
+  server: (
+    <g {...STROKE_STYLE}>
+      <rect x="3" y="4" width="18" height="6" rx="2" />
+      <rect x="3" y="14" width="18" height="6" rx="2" />
+      <path d="M7 7H7.01" />
+      <path d="M7 17H7.01" />
+    </g>
+  ),
+  // Iconoir: database
+  database: (
+    <g {...STROKE_STYLE}>
+      <ellipse cx="12" cy="5" rx="8" ry="3" />
+      <path d="M4 5V19C4 20.6569 7.58172 22 12 22C16.4183 22 20 20.6569 20 19V5" />
+      <path d="M4 12C4 13.6569 7.58172 15 12 15C16.4183 15 20 13.6569 20 12" />
+    </g>
+  ),
 };
 
 /**

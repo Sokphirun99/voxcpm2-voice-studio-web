@@ -4,7 +4,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatGenerationMetrics } from '../../domain/audioValidation.js';
-import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
+import { OfflineModelMissingError, SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
+import { assertFeatureOfflineReady } from '../../domain/offlineReadiness.js';
 import { findActiveTake, pushTakeHistory, removeTakeFromHistory } from '../../domain/takeHistory.js';
 import { useStudioServices } from '../StudioContext.jsx';
 
@@ -22,6 +23,11 @@ function handleGenerationFailure(error, { setStatus, onFailure, onValidationFiel
   }
   if (error instanceof SynthesisCancelledError) {
     setStatus({ message: error.message, error: false });
+    return;
+  }
+  if (error instanceof OfflineModelMissingError || error?.name === 'OfflineModelMissingError') {
+    setStatus({ message: error.message, error: true });
+    onNotify?.({ kind: 'error', title: 'Model download required', message: error.message });
     return;
   }
   const message = error?.message || 'Could not generate speech. Try again.';
@@ -115,6 +121,20 @@ async function runSynthesisLifecycle({ abortController, request, setBusy, setBus
   }
 }
 
+function resolveSynthesisOnline(ctx) {
+  if (typeof ctx?.isOnline === 'boolean') return ctx.isOnline;
+  if (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') {
+    return navigator.onLine;
+  }
+  return true;
+}
+
+function resolveSynthesisModels(ctx) {
+  if (ctx?.models) return ctx.models;
+  if (ctx?.offlineReadiness?.features) return ctx.offlineReadiness.features;
+  return null;
+}
+
 /**
  * Guards against overlapping synthesis runs and delegates to `runSynthesisLifecycle`.
  * @param {object} ctx - Hook services, refs, setters, and generation args.
@@ -122,14 +142,20 @@ async function runSynthesisLifecycle({ abortController, request, setBusy, setBus
  */
 function startSynthesisGeneration(ctx) {
   if (ctx.busy || ctx.abortController.current) return Promise.resolve();
+  const isOnline = resolveSynthesisOnline(ctx);
+  const models = resolveSynthesisModels(ctx);
+  assertFeatureOfflineReady({ featureId: 'tts', models, isOnline });
   return runSynthesisLifecycle({
     abortController: ctx.abortController, request: ctx.request, setBusy: ctx.setBusy, setBusyMeta: ctx.setBusyMeta,
     setActiveCharacterId: ctx.setActiveCharacterId, setStatus: ctx.setStatus,
     onFailure: ctx.onFailure, onValidationFieldError: ctx.onValidationFieldError,
     onNotify: ctx.onNotify, onUnlockSound: ctx.onUnlockSound,
     run: (signal, updateProgress) => executeSynthesisRequest({
-      synthesizeSpeech: ctx.synthesizeSpeech, request: ctx.request, signal,
-      onReferenceUploaded: ctx.onReferenceUploaded, onCompleted: ctx.onCompleted,
+      synthesizeSpeech: ctx.synthesizeSpeech,
+      request: { ...ctx.request, models, isOnline },
+      signal,
+      onReferenceUploaded: ctx.onReferenceUploaded,
+      onCompleted: ctx.onCompleted,
       updateProgress, setStatus: ctx.setStatus, commitRecording: ctx.commitRecording, setLastSeed: ctx.setLastSeed, onNotify: ctx.onNotify,
     }),
   });
@@ -137,14 +163,14 @@ function startSynthesisGeneration(ctx) {
 
 /**
  * Coordinates abortable single-character speech synthesis, bounded session take history, and status reporting.
- * Inputs: `{ onFailure, onValidationFieldError, onNotify, onUnlockSound }`.
+ * Inputs: `{ onFailure, onValidationFieldError, onNotify, onUnlockSound, offlineReadiness, models, isOnline }`.
  * Outputs: `{ busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, recording, lastSeed, status, setStatus, selectTake, deleteTake, regenerateChunk, runGeneration, cancel }`.
  * Side effects: invokes injected domain use cases, commits generated takes, and aborts pending calls on unmount.
  * Failure modes: translates ValidationError, SynthesisCancelledError, and SynthesisError into status state.
- * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void, onNotify?: Function, onUnlockSound?: Function }} params - Hook callbacks.
+ * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void, onNotify?: Function, onUnlockSound?: Function, offlineReadiness?: object, models?: unknown, isOnline?: boolean }} params - Hook callbacks.
  * @returns {object} Synthesis state and actions.
  */
-export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify, onUnlockSound }) {
+export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify, onUnlockSound, offlineReadiness = null, models = null, isOnline = undefined }) {
   const { synthesizeSpeech } = useStudioServices();
   const abortController = useRef(null);
   const [busy, setBusy] = useState(false);
@@ -196,7 +222,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     setTakes(nextTakes);
   }, []);
 
-  const regenerateChunk = useCallback(async ({ recording: target, index, text, character, anchor, cachedUpload, options, onCompleted }) => {
+  const regenerateChunk = useCallback(async ({ recording: target, index, text, character, anchor, cachedUpload, options, onCompleted, models: chunkModels, isOnline: chunkOnline }) => {
     if (!target?.id || abortController.current || regeneratingRef.current) return null;
     const controller = new AbortController();
     abortController.current = controller;
@@ -204,8 +230,12 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     setRegeneratingChunk({ takeId: target.id, index });
     setStatus({ message: `Regenerating segment ${index + 1} of ${target.chunks.length}…`, error: false });
     try {
+      const online = resolveSynthesisOnline({ isOnline: chunkOnline ?? isOnline });
+      const effectiveModels = resolveSynthesisModels({ models: chunkModels ?? models, offlineReadiness });
+      assertFeatureOfflineReady({ featureId: 'tts', models: effectiveModels, isOnline: online });
       const result = await synthesizeSpeech.regenerateChunk({
         recording: target, index, text, character, anchor, cachedUpload, options, signal: controller.signal,
+        models: effectiveModels, isOnline: online,
       });
       if (controller.signal.aborted || !result?.recording) return null;
       replaceTake(target.id, result.recording);
@@ -225,7 +255,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
       regeneratingRef.current = null;
       setRegeneratingChunk(null);
     }
-  }, [synthesizeSpeech, replaceTake, onFailure, onValidationFieldError, onNotify]);
+  }, [synthesizeSpeech, replaceTake, onFailure, onValidationFieldError, onNotify, isOnline, models, offlineReadiness]);
 
   useEffect(() => () => abortController.current?.abort(), []);
   return {
@@ -234,6 +264,9 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     runGeneration: args => startSynthesisGeneration({
       ...args, busy, abortController, synthesizeSpeech, setBusy, setBusyMeta, setActiveCharacterId,
       setStatus, commitRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound,
+      offlineReadiness: args.offlineReadiness ?? offlineReadiness,
+      models: args.models ?? models,
+      isOnline: typeof args.isOnline === 'boolean' ? args.isOnline : isOnline,
     }),
     cancel: () => abortController.current?.abort(),
   };
