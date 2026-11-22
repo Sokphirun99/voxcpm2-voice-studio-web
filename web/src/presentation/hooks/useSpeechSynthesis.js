@@ -38,29 +38,32 @@ function handleGenerationFailure(error, { setStatus, onFailure, onValidationFiel
 
 /**
  * Builds a progress status line during synthesis.
- * @param {{ completed: number, total: number }} progress - Chunk progress info.
+ * @param {{ completed: number, total: number, characterName?: string }} progress - Chunk progress info.
  * @returns {string} Human-readable progress message.
  */
-function formatProgressMessage({ completed, total }) {
+function formatProgressMessage({ completed, total, characterName }) {
   if (total <= 1) return 'Generating speech. The first request may take longer while the model loads.';
+  if (characterName) return `Generating part ${completed + 1} of ${total} (${characterName})…`;
   return `Generating part ${completed + 1} of ${total} with the same character voice…`;
 }
 
 /**
  * Builds the default completion status line when no custom message is returned.
  * @param {{ name: string, id: string }} character - Target speaking character.
- * @param {number|null} seed - Returned seed.
+ * @param {object} recording - Returned recording.
  * @returns {string} Status line text.
  */
 function formatSuccessStatus(character, recording) {
-  const identity = character ? `${character.name} (${character.id})` : 'Voice';
+  const identity = recording?.isMultiSpeaker
+    ? 'Multiple speakers'
+    : (character ? `${character.name} (${character.id})` : 'Voice');
   const metrics = formatGenerationMetrics(recording);
   const parts = ['Audio ready'];
   if (recording?.fromCache) parts.push('cached');
   else if (recording?.mastered) parts.push('-16 LUFS mastered');
   if (metrics) parts.push(metrics);
   parts.push(identity);
-  if (recording?.seed != null) parts.push(`Seed ${recording.seed}`);
+  if (recording?.seed != null && !recording?.isMultiSpeaker) parts.push(`Seed ${recording.seed}`);
   return parts.join(' · ');
 }
 
@@ -70,17 +73,70 @@ function formatCompletedStatus({ customMessage, character, recording }) {
   return metrics ? `${customMessage} · ${metrics}` : customMessage;
 }
 
+function formatSegmentSuccessStatus(character, recording) {
+  const identity = character ? `${character.name} (${character.id})` : 'Voice';
+  const metrics = formatGenerationMetrics(recording);
+  if (recording?.fromCache) return `Segment audio ready (cached) · ${identity}`;
+  return ['Segment audio ready', metrics, identity].filter(Boolean).join(' · ');
+}
+
+async function executeSegmentRequest(spec) {
+  const { synthesizeSpeech, segment, character, anchor, cachedUpload, options, signal, onCompleted, setStatus, onNotify, onReferenceUploaded, models, isOnline } = spec;
+  const runner = synthesizeSpeech.synthesizeSegment || synthesizeSpeech.execute;
+  const result = await runner({
+    segment, character, anchor, cachedUpload, options, signal, models, isOnline,
+    onReferenceUploaded: fileData => onReferenceUploaded?.(character.id, fileData),
+  });
+  if (signal.aborted || !result?.recording) return null;
+  await onCompleted?.(result);
+  const statusMsg = formatSegmentSuccessStatus(character, result.recording);
+  setStatus({ message: statusMsg, error: false });
+  onNotify?.({ kind: 'success', title: 'Segment generated', message: statusMsg });
+  return result.recording;
+}
+
+function notifyRestitchedSuccess({ recording, commitRecording, setStatus, onNotify }) {
+  commitRecording(recording);
+  const action = recording.isNarration ? 'Complete narration assembled' : 'Full audio restitched';
+  const title = recording.isNarration ? 'Narration assembled' : 'Audio track compiled';
+  const message = [action, formatGenerationMetrics(recording)].filter(Boolean).join(' · ');
+  setStatus({ message, error: false });
+  onNotify?.({ kind: 'success', title, message });
+}
+
+async function runSegmentLifecycle(ctx, runner) {
+  ctx.onUnlockSound?.();
+  const controller = new AbortController();
+  ctx.abortController.current = controller;
+  ctx.setGeneratingSegmentId(ctx.segmentId);
+  ctx.setBusy(true);
+  ctx.setStatus({ message: `Generating segment audio (${ctx.voiceName})…`, error: false });
+  try {
+    return await runner(controller.signal);
+  } catch (error) {
+    handleGenerationFailure(error, ctx);
+    return null;
+  } finally {
+    if (ctx.abortController.current === controller) ctx.abortController.current = null;
+    ctx.setGeneratingSegmentId(null);
+    ctx.setBusy(false);
+  }
+}
+
 /**
  * Executes synthesis use case, stores recording/seed updates, and updates the status line.
  * @param {object} spec - Execution callbacks and services.
  * @returns {Promise<void>} Completion promise.
  */
 async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, commitRecording, setLastSeed, onNotify }) {
-  const result = await synthesizeSpeech.execute({
+  const runner = request.isMultiSpeaker && typeof synthesizeSpeech.synthesizeMultiSpeaker === 'function'
+    ? synthesizeSpeech.synthesizeMultiSpeaker
+    : synthesizeSpeech.execute;
+  const result = await runner({
     ...request,
     signal,
     onProgress: info => updateProgress(formatProgressMessage(info)),
-    onReferenceUploaded: fileData => onReferenceUploaded?.(request.character.id, fileData),
+    onReferenceUploaded: (charId, fileData) => onReferenceUploaded?.(charId || request.character?.id, fileData),
   });
   commitRecording(result.recording);
   if (result.recording.seed != null) setLastSeed(result.recording.seed);
@@ -161,10 +217,17 @@ function startSynthesisGeneration(ctx) {
   });
 }
 
+function prepareSegmentRun(args, defaults) {
+  const online = resolveSynthesisOnline({ isOnline: args.isOnline ?? defaults.isOnline });
+  const effectiveModels = resolveSynthesisModels({ models: args.models ?? defaults.models, offlineReadiness: defaults.offlineReadiness });
+  assertFeatureOfflineReady({ featureId: 'tts', models: effectiveModels, isOnline: online });
+  return { online, effectiveModels };
+}
+
 /**
  * Coordinates abortable single-character speech synthesis, bounded session take history, and status reporting.
  * Inputs: `{ onFailure, onValidationFieldError, onNotify, onUnlockSound, offlineReadiness, models, isOnline }`.
- * Outputs: `{ busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, recording, lastSeed, status, setStatus, selectTake, deleteTake, regenerateChunk, runGeneration, cancel }`.
+ * Outputs: `{ busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, generatingSegmentId, recording, lastSeed, status, setStatus, selectTake, deleteTake, regenerateChunk, generateSegment, runGeneration, cancel }`.
  * Side effects: invokes injected domain use cases, commits generated takes, and aborts pending calls on unmount.
  * Failure modes: translates ValidationError, SynthesisCancelledError, and SynthesisError into status state.
  * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void, onNotify?: Function, onUnlockSound?: Function, offlineReadiness?: object, models?: unknown, isOnline?: boolean }} params - Hook callbacks.
@@ -179,6 +242,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
   const [takes, setTakes] = useState([]);
   const [activeTakeId, setActiveTakeId] = useState(null);
   const [regeneratingChunk, setRegeneratingChunk] = useState(null);
+  const [generatingSegmentId, setGeneratingSegmentId] = useState(null);
   const [lastSeed, setLastSeed] = useState(null);
   const [status, setStatus] = useState({ message: 'No audio generated yet.', error: false });
   const takesRef = useRef(takes);
@@ -257,10 +321,64 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     }
   }, [synthesizeSpeech, replaceTake, onFailure, onValidationFieldError, onNotify, isOnline, models, offlineReadiness]);
 
+  const generateSegment = useCallback(async args => {
+    const { segment, character } = args || {};
+    if (!segment?.id || abortController.current || generatingSegmentId) return null;
+    if (!(segment.text || '').trim()) {
+      handleGenerationFailure(new ValidationError('Enter text before generating speech.', 'script', 'EMPTY_SEGMENT'), { setStatus, onFailure, onValidationFieldError, onNotify });
+      return null;
+    }
+    const { online, effectiveModels } = prepareSegmentRun(args, { isOnline, models, offlineReadiness });
+    return runSegmentLifecycle({
+      segmentId: segment.id, voiceName: character?.name || 'Voice', abortController,
+      setGeneratingSegmentId, setBusy, setStatus, onFailure, onValidationFieldError, onNotify, onUnlockSound,
+    }, signal => executeSegmentRequest({
+      synthesizeSpeech, ...args, signal, setStatus, onNotify, models: effectiveModels, isOnline: online,
+    }));
+  }, [synthesizeSpeech, onFailure, onValidationFieldError, onNotify, onUnlockSound, isOnline, models, offlineReadiness, generatingSegmentId]);
+
+  const restitchSegments = useCallback(async args => {
+    if (!Array.isArray(args?.segments) || abortController.current) return null;
+    const controller = new AbortController();
+    abortController.current = controller;
+    setBusy(true);
+    const startMsg = args?.isNarration
+      ? 'Assembling complete narration with calibrated pauses…'
+      : 'Restitching audio segments with calibrated pauses…';
+    setStatus({ message: startMsg, error: false });
+    try {
+      const result = await synthesizeSpeech.restitchSegments({ ...args, signal: controller.signal });
+      if (controller.signal.aborted || !result?.recording) return null;
+      notifyRestitchedSuccess({ recording: result.recording, commitRecording, setStatus, onNotify });
+      return result.recording;
+    } catch (error) {
+      handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify });
+      return null;
+    } finally {
+      if (abortController.current === controller) abortController.current = null;
+      setBusy(false);
+    }
+  }, [synthesizeSpeech, commitRecording, onFailure, onValidationFieldError, onNotify]);
+
+  const exportNarration = useCallback(async args => {
+    const rec = await restitchSegments({ ...args, isNarration: true });
+    if (rec?.audioUrl && typeof document !== 'undefined' && document.body) {
+      const anchor = document.createElement('a');
+      anchor.href = rec.audioUrl;
+      anchor.download = rec.filename || 'voxcpm2-assembled-narration.wav';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+    }
+    return rec;
+  }, [restitchSegments]);
+
   useEffect(() => () => abortController.current?.abort(), []);
   return {
-    busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, recording, lastSeed, status, setStatus,
-    selectTake, deleteTake, regenerateChunk,
+    busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, generatingSegmentId, recording, lastSeed, status, setStatus,
+    selectTake, deleteTake, regenerateChunk, generateSegment, restitchSegments,
+    assembleNarration: restitchSegments,
+    exportNarration,
     runGeneration: args => startSynthesisGeneration({
       ...args, busy, abortController, synthesizeSpeech, setBusy, setBusyMeta, setActiveCharacterId,
       setStatus, commitRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound,

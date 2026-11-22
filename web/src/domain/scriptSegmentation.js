@@ -17,8 +17,7 @@ import { MAX_SCRIPT_LENGTH, countGraphemes } from './presets.js';
 
 export { MAX_PAUSE_MS, MIN_PAUSE_MS, clampPauseMs, hasPauseMarkers, preservePauseMarkers, stripPauseMarkers };
 export const DEFAULT_MAX_CHUNK_GRAPHEMES = 180;
-
-const SENTENCE_SPLIT_PATTERN = /(?<=[។៕.!?;\n])\s+/u;
+export const SENTENCE_SPLIT_PATTERN = /(?<=[។៕.!?;\n])\s+/u;
 const CLAUSE_SPLIT_PATTERN = /(?<=[,،、])\s+|\s+/u;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
@@ -117,7 +116,7 @@ function segmentPlainText(plainText, maxGraphemes) {
  * @param {string} text - Script containing optional markers.
  * @returns {Array<{ text: string, pauseAfterMs: number|null }>} Spoken parts in order.
  */
-function splitOnPauseMarkers(text) {
+export function splitOnPauseMarkers(text) {
   const parts = [];
   const pushText = raw => {
     const spoken = raw.trim();

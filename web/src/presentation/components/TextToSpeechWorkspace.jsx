@@ -3,8 +3,36 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { DEFAULT_STEPS, MAX_SCRIPT_LENGTH, STYLE_MODES, countGraphemes } from '../../domain/presets.js';
+import {
+  attachTakesToSegments,
+  createEditableSegment,
+  deleteSegment,
+  attachTakeToSegment,
+  getSegmentActiveTake,
+  getSegmentTake,
+  hasSegmentAudio,
+  selectSegmentTakeInList,
+  removeSegmentTakeInList,
+  insertSegment,
+  mergeSegments,
+  moveSegmentDown,
+  moveSegmentUp,
+  reconcileScriptToSegments,
+  reorderSegments,
+  segmentsToScript,
+  splitSegmentInList,
+  updateSegmentContent,
+  updateSegmentInList,
+} from '../../domain/projectSegments.js';
+import {
+  DEFAULT_STEPS,
+  MAX_SCRIPT_LENGTH,
+  STYLE_MODES,
+  countGraphemes,
+} from '../../domain/presets.js';
+import { findCharacterById } from '../../domain/voiceLibrary.js';
 import { createTtsProjectSnapshot } from '../../domain/projects.js';
+import { persistTakeAsset, resolveTakeAudioUrl } from '../../data/takeAssetStorage.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
 import { useProjectAutosave } from '../hooks/useProjectAutosave.js';
@@ -90,7 +118,21 @@ export function clearCharacterLockedSeed(setLockedSeeds, characterId) {
   });
 }
 
-function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, actions, options, lockedSeeds = {} }) {
+function resolveMultiSpeakerContext(spec) {
+  const { segments = [], submittedCharacter, characters = [], anchors = {}, actions } = spec;
+  const isMulti = Array.isArray(segments) && segments.length > 1 && new Set(segments.map(s => s.voiceId || submittedCharacter.id).filter(Boolean)).size > 1;
+  return {
+    isMultiSpeaker: isMulti,
+    segments,
+    characters,
+    defaultCharacter: submittedCharacter,
+    anchors,
+    cachedUploads: actions.uploadedRefsRef.current,
+  };
+}
+
+function buildSubmissionRequest(spec) {
+  const { script, submittedCharacter, submittedAnchor, actions, options, lockedSeeds = {} } = spec;
   const lockedSeed = options.lockSeed !== false ? lockedSeeds[submittedCharacter.id] : null;
   const seed = resolveEffectiveSeed({
     rawSeed: options.seed,
@@ -112,6 +154,7 @@ function buildSubmissionRequest({ script, submittedCharacter, submittedAnchor, a
     customStyle: options.customStyle || '',
     denoiseReference: options.denoiseReference,
     masterAudio: options.masterAudio !== false,
+    ...resolveMultiSpeakerContext(spec),
   };
 }
 
@@ -138,20 +181,86 @@ export function buildVoiceActions({ actions, activeCharacter, setLibraryModal, s
   };
 }
 
+async function persistChunkAsset(assetRepository, chunk, meta) {
+  if (!chunk?.blob || !assetRepository) return null;
+  return persistTakeAsset({
+    assetRepository,
+    blob: chunk.blob,
+    segmentId: chunk.segmentId || meta.fallbackSegmentId,
+    seed: chunk.seed,
+    projectId: meta.projectId,
+    logger: meta.logger,
+  });
+}
+
+async function persistChunkAssets(chunks, meta) {
+  if (!Array.isArray(chunks) || chunks.length === 0 || !meta.assetRepository) return chunks;
+  return Promise.all(chunks.map(async (chunk, idx) => {
+    const audioAssetId = await persistChunkAsset(meta.assetRepository, chunk, {
+      ...meta, fallbackSegmentId: `seg-${idx + 1}`,
+    });
+    return audioAssetId ? { ...chunk, audioAssetId } : chunk;
+  }));
+}
+
+async function uploadAndAttachProjectTakes(spec) {
+  const { assetRepository, setSegments, result, characterId, anchorRevision, options, projectId, logger } = spec;
+  if (!result?.recording || !setSegments) return;
+  const fullAssetId = await persistTakeAsset({
+    assetRepository, blob: result.recording.blob, segmentId: 'full', seed: result.recording.seed, projectId, logger,
+  });
+  const chunks = await persistChunkAssets(result.recording.chunks, { assetRepository, projectId, logger });
+  const rec = chunks ? { ...result.recording, chunks } : result.recording;
+  setSegments(prev => attachTakesToSegments(prev, rec, {
+    voiceId: characterId, audioAssetId: fullAssetId, anchorVersion: anchorRevision,
+    guidance: options.guidance, steps: options.steps, styleMode: options.styleMode, customStyle: options.customStyle,
+  }));
+}
+
+/**
+ * Uploads a generated segment take blob to durable asset storage and attaches it to the segment.
+ * Inputs: spec containing assetRepository, setSegments, segmentId, result, characterId, anchorRevision, options, projectId, logger.
+ * Outputs: Promise<void>.
+ * Side effects: uploads asset binary to storage, mutates React segment state.
+ * Failure modes: logs warning via persistTakeAsset on upload error and attaches take with null audioAssetId.
+ * @param {object} spec - Upload and attachment parameters.
+ */
+async function uploadAndAttachSegmentTake(spec) {
+  const { assetRepository, setSegments, segmentId, result, characterId, anchorRevision, options, projectId, logger } = spec;
+  if (!result?.recording || !setSegments || !segmentId) return;
+  const audioAssetId = await persistTakeAsset({
+    assetRepository, blob: result.recording.blob, segmentId, seed: result.recording.seed, projectId, logger,
+  });
+  setSegments(prev => attachTakeToSegment(prev, segmentId, result.recording, {
+    voiceId: characterId, audioAssetId, anchorVersion: anchorRevision,
+    guidance: options.guidance, steps: options.steps, styleMode: options.styleMode, customStyle: options.customStyle,
+  }));
+}
+
 function submitCharacterSpeech(event, ctx) {
   event.preventDefault();
   if (!ctx.anchorApi.isLoaded) return;
   const submittedCharacter = ctx.activeCharacter;
   const submittedAnchor = ctx.anchorApi.anchors[submittedCharacter.id] || null;
   const submittedRevision = ctx.anchorApi.getRevision(submittedCharacter.id);
-  const request = buildSubmissionRequest({ script: ctx.script, submittedCharacter, submittedAnchor, actions: ctx.actions, options: ctx.options, lockedSeeds: ctx.lockedSeeds });
+  const request = buildSubmissionRequest({
+    script: ctx.script, submittedCharacter, submittedAnchor,
+    actions: ctx.actions, options: ctx.options, lockedSeeds: ctx.lockedSeeds,
+    segments: ctx.segments, characters: ctx.charactersRef.current, anchors: ctx.anchorApi.anchors,
+  });
   void ctx.synthesis.runGeneration({
     request,
     onReferenceUploaded: ctx.actions.setCachedUpload,
-    onCompleted: result => {
-      if (ctx.options.lockSeed !== false && result.recording?.seed != null) {
+    onCompleted: async result => {
+      if (ctx.options.lockSeed !== false && result.recording?.seed != null && !request.isMultiSpeaker) {
         ctx.setLockedSeeds?.(prev => ({ ...prev, [submittedCharacter.id]: result.recording.seed }));
       }
+      await uploadAndAttachProjectTakes({
+        assetRepository: ctx.assetRepository, setSegments: ctx.setSegments, result,
+        characterId: submittedCharacter.id, anchorRevision: submittedRevision || 1,
+        options: ctx.options, projectId: ctx.projectId, logger: ctx.logger,
+      });
+      if (request.isMultiSpeaker) return null;
       return finalizeCharacterGeneration({
         result, submittedCharacter, submittedRevision,
         characterExists: id => ctx.charactersRef.current.some(item => item.id === id),
@@ -169,7 +278,11 @@ function handleScriptShortcut(event, generateDisabled) {
 
 function focusValidationField(refs, field) {
   if (field === 'promptText') refs.transcriptRef.current?.focus();
-  if (field === 'script') refs.scriptRef.current?.focus();
+  if (field === 'script') {
+    refs.scriptRef.current?.focus();
+    const firstSegment = document.querySelector('.segment-textarea');
+    firstSegment?.focus();
+  }
 }
 
 function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
@@ -186,15 +299,53 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         character: ctrl.activeCharacter, anchor: ctrl.activeAnchor,
         cachedUpload: ctrl.actions.uploadedRefsRef.current[ctrl.activeCharacter.id] || null,
         options: state.options,
+        onCompleted: result => {
+          if (state.setSegments && result?.recording) {
+            state.setSegments(prev => attachTakesToSegments(prev, result.recording, { voiceId: ctrl.activeCharacter.id }));
+          }
+        },
       })}
       onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this segment in the browser. You can still regenerate it.', error: true })} />
   ) : null;
   return (
     <form id="speech-form" className="studio-grid" onSubmit={event => submitCharacterSpeech(event, { ...state, ...ctrl })}>
-      <ScriptEditor scriptInput={state.scriptRef} script={state.script} count={ctrl.count} isOverLimit={ctrl.isOverLimit}
-        onReplaceScript={text => { state.setScript(text); state.scriptRef.current?.focus(); }}
-        onScriptChange={state.setScript} onScriptKey={event => handleScriptShortcut(event, ctrl.generateDisabled)}
-        segmentsPanel={segmentsPanel} />
+      <ScriptEditor
+        scriptInput={state.scriptRef}
+        script={state.script}
+        count={ctrl.count}
+        isOverLimit={ctrl.isOverLimit}
+        onReplaceScript={state.handleReplaceScript}
+        onScriptChange={state.handleScriptChange}
+        onScriptKey={event => handleScriptShortcut(event, ctrl.generateDisabled)}
+        segmentsPanel={segmentsPanel}
+        segments={state.segments}
+        activeSegmentId={state.activeSegmentId}
+        onSelectSegment={state.setActiveSegmentId}
+        onUpdateSegment={state.handleUpdateSegment}
+        onAddSegment={state.handleAddSegment}
+        onDeleteSegment={state.handleDeleteSegment}
+        onMoveSegmentUp={state.handleMoveSegmentUp}
+        onMoveSegmentDown={state.handleMoveSegmentDown}
+        onMergeSegment={state.handleMergeSegment}
+        onSplitSegment={state.handleSplitSegment}
+        onReorderSegments={state.handleReorderSegments}
+        onGenerateSegment={state.handleGenerateSegment}
+        onTogglePlaySegment={state.handleTogglePlaySegment}
+        generatingSegmentId={ctrl.synthesis.generatingSegmentId}
+        playingSegmentId={state.playingSegmentId}
+        onSelectSegmentTake={state.handleSelectSegmentTake}
+        onDeleteSegmentTake={state.handleDeleteSegmentTake}
+        onTogglePlayTake={state.handleTogglePlayTake}
+        playingTakeId={state.playingTakeId}
+        onRestitchSegments={state.handleRestitchSegments}
+        onExportNarration={state.handleExportNarration}
+        hasTakesToRestitch={state.hasTakesToRestitch}
+        viewMode={state.viewMode}
+        onViewModeChange={state.setViewMode}
+        voices={state.library.allVoices}
+        defaultVoiceId={ctrl.activeCharacter.id}
+        disabled={ctrl.synthesis.busy}
+      />
       <section className="voice-inspector" aria-labelledby="voice-title">
         <div className="pane-heading">
           <h2 id="voice-title">Voice</h2>
@@ -212,12 +363,30 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
   );
 }
 
+function playSegmentAudio(audioUrl, onEnd, onError) {
+  if (!audioUrl || typeof Audio === 'undefined') return null;
+  const audio = new Audio(audioUrl);
+  audio.onended = onEnd;
+  audio.onerror = onError;
+  audio.play().catch(onError);
+  return audio;
+}
+
 function applyProjectSnapshotToTts(snapshot, setters) {
   if (!snapshot) return;
   setters.setProjectId(snapshot.id || '');
   setters.setProjectTitle(snapshot.title || snapshot.name || '');
   if (setters.setProjectRevision) setters.setProjectRevision(snapshot.revision || 1);
-  setters.setScript(snapshot.payload?.script || snapshot.settings?.script || '');
+  const rawScript = snapshot.payload?.script || snapshot.settings?.script || '';
+  setters.setScript(rawScript);
+  const snapSegs = snapshot.segments || snapshot.payload?.segments;
+  if (setters.setSegments) {
+    if (Array.isArray(snapSegs) && snapSegs.length > 0) {
+      setters.setSegments(snapSegs.map(createEditableSegment));
+    } else {
+      setters.setSegments(reconcileScriptToSegments([], rawScript));
+    }
+  }
   const opts = snapshot.payload?.ttsOptions || snapshot.settings?.ttsOptions;
   if (opts && typeof opts === 'object') setters.setOptions(prev => ({ ...prev, ...opts }));
   const voiceId = snapshot.payload?.voiceId || snapshot.settings?.voiceId;
@@ -240,6 +409,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const transcriptRef = useRef(null);
   const prevHiddenRef = useRef(hidden);
   const [script, setScript] = useState('');
+  const [segments, setSegments] = useState([]);
+  const [activeSegmentId, setActiveSegmentId] = useState(null);
+  const [viewMode, setViewMode] = useState('script');
   const [options, setOptions] = useState(INITIAL_OPTIONS);
   const [projectId, setProjectId] = useState('');
   const [projectTitle, setProjectTitle] = useState('');
@@ -257,11 +429,107 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const charactersRef = useRef(library.allVoices);
   charactersRef.current = library.allVoices;
 
+  const handleScriptChange = useCallback(nextScript => {
+    setScript(nextScript);
+    setSegments(prev => reconcileScriptToSegments(prev, nextScript, { defaultVoiceId: activeCharacter.id }));
+  }, [activeCharacter.id]);
+
+  const handleUpdateSegment = useCallback((id, updates) => {
+    setSegments(prev => {
+      const next = updateSegmentInList(prev, id, updates);
+      setScript(segmentsToScript(next));
+      return next;
+    });
+  }, []);
+
+  const handleAddSegment = useCallback(afterId => {
+    setSegments(prev => {
+      const idx = prev.findIndex(s => s.id === afterId);
+      const targetIndex = idx >= 0 ? idx + 1 : prev.length;
+      const next = insertSegment(prev, targetIndex, { voiceId: activeCharacter.id });
+      setScript(segmentsToScript(next));
+      const added = next[targetIndex];
+      if (added?.id) setActiveSegmentId(added.id);
+      return next;
+    });
+  }, [activeCharacter.id]);
+
+  const handleDeleteSegment = useCallback(id => {
+    setSegments(prev => {
+      const next = deleteSegment(prev, id);
+      setScript(segmentsToScript(next));
+      return next;
+    });
+    setActiveSegmentId(prev => (prev === id ? null : prev));
+  }, []);
+
+  const handleMoveSegmentUp = useCallback(id => {
+    setActiveSegmentId(id);
+    setSegments(prev => {
+      const next = moveSegmentUp(prev, id);
+      setScript(segmentsToScript(next));
+      return next;
+    });
+  }, []);
+
+  const handleMoveSegmentDown = useCallback(id => {
+    setActiveSegmentId(id);
+    setSegments(prev => {
+      const next = moveSegmentDown(prev, id);
+      setScript(segmentsToScript(next));
+      return next;
+    });
+  }, []);
+
+  const handleMergeSegment = useCallback(id => {
+    setSegments(prev => {
+      const idx = prev.findIndex(s => s.id === id);
+      const successorId = idx >= 0 && idx < prev.length - 1 ? prev[idx + 1].id : null;
+      const next = mergeSegments(prev, id);
+      setScript(segmentsToScript(next));
+      setActiveSegmentId(cur => (cur === successorId ? id : cur));
+      return next;
+    });
+  }, []);
+
+  const handleSplitSegment = useCallback((id, cursor) => {
+    setActiveSegmentId(id);
+    setSegments(prev => {
+      const next = splitSegmentInList(prev, id, cursor);
+      setScript(segmentsToScript(next));
+      return next;
+    });
+  }, []);
+
+  const handleReorderSegments = useCallback((sourceIndex, targetIndex) => {
+    setSegments(prev => {
+      const next = reorderSegments(prev, sourceIndex, targetIndex);
+      setScript(segmentsToScript(next));
+      return next;
+    });
+  }, []);
+
+  const handleReplaceScript = useCallback(text => {
+    setScript(text);
+    setSegments(prev => reconcileScriptToSegments(prev, text, { defaultVoiceId: activeCharacter.id }));
+    scriptRef.current?.focus();
+  }, [activeCharacter.id]);
+
   useEffect(() => {
     if (!externalScript) return;
     setScript(externalScript);
+    setSegments(reconcileScriptToSegments([], externalScript, { defaultVoiceId: activeCharacter.id }));
     onConsumeExternalScript?.();
-  }, [externalScript, onConsumeExternalScript]);
+  }, [externalScript, onConsumeExternalScript, activeCharacter.id]);
+
+  useEffect(() => {
+    setSegments(prev => {
+      if (!prev || prev.length === 0) return prev;
+      const hasUnassigned = prev.some(s => !s.voiceId);
+      if (!hasUnassigned) return prev;
+      return prev.map(s => (s.voiceId ? s : updateSegmentContent(s, { voiceId: activeCharacter.id })));
+    });
+  }, [activeCharacter.id]);
 
   useEffect(() => {
     if (!projectRepository) {
@@ -279,7 +547,14 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         setProjectId(snapshot.id);
         setProjectTitle(snapshot.title);
         setProjectRevision(snapshot.revision || 1);
-        setScript(snapshot.payload?.script || '');
+        const loadedScript = snapshot.payload?.script || '';
+        setScript(loadedScript);
+        const snapSegs = snapshot.segments || snapshot.payload?.segments;
+        if (Array.isArray(snapSegs) && snapSegs.length > 0) {
+          setSegments(snapSegs.map(createEditableSegment));
+        } else {
+          setSegments(reconcileScriptToSegments([], loadedScript));
+        }
         if (snapshot.payload?.ttsOptions && typeof snapshot.payload.ttsOptions === 'object') {
           setOptions(prev => ({ ...prev, ...snapshot.payload.ttsOptions }));
         }
@@ -304,10 +579,11 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       id: projectId || undefined,
       title,
       script,
+      segments,
       voiceId: activeCharacter.id,
       ttsOptions: options,
     });
-  }, [projectId, projectTitle, script, activeCharacter.id, options]);
+  }, [projectId, projectTitle, script, segments, activeCharacter.id, options]);
 
   const autosave = useProjectAutosave({
     projectId,
@@ -315,7 +591,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     buildSnapshot,
     enabled: projectsReady,
     debounceMs: 1500,
-    deps: [script, projectTitle, activeCharacter.id, options],
+    deps: [script, segments, projectTitle, activeCharacter.id, options],
     hidden,
     projectRepository,
     logger,
@@ -349,6 +625,109 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     offlineReadiness: shared?.offlineReadiness,
   });
   const hasScript = Boolean(script.trim());
+  const [playingSegmentId, setPlayingSegmentId] = useState(null);
+  const [playingTakeId, setPlayingTakeId] = useState(null);
+  const audioPreviewRef = useRef(null);
+
+  const handleGenerateSegment = useCallback(async segmentId => {
+    const target = (segments || []).find(seg => seg.id === segmentId);
+    if (!target) return;
+    const voiceId = target.voiceId || activeCharacter.id;
+    const character = findCharacterById(library.allVoices, voiceId) || activeCharacter;
+    const anchor = anchorApi.anchors[character.id] || null;
+    const rev = anchorApi.getRevision(character.id) || 1;
+    const cachedUpload = characterActions.uploadedRefsRef.current[character.id] || null;
+    const onCompleted = async result => {
+      await uploadAndAttachSegmentTake({
+        assetRepository, setSegments, segmentId, result,
+        characterId: character.id, anchorRevision: rev,
+        options, projectId, logger,
+      });
+    };
+    await synthesis.generateSegment({
+      segment: target, character, anchor, cachedUpload,
+      options, onCompleted,
+    });
+  }, [segments, synthesis, activeCharacter, library.allVoices, anchorApi, characterActions, assetRepository, options, projectId, logger]);
+
+  const handleTogglePlaySegment = useCallback(segmentId => {
+    if (playingSegmentId === segmentId) {
+      audioPreviewRef.current?.pause();
+      audioPreviewRef.current = null;
+      setPlayingSegmentId(null);
+      setPlayingTakeId(null);
+      return;
+    }
+    const target = (segments || []).find(seg => seg.id === segmentId);
+    const take = getSegmentActiveTake(target);
+    const url = resolveTakeAudioUrl(take);
+    audioPreviewRef.current?.pause();
+    const onEnd = () => { setPlayingSegmentId(null); setPlayingTakeId(null); };
+    audioPreviewRef.current = playSegmentAudio(url, onEnd, onEnd);
+    if (audioPreviewRef.current) {
+      setPlayingSegmentId(segmentId);
+      setPlayingTakeId(take?.id || null);
+    }
+  }, [playingSegmentId, segments]);
+
+  const handleSelectSegmentTake = useCallback((segmentId, takeId) => {
+    setSegments(prev => selectSegmentTakeInList(prev, segmentId, takeId));
+  }, []);
+
+  const handleDeleteSegmentTake = useCallback((segmentId, takeId) => {
+    if (playingTakeId === takeId) {
+      audioPreviewRef.current?.pause();
+      audioPreviewRef.current = null;
+      setPlayingTakeId(null);
+      setPlayingSegmentId(null);
+    }
+    setSegments(prev => removeSegmentTakeInList(prev, segmentId, takeId));
+  }, [playingTakeId]);
+
+  const handleTogglePlayTake = useCallback((segmentId, takeId) => {
+    if (playingTakeId === takeId) {
+      audioPreviewRef.current?.pause();
+      audioPreviewRef.current = null;
+      setPlayingTakeId(null);
+      setPlayingSegmentId(null);
+      return;
+    }
+    const target = (segments || []).find(seg => seg.id === segmentId);
+    const take = getSegmentTake(target, takeId);
+    const url = resolveTakeAudioUrl(take);
+    audioPreviewRef.current?.pause();
+    const onEnd = () => { setPlayingTakeId(null); setPlayingSegmentId(null); };
+    audioPreviewRef.current = playSegmentAudio(url, onEnd, onEnd);
+    if (audioPreviewRef.current) {
+      setPlayingTakeId(takeId);
+      setPlayingSegmentId(segmentId);
+    }
+  }, [playingTakeId, segments]);
+
+  const hasTakesToRestitch = useMemo(() => (
+    Array.isArray(segments) && segments.some(s => hasSegmentAudio(s))
+  ), [segments]);
+
+  const handleRestitchSegments = useCallback(async () => {
+    const assetFetcher = assetRepository ? id => assetRepository.getAssetBinary(id) : null;
+    await synthesis.restitchSegments({
+      segments, character: activeCharacter, options, assetFetcher, projectTitle,
+    });
+  }, [segments, activeCharacter, options, assetRepository, synthesis, projectTitle]);
+
+  const handleExportNarration = useCallback(async () => {
+    const assetFetcher = assetRepository ? id => assetRepository.getAssetBinary(id) : null;
+    await synthesis.exportNarration({
+      segments, character: activeCharacter, options, assetFetcher, projectTitle,
+    });
+  }, [segments, activeCharacter, options, assetRepository, synthesis, projectTitle]);
+
+  useEffect(() => () => {
+    audioPreviewRef.current?.pause();
+    audioPreviewRef.current = null;
+    setPlayingSegmentId(null);
+    setPlayingTakeId(null);
+  }, []);
   useEffect(() => {
     onTtsStateChange?.({ busy: synthesis.busy, hasScript, libraryOpen: libraryModal.open });
   }, [synthesis.busy, hasScript, libraryModal.open, onTtsStateChange]);
@@ -360,6 +739,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       setProjectTitle,
       setProjectRevision,
       setScript,
+      setSegments,
       setOptions,
       allVoices: allVoicesRef.current,
       characterActions: characterActionsRef.current,
@@ -371,8 +751,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     id: projectId,
     title: projectTitle,
     revision: projectRevision,
-    payload: { script, ttsOptions: options, voiceId: activeCharacter.id },
-  }), [projectId, projectTitle, projectRevision, script, options, activeCharacter.id]);
+    segments,
+    payload: { script, segments, ttsOptions: options, voiceId: activeCharacter.id },
+  }), [projectId, projectTitle, projectRevision, script, segments, options, activeCharacter.id]);
 
   const recovery = useProjectRecovery({
     projectId,
@@ -398,6 +779,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
           setProjectTitle,
           setProjectRevision,
           setScript,
+          setSegments,
           setOptions,
           allVoices: allVoicesRef.current,
           characterActions: characterActionsRef.current,
@@ -411,8 +793,24 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const count = countGraphemes(script);
   const isOverLimit = count > MAX_SCRIPT_LENGTH;
   const generateDisabled = synthesis.busy || Boolean(synthesis.regeneratingChunk) || !anchorApi.isLoaded || !hasScript || isOverLimit;
-  const state = { scriptRef, transcriptRef, script, setScript, options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi, charactersRef, libraryModal, setLibraryModal };
-  const ctrl = { logger, glossaryRepository, synthesis, activeCharacter, activeAnchor, actions: characterActions, count, isOverLimit, generateDisabled, autosave, recovery };
+  const state = {
+    scriptRef, transcriptRef, script, setScript,
+    segments, setSegments, activeSegmentId, setActiveSegmentId,
+    viewMode, setViewMode, handleScriptChange, handleUpdateSegment,
+    handleAddSegment, handleDeleteSegment, handleReplaceScript,
+    handleMoveSegmentUp, handleMoveSegmentDown, handleMergeSegment,
+    handleSplitSegment, handleReorderSegments,
+    handleGenerateSegment, handleTogglePlaySegment, playingSegmentId,
+    handleSelectSegmentTake, handleDeleteSegmentTake, handleTogglePlayTake, playingTakeId,
+    handleRestitchSegments, handleExportNarration, hasTakesToRestitch,
+    options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi,
+    charactersRef, libraryModal, setLibraryModal,
+  };
+  const ctrl = {
+    logger, glossaryRepository, assetRepository, projectId,
+    synthesis, activeCharacter, activeAnchor, actions: characterActions,
+    count, isOverLimit, generateDisabled, autosave, recovery,
+  };
   return { state, ctrl };
 }
 

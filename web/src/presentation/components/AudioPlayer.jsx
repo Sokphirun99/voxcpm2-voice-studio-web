@@ -280,15 +280,48 @@ function TakeHistoryPills({ takes, activeTakeId, onSelectTake, onDeleteTake }) {
   );
 }
 
+function resolveNarrationDownloadName(recording) {
+  if (recording?.filename) return recording.filename;
+  if (recording?.isAssembled || recording?.isRestitched) return 'voxcpm2-assembled-narration.wav';
+  if (recording?.isMultiSpeaker) return 'voxcpm2-multi-speaker.wav';
+  if (recording?.seed != null) return `voxcpm2-${recording.seed}.wav`;
+  return 'voxcpm2.wav';
+}
+
+function PlaybackActionButtons({ media, recording, activeCharacter, activeAnchor, verification, onPinTake }) {
+  const downloadName = resolveNarrationDownloadName(recording);
+  const downloadLabel = recording?.isAssembled ? 'Export Narration' : 'Download WAV';
+  const downloadTitle = recording?.isAssembled ? 'Export complete assembled narration WAV' : 'Download WAV';
+  const pin = resolvePinControlState({ recording, activeCharacter, activeAnchor });
+  const canVerify = Boolean(verification?.canVerify && verification?.onVerify);
+  return (
+    <div className="player-actions">
+      {verification?.onVerify && (
+        <button type="button" className="button subtle-button verify-button" id="verify-speech-btn"
+          disabled={!canVerify || verification.checking} aria-busy={verification.checking || undefined}
+          title="Double-check spoken Khmer words using Whisper" onClick={verification.onVerify}>
+          <Icon name="check_circle" /><span>{verification.checking ? 'Checking…' : 'Check words'}</span>
+        </button>
+      )}
+      <button type="button" className={pin.isLocked ? 'button lock-button is-locked' : 'button lock-button'}
+        id="lock-voice" disabled={pin.disabled} aria-pressed={pin.isLocked} onClick={onPinTake} title={pin.title}>
+        <Icon name="lock" /><span>{pin.label}</span>
+      </button>
+      <a className="button download-button" id="download" href={media.url || undefined}
+        download={downloadName} aria-disabled={media.url ? undefined : true} title={downloadTitle}>
+        <Icon name="arrow_down_to_line" /><span>{downloadLabel}</span>
+      </a>
+    </div>
+  );
+}
+
 /**
  * Renders play/pause, waveform scrubber, optional Whisper word-check button, character voice-pin button, and WAV download link.
  * @param {object} props - Controls props.
  * @returns {React.ReactElement} Player controls row.
  */
-function PlaybackControls({ media, recording, activeCharacter, activeAnchor, verification, onTogglePlay, onSeek, onPinTake }) {
-  const downloadName = recording?.seed != null ? `voxcpm2-${recording.seed}.wav` : 'voxcpm2.wav';
-  const pin = resolvePinControlState({ recording, activeCharacter, activeAnchor });
-  const canVerify = Boolean(verification?.canVerify && verification?.onVerify);
+function PlaybackControls(props) {
+  const { media, onTogglePlay, onSeek } = props;
   return (
     <div className="player">
       <button type="button" className="button play-button" id="play"
@@ -296,23 +329,7 @@ function PlaybackControls({ media, recording, activeCharacter, activeAnchor, ver
         <Icon name={media.playing ? 'pause_fill' : 'play_fill'} />
       </button>
       <AudioTrackBar media={media} onSeek={onSeek} />
-      <div className="player-actions">
-        {verification?.onVerify && (
-          <button type="button" className="button subtle-button verify-button" id="verify-speech-btn"
-            disabled={!canVerify || verification.checking} aria-busy={verification.checking || undefined}
-            title="Double-check spoken Khmer words using Whisper" onClick={verification.onVerify}>
-            <Icon name="check_circle" /><span>{verification.checking ? 'Checking…' : 'Check words'}</span>
-          </button>
-        )}
-        <button type="button" className={pin.isLocked ? 'button lock-button is-locked' : 'button lock-button'}
-          id="lock-voice" disabled={pin.disabled} aria-pressed={pin.isLocked} onClick={onPinTake} title={pin.title}>
-          <Icon name="lock" /><span>{pin.label}</span>
-        </button>
-        <a className="button download-button" id="download" href={media.url || undefined}
-          download={downloadName} aria-disabled={media.url ? undefined : true}>
-          <Icon name="arrow_down_to_line" /><span>Download WAV</span>
-        </a>
-      </div>
+      <PlaybackActionButtons {...props} />
     </div>
   );
 }

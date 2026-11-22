@@ -236,38 +236,36 @@ function validateSegmentInterval(start, end) {
   return { numStart, numEnd };
 }
 
+function buildTakeEntity(id, assetId, duration, isSelected, spec) {
+  return Object.freeze({
+    id,
+    takeId: id,
+    audioAssetId: assetId,
+    duration,
+    isSelected: Boolean(isSelected),
+    settings: Object.freeze({ ...(spec.settings || {}) }),
+    createdAt: typeof spec.createdAt === 'string' && spec.createdAt ? spec.createdAt : new Date().toISOString(),
+    blob: spec.blob || null,
+    audioUrl: typeof spec.audioUrl === 'string' ? spec.audioUrl : null,
+  });
+}
+
 /**
  * Creates and validates an individual audio take entity.
- * Inputs: `{ id, takeId, audioAssetId, duration, isSelected, settings, createdAt }`.
+ * Inputs: `{ id, takeId, audioAssetId, duration, isSelected, settings, createdAt, blob, audioUrl }`.
  * Outputs: Frozen SegmentTake object.
  * Side effects: none.
  * Failure modes: Throws ValidationError on missing id or invalid duration.
  * @param {object} spec - Take attributes.
  * @returns {Readonly<object>} Frozen take object.
  */
-export function createSegmentTake({
-  id,
-  takeId,
-  audioAssetId = null,
-  duration = null,
-  isSelected = false,
-  settings = {},
-  createdAt,
-} = {}) {
-  const candidate = id || takeId;
+export function createSegmentTake(spec = {}) {
+  const candidate = spec.id || spec.takeId;
   const normalizedId = typeof candidate === 'string' ? candidate.trim() : '';
   if (!normalizedId) throw new ValidationError('Take id is required.', 'id', 'INVALID_TAKE_ID');
-  const normalizedAssetId = audioAssetId ? assertProjectId(audioAssetId) : null;
-  const numDuration = assertStrictNonNegativeNumber(duration, 'duration', 'INVALID_TAKE_DURATION');
-  return Object.freeze({
-    id: normalizedId,
-    takeId: normalizedId,
-    audioAssetId: normalizedAssetId,
-    duration: numDuration,
-    isSelected: Boolean(isSelected),
-    settings: Object.freeze({ ...(settings || {}) }),
-    createdAt: typeof createdAt === 'string' && createdAt ? createdAt : new Date().toISOString(),
-  });
+  const normalizedAssetId = spec.audioAssetId ? assertProjectId(spec.audioAssetId) : null;
+  const numDuration = assertStrictNonNegativeNumber(spec.duration, 'duration', 'INVALID_TAKE_DURATION');
+  return buildTakeEntity(normalizedId, normalizedAssetId, numDuration, spec.isSelected, spec);
 }
 
 function normalizeSegmentProps(spec, interval, pauseDuration, takes) {
@@ -282,6 +280,7 @@ function normalizeSegmentProps(spec, interval, pauseDuration, takes) {
     speakerId: typeof speaker === 'string' ? speaker : null,
     speakerName: typeof spec.speakerName === 'string' ? spec.speakerName : null,
     voiceId: typeof spec.voiceId === 'string' ? spec.voiceId : null,
+    status: typeof spec.status === 'string' && spec.status ? spec.status : 'draft',
     takes,
     pauseDuration,
   });
@@ -597,17 +596,21 @@ export function createSubtitleProjectSnapshot(spec = {}) {
 }
 
 function buildTtsSnapshotPayload(spec) {
+  const segments = Array.isArray(spec.segments)
+    ? spec.segments.map(createProjectSegment)
+    : (Array.isArray(spec.payload?.segments) ? spec.payload.segments.map(createProjectSegment) : []);
   return {
     script: typeof spec.script === 'string' ? spec.script : '',
     voiceId: typeof spec.voiceId === 'string' ? spec.voiceId : '',
     ttsOptions: typeof spec.ttsOptions === 'object' && !Array.isArray(spec.ttsOptions) ? spec.ttsOptions : {},
+    segments,
   };
 }
 
 /**
- * Builds a TTS project snapshot storing script text, voice id, and synthesis options.
- * Inputs: `{ id, title, script, voiceId, ttsOptions, createdAt, updatedAt }`.
- * Outputs: Legacy TTS project snapshot.
+ * Builds a TTS project snapshot storing script text, voice id, segments, and synthesis options.
+ * Inputs: `{ id, title, script, voiceId, segments, ttsOptions, createdAt, updatedAt }`.
+ * Outputs: Complete TTS project snapshot.
  * Side effects: none.
  * Failure modes: Throws ValidationError on invalid title.
  * @param {object} spec - Snapshot fields.
@@ -615,11 +618,14 @@ function buildTtsSnapshotPayload(spec) {
  */
 export function createTtsProjectSnapshot(spec = {}) {
   const now = new Date().toISOString();
+  const payload = buildTtsSnapshotPayload(spec);
   return {
     id: spec.id || '',
     kind: 'tts',
+    type: 'tts',
     title: assertProjectTitle(spec.title),
-    payload: buildTtsSnapshotPayload(spec),
+    segments: payload.segments,
+    payload,
     createdAt: spec.createdAt || now,
     updatedAt: spec.updatedAt || now,
     deletedAt: null,

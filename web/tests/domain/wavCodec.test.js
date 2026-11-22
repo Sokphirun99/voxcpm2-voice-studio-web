@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SynthesisError } from '../../src/domain/errors.js';
 import {
+  applyBoundaryMicroFades,
   concatenateWavBlobs,
   concatenateWavBlobsWithPauses,
   ensureAudioWavBlob,
@@ -185,4 +186,52 @@ test('replaceChunkAndRestitch preserves per-chunk pauseAfterMs when replacing on
   assert.equal(updated[1].pauseAfterMs, 800);
   assert.equal(updated[2].pauseAfterMs, null);
   assert.equal(readWavDurationSeconds(await blob.arrayBuffer()), (200 + 500 + 400 + 800 + 100) / 1000);
+});
+
+test('applyBoundaryMicroFades applies smooth linear scaling at edge boundaries to prevent clicks', () => {
+  const sampleRate = 48000;
+  const numChannels = 1;
+  const blockAlign = 2;
+  const totalFrames = 4800; // 100ms
+  const buffer = new ArrayBuffer(totalFrames * blockAlign);
+  const view = new DataView(buffer);
+  const HIGH_AMPLITUDE = 16000;
+
+  for (let f = 0; f < totalFrames; f++) {
+    view.setInt16(f * blockAlign, HIGH_AMPLITUDE, true);
+  }
+
+  const pcmBytes = new Uint8Array(buffer);
+  applyBoundaryMicroFades(pcmBytes, { sampleRate, numChannels, blockAlign }, 5);
+
+  const fadedView = new DataView(pcmBytes.buffer);
+  const firstSample = fadedView.getInt16(0, true);
+  const lastSample = fadedView.getInt16((totalFrames - 1) * blockAlign, true);
+  const midSample = fadedView.getInt16(Math.floor(totalFrames / 2) * blockAlign, true);
+
+  // First and last samples should be attenuated near 0, while middle samples remain intact
+  assert.equal(firstSample, 0, 'First sample should be exactly 0 after micro-fade');
+  assert.equal(lastSample, 0, 'Last sample should be exactly 0 after micro-fade');
+  assert.equal(midSample, HIGH_AMPLITUDE);
+
+  // Safely skips non-16-bit PCM without throwing or corrupting
+  const non16BitPcm = new Uint8Array(buffer);
+  assert.doesNotThrow(() => {
+    applyBoundaryMicroFades(non16BitPcm, { sampleRate, numChannels, blockAlign, bitsPerSample: 24 });
+  });
+});
+
+test('concatenateWavBlobsWithPauses surfaces exact format mismatch diagnostics', async () => {
+  const sampleRate = 48000;
+  const clip48k = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 0.1).fill(800) });
+  const clip16k = makeTestWavBlob({ sampleRate: 16000, samples: new Array(1600).fill(800) });
+
+  await assert.rejects(
+    () => concatenateWavBlobsWithPauses([{ blob: clip48k }, { blob: clip16k }]),
+    err => {
+      assert.equal(err.code, 'WAV_FORMAT_MISMATCH');
+      assert.ok(err.message.includes('Segment #2 has mismatched sample rate: expected 48000 Hz, received 16000 Hz.'));
+      return true;
+    }
+  );
 });

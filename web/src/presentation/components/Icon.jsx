@@ -40,6 +40,10 @@ const ICON_PATHS = {
   plus: (
     <path d="M12 5V19M5 12H19" {...STROKE_STYLE} />
   ),
+  // Iconoir: add alias
+  add: (
+    <path d="M12 5V19M5 12H19" {...STROKE_STYLE} />
+  ),
   // Iconoir: list
   list_bullet: (
     <g {...STROKE_STYLE}>
@@ -76,6 +80,8 @@ const ICON_PATHS = {
   ),
   // Iconoir: nav-arrow-down
   chevron_down: <path d="M6 9L12 15L18 9" {...STROKE_STYLE} />,
+  // Iconoir: nav-arrow-up
+  chevron_up: <path d="M6 15L12 9L18 15" {...STROKE_STYLE} />,
   // Iconoir: play (solid)
   play_fill: (
     <path
@@ -110,6 +116,13 @@ const ICON_PATHS = {
   ),
   // Iconoir: xmark
   xmark: (
+    <path
+      d="M6.75827 17.2426L12.0009 12M17.2435 6.75736L12.0009 12M12.0009 12L6.75827 6.75736M12.0009 12L17.2435 17.2426"
+      {...STROKE_STYLE}
+    />
+  ),
+  // Iconoir: close alias
+  close: (
     <path
       d="M6.75827 17.2426L12.0009 12M17.2435 6.75736L12.0009 12M12.0009 12L6.75827 6.75736M12.0009 12L17.2435 17.2426"
       {...STROKE_STYLE}

@@ -2,11 +2,13 @@
  * @fileoverview Pure domain application use cases coordinating ports via dependency injection.
  */
 
+import { assembleAudioNarration } from './audioAssembly.js';
 import { validateAudioFile } from './audioValidation.js';
-import { ValidationError } from './errors.js';
+import { SynthesisError, ValidationError } from './errors.js';
 import { assertFeatureOfflineReady } from './offlineReadiness.js';
 import { assertPort } from './ports.js';
 import { validateGenerationInput } from './presets.js';
+import { getSegmentActiveTake } from './projectSegments.js';
 import { hasPauseMarkers, segmentScriptWithPauses, stripPauseMarkers } from './scriptSegmentation.js';
 import { createSavedVoiceEntry } from './voiceLibrary.js';
 import { concatenateWavBlobsWithPauses, replaceChunkAndRestitch, tryReadWavDurationSeconds, trySmoothWavBlob } from './wavCodec.js';
@@ -371,16 +373,175 @@ async function regenerateSpeechChunk({ speechGateway, audioMaster = null, seedGe
 }
 
 /**
+ * Synthesizes speech for an individual script segment, validating input and reusing cache semantics.
+ * @param {object} deps - Injected ports.
+ * @param {object} params - `{ segment, character, options, ...rest }`.
+ * @returns {Promise<object>} Synthesis output `{ recording, uploadedFileData }`.
+ */
+async function executeSegmentSpeechSynthesis(deps, params) {
+  const { segment, character, options = {}, ...rest } = params || {};
+  const text = typeof segment === 'string' ? segment.trim() : (segment?.text || '').trim();
+  if (!text) {
+    throw new ValidationError('Enter segment text before generating speech.', 'script', 'EMPTY_SEGMENT');
+  }
+  const resolvedOptions = { guidance: 2.0, steps: 10, ...options };
+  return executeSpeechSynthesis(deps, {
+    ...rest,
+    ...resolvedOptions,
+    script: text,
+    character,
+  });
+}
+
+/**
+ * Concatenates active segment takes into a seamless full-script audio track with calibrated pauses.
+ * Inputs: `{ audioMaster }`, `{ segments, character, options, assetFetcher, signal, projectTitle }`.
+ * Outputs: `{ recording, blob, filename }` entity with combined audio and chunk metadata.
+ * Side effects: reads take Blobs or fetches asset binaries, optional audio mastering.
+ * Failure modes: throws ValidationError if segments are missing takes, SynthesisError on stitch failure.
+ * @param {object} deps - Injected dependencies ({ audioMaster }).
+ * @param {object} params - Restitching parameters.
+ * @returns {Promise<{ recording: object, blob: Blob, filename: string }>} Stitched recording.
+ */
+export async function executeRestitchSegments({ audioMaster = null }, params) {
+  return assembleAudioNarration({ ...params, audioMaster });
+}
+
+export const executeAssembleNarration = executeRestitchSegments;
+
+function validateMultiSpeakerSegments(segments) {
+  const active = (segments || []).filter(s => (s.text || '').trim().length > 0);
+  if (active.length === 0) {
+    throw new ValidationError('Enter text before generating speech.', 'script', 'EMPTY_SCRIPT');
+  }
+  return active;
+}
+
+function resolveSegmentSpeakerContext({ segment, characters, defaultCharacter, anchors, cachedUploads }) {
+  const voiceId = segment.voiceId || defaultCharacter?.id;
+  const character = characters.find(c => c.id === voiceId) || defaultCharacter;
+  if (!character?.id) {
+    throw new ValidationError('Select a speaking character before generating speech.', 'character', 'MISSING_CHARACTER');
+  }
+  const anchor = anchors?.[character.id] || null;
+  const cachedUpload = cachedUploads?.[character.id] || null;
+  return { character, anchor, cachedUpload };
+}
+
+function buildMultiSpeakerChunk({ segment, index, result, duration, pauseAfterMs, character }) {
+  return {
+    index,
+    segmentId: segment.id,
+    text: segment.text,
+    blob: result.recording.blob,
+    duration,
+    durationSeconds: duration,
+    pauseAfterMs,
+    seed: result.recording.seed ?? null,
+    voiceId: character.id,
+    speakerId: segment.speakerId || character.id,
+    speakerName: segment.speakerName || character.name,
+    anchorBlob: result.recording.anchorBlob,
+    anchorTranscript: result.recording.anchorTranscript,
+    uploadedFileData: result.uploadedFileData || null,
+  };
+}
+
+async function synthesizeMultiSpeakerStep(deps, ctx) {
+  const { segment, character, anchor, cachedUpload, options, signal, onReferenceUploaded, models, isOnline } = ctx;
+  return executeSegmentSpeechSynthesis(deps, {
+    segment,
+    character,
+    anchor,
+    cachedUpload,
+    options,
+    signal,
+    onReferenceUploaded: fileData => onReferenceUploaded?.(character.id, fileData),
+    models,
+    isOnline,
+  });
+}
+
+function buildMultiSpeakerRecording({ combinedBlob, duration, chunks, mastered }) {
+  const distinctVoices = Array.from(new Set(chunks.map(c => c.voiceId).filter(Boolean)));
+  const isMulti = distinctVoices.length > 1;
+  return {
+    id: `take-${Date.now()}-${isMulti ? 'multi' : (distinctVoices[0] || 'mix')}`,
+    characterId: isMulti ? 'multi-speaker' : (distinctVoices[0] || null),
+    characterName: isMulti ? 'Multiple speakers' : (chunks[0]?.speakerName || 'Voice'),
+    transcript: chunks.map(c => c.text).join('\n'),
+    blob: combinedBlob,
+    audioUrl: typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' ? URL.createObjectURL(combinedBlob) : null,
+    duration,
+    audioDurationSeconds: duration,
+    chunks,
+    fromCache: chunks.every(c => c.fromCache),
+    mastered,
+    isMultiSpeaker: isMulti,
+  };
+}
+
+async function synthesizeMultiSpeakerSegments(deps, params) {
+  const { segments, characters, defaultCharacter, anchors, cachedUploads, options, signal, onProgress, onReferenceUploaded, models, isOnline, defaultPauseMs } = params;
+  const chunks = [];
+  const segmentResults = [];
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i];
+    const speaker = resolveSegmentSpeakerContext({ segment: seg, characters, defaultCharacter, anchors, cachedUploads });
+    onProgress?.({ stage: 'synthesizing_segment', completed: i, total: segments.length, characterName: speaker.character.name });
+    const result = await synthesizeMultiSpeakerStep(deps, { segment: seg, ...speaker, options, signal, onReferenceUploaded, models, isOnline });
+    const duration = result.recording.audioDurationSeconds || await readRecordingDurationSeconds(result.recording.blob);
+    const pauseAfterMs = typeof seg.pauseDuration === 'number' && seg.pauseDuration >= 0 ? Math.round(seg.pauseDuration * 1000) : defaultPauseMs;
+    const chunk = buildMultiSpeakerChunk({ segment: seg, index: i, result, duration, pauseAfterMs, character: speaker.character });
+    chunks.push(chunk);
+    segmentResults.push({ segmentId: seg.id, segment: seg, recording: result.recording, chunk });
+  }
+  return { chunks, segmentResults };
+}
+
+async function masterMultiSpeakerTrack(blob, audioMaster, options, signal) {
+  if (options.masterAudio === false || !audioMaster) {
+    return { blob, mastered: false };
+  }
+  const res = await audioMaster.masterWav(blob, { signal });
+  return { blob: res.blob, mastered: res.mastered };
+}
+
+/**
+ * Synthesizes a multi-speaker script by generating each segment with its assigned voice and anchor.
+ * Inputs: injected deps, params ({ segments, characters, defaultCharacter, anchors, cachedUploads, options, signal, onProgress, onReferenceUploaded }).
+ * Outputs: Promise<{ recording: object, segmentResults: object[], uploadedFileData: null }>.
+ * Side effects: executes inference calls via speechGateway, masters stitched audio track.
+ * Failure modes: throws ValidationError on empty segments or missing characters.
+ * @param {object} deps - Injected ports.
+ * @param {object} params - Multi-speaker generation parameters.
+ * @returns {Promise<object>} Combined recording and per-segment results.
+ */
+export async function executeMultiSpeakerSynthesis(deps, params) {
+  const { segments, characters = [], defaultCharacter, anchors = {}, cachedUploads = {}, options = {}, signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
+  const activeSegments = validateMultiSpeakerSegments(segments);
+  const defaultPauseMs = typeof options.defaultPauseSeconds === 'number' ? Math.round(options.defaultPauseSeconds * 1000) : SINGLE_VOICE_PAUSE_MS;
+  const { chunks, segmentResults } = await synthesizeMultiSpeakerSegments(deps, {
+    segments: activeSegments, characters, defaultCharacter, anchors, cachedUploads, options, signal, onProgress, onReferenceUploaded, models, isOnline, defaultPauseMs,
+  });
+  const stitchedBlob = await concatenateWavBlobsWithPauses(chunks, defaultPauseMs);
+  const { blob: combinedBlob, mastered } = await masterMultiSpeakerTrack(stitchedBlob, deps.audioMaster, options, signal);
+  const totalDuration = await readRecordingDurationSeconds(combinedBlob);
+  const recording = buildMultiSpeakerRecording({ combinedBlob, duration: totalDuration, chunks, mastered });
+  return { recording, segmentResults, uploadedFileData: null };
+}
+
+/**
  * Creates the single-character speech synthesis use case.
  * Inputs: `{ speechGateway, audioMaster, synthesisCache, seedGenerator }`.
- * Outputs: `{ execute(command), regenerateChunk(command) }` use-case object.
+ * Outputs: `{ execute(command), regenerateChunk(command), synthesizeSegment(command), restitchSegments(command) }` use-case object.
  * Side effects: delegates synthesis, mastering, and caching exclusively to injected ports.
  * Failure modes: throws ValidationError, SynthesisCancelledError, or SynthesisError.
  * When `glossaryRepository` is injected, its enabled pronunciation rules rewrite the spoken text of `execute`
  * (an explicit `pronunciationRules` param overrides it). `regenerateChunk` never re-applies rules because
  * segment text is already the spoken text and a second pass could rewrite a replacement.
  * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, glossaryRepository?: import('./ports.js').GlossaryRepositoryPort|null, seedGenerator?: () => number }} deps - Injected ports.
- * @returns {{ execute: (params: object) => Promise<object>, regenerateChunk: (params: object) => Promise<object> }} Synthesis use case.
+ * @returns {{ execute: (params: object) => Promise<object>, regenerateChunk: (params: object) => Promise<object>, synthesizeSegment: (params: object) => Promise<object>, synthesizeMultiSpeaker: (params: object) => Promise<object>, restitchSegments: (params: object) => Promise<object> }} Synthesis use case.
  */
 export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, seedGenerator }) {
   assertPort(speechGateway, 'speechGateway', ['uploadReferenceAudio', 'synthesize']);
@@ -388,6 +549,11 @@ export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = nul
   return {
     execute: params => executeSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
     regenerateChunk: params => regenerateSpeechChunk({ speechGateway, audioMaster, seedGenerator }, params),
+    synthesizeSegment: params => executeSegmentSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
+    synthesizeMultiSpeaker: params => executeMultiSpeakerSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
+    restitchSegments: params => executeRestitchSegments({ audioMaster }, params),
+    assembleAudioNarration: params => executeRestitchSegments({ audioMaster }, params),
+    assembleNarration: params => executeRestitchSegments({ audioMaster }, params),
   };
 }
 

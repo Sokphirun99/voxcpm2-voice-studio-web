@@ -4131,3 +4131,368 @@ a {
     grid-template-columns: 1fr;
   }
 }
+
+/* ==========================================================================
+   Structured Segment Editor (Release 2: R2-01)
+   ========================================================================== */
+
+.segment-editor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 440px;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+
+.segment-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--control);
+  border: 1px solid var(--line);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.segment-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+.segment-card.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.segment-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.segment-header-left,
+.segment-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.segment-index-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.segment-status-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--muted);
+}
+
+.segment-status-badge.status-ready {
+  color: var(--online);
+  border-color: color-mix(in srgb, var(--online) 40%, var(--line));
+  background: color-mix(in srgb, var(--online) 10%, var(--control));
+}
+
+.segment-status-badge.status-draft {
+  color: var(--quiet);
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--quiet) 8%, var(--control));
+}
+
+.segment-status-badge.status-outdated {
+  color: var(--offline);
+  border-color: color-mix(in srgb, var(--offline) 40%, var(--line));
+  background: color-mix(in srgb, var(--offline) 10%, var(--control));
+}
+
+.segment-status-badge.status-error {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 40%, var(--line));
+  background: color-mix(in srgb, var(--error) 10%, var(--control));
+}
+
+.segment-voice-picker {
+  display: inline-flex;
+  align-items: center;
+}
+
+.segment-voice-select {
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--text);
+  max-width: 140px;
+  cursor: pointer;
+  outline: none;
+}
+
+.segment-voice-select:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+.segment-voice-select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.segment-voice-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--accent) 8%, var(--control));
+  color: var(--text);
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-char-count {
+  font-size: 11px;
+  color: var(--quiet);
+}
+
+.segment-action-btn {
+  padding: 2px 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.segment-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.segment-duration-badge {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
+
+.segment-action-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.segment-generate-btn:hover,
+.segment-play-btn:hover,
+.segment-play-btn.is-playing,
+.segment-generate-btn.is-busy {
+  color: var(--accent);
+}
+
+.segment-generate-btn .spinning {
+  animation: studio-spin 1s linear infinite;
+}
+
+.segment-delete-btn:hover {
+  color: var(--error);
+}
+
+.segment-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.segment-textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--editor);
+  color: var(--text);
+  font: 13px/1.45 var(--studio-font-family);
+  resize: vertical;
+  min-height: 48px;
+}
+
+.segment-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.segment-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.segment-pause-control {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.segment-pause-input {
+  width: 52px;
+  padding: 2px 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--control);
+  color: var(--text);
+  font-size: 11px;
+  text-align: right;
+}
+
+.segment-pause-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.segment-editor-empty {
+  padding: 20px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+}
+
+.editor-mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.editor-mode-toggle button {
+  border-radius: 0;
+  border: none;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.editor-mode-toggle button.is-active {
+  background: var(--accent);
+  color: var(--action-text);
+}
+
+.segment-takes-tray {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin-top: 6px;
+  overflow-x: auto;
+}
+
+.segment-takes-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.segment-takes-list {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.segment-take-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--control);
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.segment-take-chip:hover {
+  border-color: var(--muted);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.segment-take-chip.is-selected {
+  border-color: var(--accent);
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.segment-take-label {
+  font-weight: 560;
+}
+
+.segment-take-duration {
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.segment-take-active-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--action-text, #fff);
+}
+
+.segment-take-play-btn,
+.segment-take-delete-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.segment-take-play-btn:hover,
+.segment-take-delete-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.segment-take-play-btn.is-playing {
+  color: var(--accent);
+  animation: pulse 1s infinite;
+}
+
+.segment-take-delete-btn:hover {
+  color: var(--error);
+}
+
+
