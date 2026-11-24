@@ -13,6 +13,7 @@ import {
   hasSegmentAudio,
   selectSegmentTakeInList,
   removeSegmentTakeInList,
+  cycleSegmentTakeInList,
   insertSegment,
   mergeSegments,
   moveSegmentDown,
@@ -240,6 +241,7 @@ async function uploadAndAttachSegmentTake(spec) {
 function submitCharacterSpeech(event, ctx) {
   event.preventDefault();
   if (!ctx.anchorApi.isLoaded) return;
+  ctx.handleStopPreview?.();
   const submittedCharacter = ctx.activeCharacter;
   const submittedAnchor = ctx.anchorApi.anchors[submittedCharacter.id] || null;
   const submittedRevision = ctx.anchorApi.getRevision(submittedCharacter.id);
@@ -337,6 +339,7 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         onDeleteSegmentTake={state.handleDeleteSegmentTake}
         onTogglePlayTake={state.handleTogglePlayTake}
         playingTakeId={state.playingTakeId}
+        onCycleSegmentTake={state.handleCycleSegmentTake}
         onRestitchSegments={state.handleRestitchSegments}
         onExportNarration={state.handleExportNarration}
         hasTakesToRestitch={state.hasTakesToRestitch}
@@ -363,13 +366,48 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
   );
 }
 
+function stopCurrentPreview(previewRef) {
+  if (!previewRef?.current) return;
+  previewRef.current.onended = null;
+  previewRef.current.onerror = null;
+  previewRef.current.pause();
+  previewRef.current = null;
+}
+
+function pauseMainAudioElement() {
+  if (typeof document === 'undefined') return;
+  const mainAudio = document.querySelector('audio#audio');
+  if (mainAudio && !mainAudio.paused) mainAudio.pause();
+}
+
+function createPlaybackNotifier(shared, logger, actionName, onClear) {
+  return error => {
+    onClear();
+    logger?.error?.(actionName, error);
+    shared?.onNotify?.({ type: 'warning', message: 'Could not play audio in the browser.' });
+  };
+}
+
+function warnMissingAudio(shared, onClear, message) {
+  onClear();
+  shared?.onNotify?.({ type: 'warning', message });
+}
+
 function playSegmentAudio(audioUrl, onEnd, onError) {
   if (!audioUrl || typeof Audio === 'undefined') return null;
-  const audio = new Audio(audioUrl);
-  audio.onended = onEnd;
-  audio.onerror = onError;
-  audio.play().catch(onError);
-  return audio;
+  try {
+    const audio = new Audio(audioUrl);
+    audio.onended = onEnd;
+    audio.onerror = onError;
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(onError);
+    }
+    return audio;
+  } catch (error) {
+    onError?.(error);
+    return null;
+  }
 }
 
 function applyProjectSnapshotToTts(snapshot, setters) {
@@ -630,6 +668,10 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const audioPreviewRef = useRef(null);
 
   const handleGenerateSegment = useCallback(async segmentId => {
+    stopCurrentPreview(audioPreviewRef);
+    setPlayingSegmentId(null);
+    setPlayingTakeId(null);
+    pauseMainAudioElement();
     const target = (segments || []).find(seg => seg.id === segmentId);
     if (!target) return;
     const voiceId = target.voiceId || activeCharacter.id;
@@ -651,33 +693,38 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   }, [segments, synthesis, activeCharacter, library.allVoices, anchorApi, characterActions, assetRepository, options, projectId, logger]);
 
   const handleTogglePlaySegment = useCallback(segmentId => {
+    const clearState = () => { setPlayingSegmentId(null); setPlayingTakeId(null); };
     if (playingSegmentId === segmentId) {
-      audioPreviewRef.current?.pause();
-      audioPreviewRef.current = null;
-      setPlayingSegmentId(null);
-      setPlayingTakeId(null);
+      stopCurrentPreview(audioPreviewRef);
+      clearState();
       return;
     }
     const target = (segments || []).find(seg => seg.id === segmentId);
     const take = getSegmentActiveTake(target);
     const url = resolveTakeAudioUrl(take);
-    audioPreviewRef.current?.pause();
-    const onEnd = () => { setPlayingSegmentId(null); setPlayingTakeId(null); };
-    audioPreviewRef.current = playSegmentAudio(url, onEnd, onEnd);
+    stopCurrentPreview(audioPreviewRef);
+    if (!url) return warnMissingAudio(shared, clearState, 'No playable audio found for this segment.');
+    pauseMainAudioElement();
+    const onError = createPlaybackNotifier(shared, logger, 'playSegmentAudio', clearState);
+    audioPreviewRef.current = playSegmentAudio(url, clearState, onError);
     if (audioPreviewRef.current) {
       setPlayingSegmentId(segmentId);
       setPlayingTakeId(take?.id || null);
     }
-  }, [playingSegmentId, segments]);
+  }, [playingSegmentId, segments, shared, logger]);
 
   const handleSelectSegmentTake = useCallback((segmentId, takeId) => {
+    if (playingSegmentId === segmentId && playingTakeId !== takeId) {
+      stopCurrentPreview(audioPreviewRef);
+      setPlayingSegmentId(null);
+      setPlayingTakeId(null);
+    }
     setSegments(prev => selectSegmentTakeInList(prev, segmentId, takeId));
-  }, []);
+  }, [playingSegmentId, playingTakeId]);
 
   const handleDeleteSegmentTake = useCallback((segmentId, takeId) => {
     if (playingTakeId === takeId) {
-      audioPreviewRef.current?.pause();
-      audioPreviewRef.current = null;
+      stopCurrentPreview(audioPreviewRef);
       setPlayingTakeId(null);
       setPlayingSegmentId(null);
     }
@@ -685,24 +732,34 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   }, [playingTakeId]);
 
   const handleTogglePlayTake = useCallback((segmentId, takeId) => {
+    const clearState = () => { setPlayingTakeId(null); setPlayingSegmentId(null); };
     if (playingTakeId === takeId) {
-      audioPreviewRef.current?.pause();
-      audioPreviewRef.current = null;
-      setPlayingTakeId(null);
-      setPlayingSegmentId(null);
+      stopCurrentPreview(audioPreviewRef);
+      clearState();
       return;
     }
     const target = (segments || []).find(seg => seg.id === segmentId);
     const take = getSegmentTake(target, takeId);
     const url = resolveTakeAudioUrl(take);
-    audioPreviewRef.current?.pause();
-    const onEnd = () => { setPlayingTakeId(null); setPlayingSegmentId(null); };
-    audioPreviewRef.current = playSegmentAudio(url, onEnd, onEnd);
+    stopCurrentPreview(audioPreviewRef);
+    if (!url) return warnMissingAudio(shared, clearState, 'No playable audio found for this take.');
+    pauseMainAudioElement();
+    const onError = createPlaybackNotifier(shared, logger, 'playTakeAudio', clearState);
+    audioPreviewRef.current = playSegmentAudio(url, clearState, onError);
     if (audioPreviewRef.current) {
       setPlayingTakeId(takeId);
       setPlayingSegmentId(segmentId);
     }
-  }, [playingTakeId, segments]);
+  }, [playingTakeId, segments, shared, logger]);
+
+  const handleCycleSegmentTake = useCallback((segmentId, direction = 1) => {
+    if (playingSegmentId === segmentId) {
+      stopCurrentPreview(audioPreviewRef);
+      setPlayingSegmentId(null);
+      setPlayingTakeId(null);
+    }
+    setSegments(prev => cycleSegmentTakeInList(prev, segmentId, direction));
+  }, [playingSegmentId]);
 
   const hasTakesToRestitch = useMemo(() => (
     Array.isArray(segments) && segments.some(s => hasSegmentAudio(s))
@@ -802,6 +859,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     handleSplitSegment, handleReorderSegments,
     handleGenerateSegment, handleTogglePlaySegment, playingSegmentId,
     handleSelectSegmentTake, handleDeleteSegmentTake, handleTogglePlayTake, playingTakeId,
+    handleCycleSegmentTake,
+    handleStopPreview: () => { stopCurrentPreview(audioPreviewRef); setPlayingSegmentId(null); setPlayingTakeId(null); },
     handleRestitchSegments, handleExportNarration, hasTakesToRestitch,
     options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi,
     charactersRef, libraryModal, setLibraryModal,
@@ -864,6 +923,7 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         status={ctrl.synthesis.status} busyMeta={ctrl.synthesis.busyMeta} verification={verification}
         onSelectTake={ctrl.synthesis.selectTake} onDeleteTake={ctrl.synthesis.deleteTake}
         onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
+        onAudioPlay={state.handleStopPreview}
         onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
       <VoiceLibrary open={state.libraryModal.open} openSaveForm={state.libraryModal.openForm}
         busy={ctrl.synthesis.busy} library={state.library} anchors={state.anchorApi.anchors}

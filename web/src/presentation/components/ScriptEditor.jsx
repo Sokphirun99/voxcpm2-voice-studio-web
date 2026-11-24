@@ -81,6 +81,7 @@ function EditorSegmentView({ props }) {
       generatingSegmentId={props.generatingSegmentId} playingSegmentId={props.playingSegmentId}
       onSelectSegmentTake={props.onSelectSegmentTake} onDeleteSegmentTake={props.onDeleteSegmentTake}
       onTogglePlayTake={props.onTogglePlayTake} playingTakeId={props.playingTakeId}
+      onCycleSegmentTake={props.onCycleSegmentTake}
       voices={props.voices || props.characters} defaultVoiceId={props.defaultVoiceId}
     />
   );

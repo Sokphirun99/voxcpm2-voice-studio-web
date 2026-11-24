@@ -8,6 +8,7 @@ import {
   countGraphemeClusters,
   getSegmentActiveTake,
   hasSegmentAudio,
+  isTakeOutdated,
 } from '../../domain/projectSegments.js';
 import { Icon } from './Icon.jsx';
 
@@ -27,11 +28,13 @@ function SegmentStatusBadge({ status }) {
   );
 }
 
-function SegmentDurationBadge({ duration }) {
+function SegmentDurationBadge({ duration, isPlaying }) {
   if (typeof duration !== 'number' || duration <= 0) return null;
+  const prefix = isPlaying ? '▶ ' : '';
   return (
-    <span className="segment-duration-badge" title={`Duration: ${duration.toFixed(1)}s`}>
-      {duration.toFixed(1)}s
+    <span className={`segment-duration-badge ${isPlaying ? 'is-playing' : ''}`}
+      title={`Duration: ${duration.toFixed(1)}s${isPlaying ? ' (playing)' : ''}`}>
+      {prefix}{duration.toFixed(1)}s
     </span>
   );
 }
@@ -99,59 +102,94 @@ function SegmentTakeDeleteButton({ onDelete, disabled, takeNumber }) {
   );
 }
 
-function formatTakeTooltip(settings) {
-  if (!settings || typeof settings !== 'object') return 'Take audio';
+function formatTakeTooltip(settings, isOutdated) {
   const parts = [];
+  if (isOutdated) parts.push('Outdated');
+  if (!settings || typeof settings !== 'object') {
+    return parts.length > 0 ? parts.join(' · ') : 'Take audio';
+  }
   if (settings.seed != null) parts.push(`Seed: ${settings.seed}`);
   if (settings.guidance != null) parts.push(`CFG: ${settings.guidance}`);
   if (settings.steps != null) parts.push(`Steps: ${settings.steps}`);
   if (settings.styleMode) parts.push(`Mode: ${settings.styleMode}`);
+  if (settings.voiceId) parts.push(`Voice: ${settings.voiceId}`);
   return parts.length > 0 ? parts.join(' · ') : 'Take audio';
 }
 
+/**
+ * Keyboard handler for individual segment take chips.
+ * Inputs: KeyboardEvent, context object ({ onChipClick, onTogglePlay, onDelete }).
+ * Outputs: void.
+ * Side effects: calls event.preventDefault() and triggers take action on matching keys.
+ * Failure modes: no-op if event is during IME composition or includes modifiers.
+ * @param {KeyboardEvent} event - Keyboard event.
+ * @param {object} ctx - Action callbacks.
+ */
+export function handleChipKey(event, { onChipClick, onTogglePlay, onDelete }) {
+  if (event.isComposing || event.keyCode === 229 || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    onChipClick();
+  } else if (event.key === 'p' || event.key === 'P') {
+    event.preventDefault();
+    onTogglePlay?.();
+  } else if ((event.key === 'Delete' || event.key === 'Backspace') && onDelete) {
+    event.preventDefault();
+    onDelete();
+  }
+}
+
+function SegmentTakeBadges({ isSelected, isOutdated, duration }) {
+  return (
+    <>
+      {duration > 0 && <span className="segment-take-duration">{duration.toFixed(1)}s</span>}
+      {isSelected && <span className="segment-take-active-badge" title="Active take used in speech">Active</span>}
+      {isOutdated && <span className="segment-take-outdated-badge" title="Take script or voice differs from current segment">Outdated</span>}
+    </>
+  );
+}
+
 function SegmentTakeChip(props) {
-  const { take, takeIndex, isPlaying, disabled, onSelect, onTogglePlay, onDelete } = props;
+  const { take, takeIndex, segment, isPlaying, disabled, onSelect, onTogglePlay, onDelete } = props;
   const takeNumber = takeIndex + 1;
   const isSelected = Boolean(take.isSelected);
-  const title = formatTakeTooltip(take.settings);
+  const isOutdated = isTakeOutdated(take, segment);
   const onChipClick = () => { if (!isSelected && onSelect) onSelect(); };
-
+  const chipClasses = `segment-take-chip${isSelected ? ' is-selected' : ''}${isPlaying ? ' is-playing' : ''}${isOutdated ? ' is-outdated' : ''}`;
+  const ariaState = `Take ${takeNumber}${isSelected ? ' (active)' : ''}${isPlaying ? ' (playing)' : ''}${isOutdated ? ' (outdated)' : ''}`;
   return (
-    <div className={`segment-take-chip ${isSelected ? 'is-selected' : ''}`}
-      role="button" tabIndex={0} aria-pressed={isSelected}
-      aria-label={`Take ${takeNumber}${isSelected ? ' (active)' : ''}`}
-      title={title} onClick={onChipClick}
-      onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onChipClick(); } }}>
+    <div className={chipClasses} role="button" tabIndex={0} aria-pressed={isSelected}
+      aria-label={ariaState} title={formatTakeTooltip(take.settings, isOutdated)} onClick={onChipClick}
+      onKeyDown={event => handleChipKey(event, { onChipClick, onTogglePlay, onDelete })}>
       <SegmentTakePlayButton isPlaying={isPlaying} onTogglePlay={onTogglePlay} disabled={disabled} takeNumber={takeNumber} />
       <span className="segment-take-label">Take {takeNumber}</span>
-      {take.duration > 0 && <span className="segment-take-duration">{take.duration.toFixed(1)}s</span>}
-      {isSelected && <span className="segment-take-active-badge" title="Active take used in speech">Active</span>}
+      <SegmentTakeBadges isSelected={isSelected} isOutdated={isOutdated} duration={take.duration} />
       <SegmentTakeDeleteButton onDelete={onDelete} disabled={disabled} takeNumber={takeNumber} />
     </div>
   );
 }
 
+function renderTakeChip(take, idx, segment, props) {
+  const { disabled, playingTakeId, onSelectTake, onTogglePlayTake, onDeleteTake } = props;
+  return (
+    <SegmentTakeChip key={take.id} take={take} takeIndex={idx} segment={segment}
+      isPlaying={playingTakeId === take.id} disabled={disabled}
+      onSelect={onSelectTake ? () => onSelectTake(segment.id, take.id) : null}
+      onTogglePlay={onTogglePlayTake ? () => onTogglePlayTake(segment.id, take.id) : null}
+      onDelete={onDeleteTake ? () => onDeleteTake(segment.id, take.id) : null} />
+  );
+}
+
 function SegmentTakesTray(props) {
-  const { segment, disabled, playingTakeId, onSelectTake, onTogglePlayTake, onDeleteTake } = props;
-  const takes = Array.isArray(segment.takes) ? segment.takes : [];
+  const { segment, index } = props;
+  const takes = Array.isArray(segment?.takes) ? segment.takes : [];
   if (takes.length === 0) return null;
 
   return (
-    <div className="segment-takes-tray" role="group" aria-label={`Takes for segment #${props.index + 1}`}>
+    <div className="segment-takes-tray" role="group" aria-label={`Takes for segment #${index + 1}`}>
       <span className="segment-takes-label">Takes ({takes.length}):</span>
       <div className="segment-takes-list">
-        {takes.map((take, idx) => (
-          <SegmentTakeChip
-            key={take.id}
-            take={take}
-            takeIndex={idx}
-            isPlaying={playingTakeId === take.id}
-            disabled={disabled}
-            onSelect={onSelectTake ? () => onSelectTake(segment.id, take.id) : null}
-            onTogglePlay={onTogglePlayTake ? () => onTogglePlayTake(segment.id, take.id) : null}
-            onDelete={onDeleteTake ? () => onDeleteTake(segment.id, take.id) : null}
-          />
-        ))}
+        {takes.map((take, idx) => renderTakeChip(take, idx, segment, props))}
       </div>
     </div>
   );
@@ -287,7 +325,7 @@ function SegmentCardHeader(props) {
         <SegmentVoiceSelector segment={props.segment} index={props.index} voices={props.voices}
           disabled={props.disabled} onUpdate={props.onUpdate} defaultVoiceId={props.defaultVoiceId} />
         <SegmentStatusBadge status={props.status} />
-        <SegmentDurationBadge duration={props.duration} />
+        <SegmentDurationBadge duration={props.duration} isPlaying={props.isPlaying} />
       </div>
       <div className="segment-header-right">
         <span className="segment-char-count">{props.count.toLocaleString()} chars</span>
@@ -366,9 +404,37 @@ function handleTextareaFocusNav(event, { index, totalCount, onFocusIndex }) {
   return false;
 }
 
+/**
+ * Evaluates take review and playback keyboard shortcuts for segment textareas (Alt+P, Alt+T, Alt+[, Alt+]).
+ * Inputs: KeyboardEvent, context object ({ onTogglePlay, onCycleTake }).
+ * Outputs: boolean indicating if shortcut was handled.
+ * Side effects: calls event.preventDefault() and fires toggle play or cycle take.
+ * Failure modes: returns false on IME composition, non-Alt keys, or Ctrl/Meta modifier combinations.
+ * @param {KeyboardEvent} event - Keyboard event.
+ * @param {object} ctx - Action callbacks.
+ * @returns {boolean} Whether shortcut was handled.
+ */
+export function handleTextareaTakeShortcuts(event, ctx) {
+  if (event.isComposing || event.keyCode === 229 || event.ctrlKey || event.metaKey || !event.altKey) return false;
+  if ((event.key === 'p' || event.key === 'P') && ctx.onTogglePlay) {
+    event.preventDefault();
+    ctx.onTogglePlay();
+    return true;
+  }
+  const isNext = event.key === ']' || event.key === 't' || event.key === 'T';
+  const isPrev = event.key === '[';
+  if ((isNext || isPrev) && ctx.onCycleTake) {
+    event.preventDefault();
+    ctx.onCycleTake(isNext ? 1 : -1);
+    return true;
+  }
+  return false;
+}
+
 function handleSegmentTextareaKey(event, ctx) {
   if (handleTextareaReorder(event, ctx)) return;
   if (handleTextareaSplit(event, ctx.onSplit, ctx.canSplit)) return;
+  if (handleTextareaTakeShortcuts(event, ctx)) return;
   if (handleTextareaFocusNav(event, ctx)) return;
   if (event.key === 'Escape') {
     event.target.blur();
@@ -385,9 +451,9 @@ function handleSegmentTextareaKey(event, ctx) {
 }
 
 function SegmentCardBody(props) {
-  const { segment, index, totalCount, textareaRef, onFocusIndex, onUpdate, onMoveUp, onMoveDown, onSplit, canSplit, disabled, onScriptKey, onGenerate } = props;
+  const { segment, index, totalCount, textareaRef, onFocusIndex, onUpdate, onMoveUp, onMoveDown, onSplit, canSplit, disabled, onScriptKey, onGenerate, onTogglePlay, onCycleTake } = props;
   const onKeyDown = event => handleSegmentTextareaKey(event, {
-    index, totalCount, onMoveUp, onMoveDown, onSplit, canSplit, onFocusIndex, onScriptKey, onGenerate,
+    index, totalCount, onMoveUp, onMoveDown, onSplit, canSplit, onFocusIndex, onScriptKey, onGenerate, onTogglePlay, onCycleTake,
   });
   return (
     <div className="segment-card-body">
@@ -416,18 +482,56 @@ function handleCardReorder(event, { index, totalCount, onMoveUp, onMoveDown }) {
   return false;
 }
 
-function handleCardKey(event, ctx) {
-  if (event.target !== event.currentTarget) return;
-  if (handleCardReorder(event, ctx)) return;
-  if (event.key === 'Enter' || event.key === ' ') {
+/**
+ * Evaluates take navigation shortcuts for segment cards (p, t, [, ]).
+ * Inputs: KeyboardEvent, context object ({ onTogglePlay, onCycleTake }).
+ * Outputs: boolean indicating if shortcut was handled.
+ * Side effects: calls event.preventDefault() and triggers playback or cycling.
+ * Failure modes: returns false on IME composition or any modifier keys (Ctrl, Meta, Alt).
+ * @param {KeyboardEvent} event - Keyboard event.
+ * @param {object} ctx - Action callbacks.
+ * @returns {boolean} Whether shortcut was handled.
+ */
+export function handleCardTakeNavigation(event, ctx) {
+  if (event.isComposing || event.keyCode === 229 || event.ctrlKey || event.metaKey || event.altKey) return false;
+  if (event.key === 'p' || event.key === 'P') {
     event.preventDefault();
-    ctx.textareaEl?.focus();
-  } else if (event.key === 'ArrowDown' && ctx.index < ctx.totalCount - 1) {
+    ctx.onTogglePlay?.();
+    return true;
+  }
+  const isNext = event.key === ']' || event.key === 't' || event.key === 'T';
+  const isPrev = event.key === '[';
+  if (isNext || isPrev) {
+    event.preventDefault();
+    ctx.onCycleTake?.(isNext ? 1 : -1);
+    return true;
+  }
+  return false;
+}
+
+function handleCardNavFocus(event, ctx) {
+  if (event.key === 'ArrowDown' && ctx.index < ctx.totalCount - 1) {
     event.preventDefault();
     ctx.onFocusIndex(ctx.index + 1);
-  } else if (event.key === 'ArrowUp' && ctx.index > 0) {
+    return true;
+  }
+  if (event.key === 'ArrowUp' && ctx.index > 0) {
     event.preventDefault();
     ctx.onFocusIndex(ctx.index - 1);
+    return true;
+  }
+  return false;
+}
+
+function handleCardKey(event, ctx) {
+  if (event.target !== event.currentTarget) return;
+  if (handleCardReorder(event, ctx) || handleCardTakeNavigation(event, ctx) || handleCardNavFocus(event, ctx)) return;
+  if (event.key === 'Enter' || (event.key === ' ' && !ctx.hasAudio)) {
+    event.preventDefault();
+    ctx.textareaEl?.focus();
+  } else if (event.key === ' ' && ctx.hasAudio) {
+    event.preventDefault();
+    ctx.onTogglePlay?.();
   } else if ((event.key === 'Delete' || event.key === 'Backspace') && ctx.onDelete && ctx.totalCount > 1) {
     event.preventDefault();
     ctx.onDelete();
@@ -446,16 +550,21 @@ function resolveSplitOffset(cursor, textareaEl, text) {
   return Math.floor(len / 2);
 }
 
-function useSegmentCardHandlers(props, localTextareaRef) {
-  const { segment, index, totalCount, onFocusIndex, onMoveUp, onMoveDown, onSplit, onDelete, textareaRef } = props;
+function useSegmentCardHandlers(props, localTextareaRef, audioState) {
+  const { segment, index, totalCount, onFocusIndex, onMoveUp, onMoveDown, onSplit, onDelete, textareaRef, onCycleTake } = props;
   const cardDelete = onDelete ? () => onDelete(segment.id) : null;
-  const onKeyDown = event => handleCardKey(event, { index, totalCount, onFocusIndex, textareaEl: localTextareaRef.current, onDelete: cardDelete, onMoveUp, onMoveDown });
+  const cycleTake = onCycleTake ? dir => onCycleTake(segment.id, dir) : null;
+  const onKeyDown = event => handleCardKey(event, {
+    index, totalCount, onFocusIndex, textareaEl: localTextareaRef.current,
+    onDelete: cardDelete, onMoveUp, onMoveDown, onTogglePlay: audioState.onTogglePlay,
+    onCycleTake: cycleTake, hasAudio: audioState.hasAudio,
+  });
   const handleSplitClick = onSplit ? cursor => onSplit(segment.id, resolveSplitOffset(cursor, localTextareaRef.current, segment.text)) : null;
   const handleMountTextarea = useCallback(el => {
     localTextareaRef.current = el;
     textareaRef?.(el);
   }, [textareaRef]);
-  return { cardDelete, onKeyDown, handleSplitClick, handleMountTextarea };
+  return { cardDelete, onKeyDown, handleSplitClick, handleMountTextarea, cycleTake };
 }
 
 function resolveCardAudioState(segment, props) {
@@ -471,30 +580,34 @@ function resolveCardAudioState(segment, props) {
   };
 }
 
-function SegmentCard(props) {
-  const { segment, index, totalCount, isSelected, onSelect, onFocusIndex, onUpdate, onMoveUp, onMoveDown, onAdd, disabled, onScriptKey, voices, defaultVoiceId } = props;
-  const localTextareaRef = useRef(null);
-  const { cardDelete, onKeyDown, handleSplitClick, handleMountTextarea } = useSegmentCardHandlers(props, localTextareaRef);
-  const audioState = resolveCardAudioState(segment, props);
+function buildCardHeaderProps(props, cardDelete, handleSplitClick, audioState) {
+  const { segment, index, totalCount, isSelected, disabled, voices, defaultVoiceId, onUpdate, onMoveUp, onMoveDown, onMerge, onAdd } = props;
   const count = countGraphemeClusters(segment.text);
-  const canSplit = count >= MIN_SPLIT_GRAPHEMES;
+  return {
+    index, totalCount, status: segment.status, count, canSplit: count >= MIN_SPLIT_GRAPHEMES, isSelected, disabled,
+    segment, voices, defaultVoiceId, onUpdate, onMoveUp, onMoveDown, onMerge,
+    onSplit: handleSplitClick, onDelete: cardDelete, onAdd: onAdd ? () => onAdd(segment.id) : null,
+    ...audioState,
+  };
+}
 
+function SegmentCard(props) {
+  const { segment, index, isSelected, onSelect, onFocusIndex, onUpdate, onMoveUp, onMoveDown, disabled, onScriptKey } = props;
+  const localTextareaRef = useRef(null);
+  const audioState = resolveCardAudioState(segment, props);
+  const { cardDelete, onKeyDown, handleSplitClick, handleMountTextarea, cycleTake } = useSegmentCardHandlers(props, localTextareaRef, audioState);
+  const headerProps = buildCardHeaderProps(props, cardDelete, handleSplitClick, audioState);
+  const cardClasses = `segment-card status-${segment.status}${isSelected ? ' is-selected' : ''}${audioState.isPlaying ? ' is-playing' : ''}`;
   return (
-    <div className={`segment-card status-${segment.status} ${isSelected ? 'is-selected' : ''}`}
-      data-segment-id={segment.id} onClick={() => onSelect?.(segment.id)}
+    <div className={cardClasses} data-segment-id={segment.id} onClick={() => onSelect?.(segment.id)}
       onKeyDown={onKeyDown} tabIndex={0} role="group" aria-label={`Segment ${index + 1}: ${segment.status}`}>
-      <SegmentCardHeader index={index} totalCount={totalCount} status={segment.status} count={count}
-        segment={segment} voices={voices} defaultVoiceId={defaultVoiceId} onUpdate={onUpdate}
-        onMoveUp={onMoveUp} onMoveDown={onMoveDown} onSplit={handleSplitClick} onMerge={props.onMerge}
-        onAdd={onAdd ? () => onAdd(segment.id) : null} onDelete={cardDelete} disabled={disabled} canSplit={canSplit}
-        {...audioState} />
-      <SegmentCardBody segment={segment} index={index} totalCount={totalCount} textareaRef={handleMountTextarea}
+      <SegmentCardHeader {...headerProps} />
+      <SegmentCardBody segment={segment} index={index} totalCount={props.totalCount} textareaRef={handleMountTextarea}
         onFocusIndex={onFocusIndex} onUpdate={onUpdate} onMoveUp={onMoveUp} onMoveDown={onMoveDown}
-        onSplit={handleSplitClick} canSplit={canSplit} disabled={disabled} onScriptKey={onScriptKey}
-        onGenerate={audioState.onGenerate} />
-      <SegmentTakesTray segment={segment} index={index} disabled={disabled}
-        playingTakeId={props.playingTakeId} onSelectTake={props.onSelectSegmentTake}
-        onTogglePlayTake={props.onTogglePlayTake} onDeleteTake={props.onDeleteSegmentTake} />
+        onSplit={handleSplitClick} canSplit={headerProps.canSplit} disabled={disabled} onScriptKey={onScriptKey}
+        onGenerate={audioState.onGenerate} onTogglePlay={audioState.onTogglePlay} onCycleTake={cycleTake} />
+      <SegmentTakesTray segment={segment} index={index} disabled={disabled} playingTakeId={props.playingTakeId}
+        onSelectTake={props.onSelectSegmentTake} onTogglePlayTake={props.onTogglePlayTake} onDeleteTake={props.onDeleteSegmentTake} />
     </div>
   );
 }
@@ -512,26 +625,28 @@ function SegmentEditorEmpty({ onAdd }) {
   );
 }
 
+function resolveCardMoveHandlers(props, segmentId, index) {
+  const onMoveUp = props.onMoveSegmentUp ? () => props.onMoveSegmentUp(segmentId) : (props.onReorderSegments ? () => props.onReorderSegments(index, index - 1) : null);
+  const onMoveDown = props.onMoveSegmentDown ? () => props.onMoveSegmentDown(segmentId) : (props.onReorderSegments ? () => props.onReorderSegments(index, index + 1) : null);
+  return { onMoveUp, onMoveDown };
+}
+
 function renderSegmentCard(segment, index, props, total) {
-  const isSelected = props.activeSegmentId === segment.id;
-  const setRef = el => { props.textareaRefs.current[segment.id] = el; };
-  const onMoveUp = props.onMoveSegmentUp ? () => props.onMoveSegmentUp(segment.id) : (props.onReorderSegments ? () => props.onReorderSegments(index, index - 1) : null);
-  const onMoveDown = props.onMoveSegmentDown ? () => props.onMoveSegmentDown(segment.id) : (props.onReorderSegments ? () => props.onReorderSegments(index, index + 1) : null);
-  const onMerge = props.onMergeSegment ? () => props.onMergeSegment(segment.id) : null;
-  const voices = props.voices || props.characters || [];
+  const { onMoveUp, onMoveDown } = resolveCardMoveHandlers(props, segment.id, index);
   return (
-    <SegmentCard
-      key={segment.id} segment={segment} index={index} totalCount={total} isSelected={isSelected}
-      textareaRef={setRef} onSelect={props.onSelectSegment} onFocusIndex={props.onFocusIndex}
+    <SegmentCard key={segment.id} segment={segment} index={index} totalCount={total}
+      isSelected={props.activeSegmentId === segment.id}
+      textareaRef={el => { props.textareaRefs.current[segment.id] = el; }}
+      onSelect={props.onSelectSegment} onFocusIndex={props.onFocusIndex}
       onUpdate={props.onUpdateSegment} onMoveUp={onMoveUp} onMoveDown={onMoveDown}
-      onSplit={props.onSplitSegment} onMerge={onMerge} onAdd={props.onAddSegment}
-      onDelete={props.onDeleteSegment} disabled={props.disabled} onScriptKey={props.onScriptKey}
-      onGenerateSegment={props.onGenerateSegment} onTogglePlaySegment={props.onTogglePlaySegment}
-      generatingSegmentId={props.generatingSegmentId} playingSegmentId={props.playingSegmentId}
-      onSelectSegmentTake={props.onSelectSegmentTake} onDeleteSegmentTake={props.onDeleteSegmentTake}
-      onTogglePlayTake={props.onTogglePlayTake} playingTakeId={props.playingTakeId}
-      voices={voices} defaultVoiceId={props.defaultVoiceId}
-    />
+      onSplit={props.onSplitSegment} onMerge={props.onMergeSegment ? () => props.onMergeSegment(segment.id) : null}
+      onAdd={props.onAddSegment} onDelete={props.onDeleteSegment} disabled={props.disabled}
+      onScriptKey={props.onScriptKey} onGenerateSegment={props.onGenerateSegment}
+      onTogglePlaySegment={props.onTogglePlaySegment} generatingSegmentId={props.generatingSegmentId}
+      playingSegmentId={props.playingSegmentId} onSelectSegmentTake={props.onSelectSegmentTake}
+      onDeleteSegmentTake={props.onDeleteSegmentTake} onTogglePlayTake={props.onTogglePlayTake}
+      playingTakeId={props.playingTakeId} onCycleTake={props.onCycleSegmentTake}
+      voices={props.voices || props.characters || []} defaultVoiceId={props.defaultVoiceId} />
   );
 }
 

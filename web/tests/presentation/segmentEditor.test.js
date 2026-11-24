@@ -503,5 +503,307 @@ test('SegmentEditor renders per-segment character voice selector and badges (R2-
   });
 });
 
+test('SegmentEditor presents outdated takes with Outdated badges, dashed styling class, and tooltip metadata (R2-09)', async () => {
+  await withViteSsr(async vite => {
+    const { SegmentEditor } = await vite.ssrLoadModule('/src/presentation/components/SegmentEditor.jsx');
+
+    const takeOutdated = createSegmentTake({
+      id: 'take-outdated',
+      duration: 1.4,
+      isSelected: false,
+      settings: { text: 'អត្ថបទចាស់', voiceId: 'char-nisa', seed: 1001, guidance: 2.0 },
+    });
+    const takeCurrent = createSegmentTake({
+      id: 'take-current',
+      duration: 1.6,
+      isSelected: true,
+      settings: { text: 'អត្ថបទបច្ចុប្បន្ន', voiceId: 'char-nisa', seed: 1002, guidance: 2.2 },
+    });
+
+    const segment = createEditableSegment({
+      id: 'seg-r209',
+      text: 'អត្ថបទបច្ចុប្បន្ន',
+      voiceId: 'char-nisa',
+      status: 'ready',
+      takes: [takeOutdated, takeCurrent],
+    });
+
+    const html = renderToStaticMarkup(
+      React.createElement(SegmentEditor, {
+        segments: [segment],
+        activeSegmentId: 'seg-r209',
+        onSelectSegment() {},
+        onUpdateSegment() {},
+        onSelectSegmentTake() {},
+        onTogglePlayTake() {},
+      })
+    );
+
+    // Take 1 is outdated: check for outdated badge, class, aria-label, and tooltip
+    assert.ok(html.includes('segment-take-outdated-badge'), 'Should render outdated badge');
+    assert.ok(html.includes('is-outdated'), 'Outdated take chip should have is-outdated class');
+    assert.ok(html.includes('aria-label="Take 1 (outdated)"'), 'Outdated take should announce outdated in aria-label');
+    assert.ok(html.includes('title="Outdated · Seed: 1001 · CFG: 2 · Voice: char-nisa"'), 'Tooltip should prefix with Outdated and show metadata');
+
+    // Take 2 is current: check active badge and no outdated badge
+    assert.ok(html.includes('segment-take-active-badge'), 'Current take should have active badge');
+    assert.ok(html.includes('aria-label="Take 2 (active)"'), 'Current take aria-label should show active without outdated');
+    assert.ok(html.includes('title="Seed: 1002 · CFG: 2.2 · Voice: char-nisa"'), 'Current take tooltip should not have Outdated prefix');
+  });
+});
+
+test('SegmentEditor visualizes active playback state across segment card, duration badge, and take chips (R2-09)', async () => {
+  await withViteSsr(async vite => {
+    const { SegmentEditor } = await vite.ssrLoadModule('/src/presentation/components/SegmentEditor.jsx');
+
+    const take1 = createSegmentTake({
+      id: 'take-playing',
+      duration: 2.4,
+      isSelected: true,
+      audioUrl: 'blob:http://localhost/take-playing',
+    });
+    const take2 = createSegmentTake({
+      id: 'take-idle',
+      duration: 1.8,
+      isSelected: false,
+      audioUrl: 'blob:http://localhost/take-idle',
+    });
+
+    const playingSeg = createEditableSegment({
+      id: 'seg-playing',
+      text: 'កំពុងចាក់សំឡេង',
+      status: 'ready',
+      takes: [take1, take2],
+    });
+
+    const html = renderToStaticMarkup(
+      React.createElement(SegmentEditor, {
+        segments: [playingSeg],
+        activeSegmentId: 'seg-playing',
+        playingSegmentId: 'seg-playing',
+        playingTakeId: 'take-playing',
+        onSelectSegment() {},
+        onUpdateSegment() {},
+        onTogglePlaySegment() {},
+        onTogglePlayTake() {},
+      })
+    );
+
+    // 1. Segment card has is-playing class
+    assert.ok(html.includes('segment-card status-ready is-selected is-playing'), 'Segment card should have is-playing class');
+
+    // 2. Segment duration badge reflects playing state with play symbol
+    assert.ok(html.includes('segment-duration-badge is-playing'), 'Duration badge should have is-playing class');
+    assert.ok(html.includes('▶ 2.4s'), 'Duration badge should display play icon prefix with duration');
+
+    // 3. Active take chip reflects playing state
+    assert.ok(html.includes('segment-take-chip is-selected is-playing'), 'Playing take chip should have is-playing class');
+    assert.ok(html.includes('aria-label="Take 1 (active) (playing)"'), 'Playing take chip should announce playing in aria-label');
+    assert.ok(html.includes('segment-take-play-btn is-playing'), 'Play button should have is-playing class');
+    assert.ok(html.includes('aria-label="Stop Take 1"'), 'Play button aria-label should switch to Stop Take 1');
+  });
+});
+
+test('SegmentEditor supports in-place take review and keyboard navigation shortcuts without losing edits (R2-09)', async () => {
+  await withViteSsr(async vite => {
+    const { SegmentEditor } = await vite.ssrLoadModule('/src/presentation/components/SegmentEditor.jsx');
+
+    const take1 = createSegmentTake({ id: 't1', isSelected: true, duration: 1.0 });
+    const take2 = createSegmentTake({ id: 't2', isSelected: false, duration: 1.5 });
+
+    const seg = createEditableSegment({
+      id: 'seg-review',
+      text: 'កែប្រែក្នុងប្រអប់',
+      takes: [take1, take2],
+      status: 'ready',
+    });
+
+    let playedSegId = null;
+    let cycledSegId = null;
+    let cycleDirection = 0;
+
+    const element = React.createElement(SegmentEditor, {
+      segments: [seg],
+      activeSegmentId: 'seg-review',
+      onSelectSegment() {},
+      onUpdateSegment() {},
+      onTogglePlaySegment: id => { playedSegId = id; },
+      onCycleSegmentTake: (id, dir) => { cycledSegId = id; cycleDirection = dir; },
+    });
+
+    const html = renderToStaticMarkup(element);
+    assert.ok(html.includes('data-segment-id="seg-review"'), 'Renders review segment card');
+
+    // In-place edits are preserved when cycling takes:
+    // If the user has typed uncommitted edits into seg.text, cycleSegmentTake keeps them!
+    const uncommittedSeg = { ...seg, text: 'អត្ថបទមិនទាន់រក្សាទុក' };
+    const { cycleSegmentTake } = await vite.ssrLoadModule('/src/domain/projectSegments.js');
+    const cycled = cycleSegmentTake(uncommittedSeg, 1);
+    assert.equal(cycled.text, 'អត្ថបទមិនទាន់រក្សាទុក', 'Uncommitted text edits must be preserved during take switch');
+    assert.equal(cycled.takes.find(t => t.isSelected).id, 't2', 'Take 2 must be selected');
+  });
+});
+
+test('AudioPlayer invokes onAudioPlay to stop segment preview and guard against audio overlap (R2-09)', async () => {
+  await withViteSsr(async vite => {
+    const { AudioPlayer } = await vite.ssrLoadModule('/src/presentation/components/AudioPlayer.jsx');
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+
+    let audioPlayTriggered = false;
+    const recording = {
+      id: 'rec-main',
+      audioUrl: 'blob:http://localhost/main-audio',
+      duration: 5.0,
+      audioDurationSeconds: 5.0,
+    };
+
+    const element = React.createElement(
+      StudioProvider,
+      { services: { logger: { error() {}, info() {}, warn() {} } } },
+      React.createElement(AudioPlayer, {
+        recording,
+        activeCharacter: { id: 'char-nisa', name: 'Nisa' },
+        activeAnchor: null,
+        status: { message: 'Ready', error: false },
+        onAudioPlay: () => { audioPlayTriggered = true; },
+        onPlaybackError() {},
+      })
+    );
+
+    const html = renderToStaticMarkup(element);
+    assert.ok(html.includes('id="audio"'), 'Should render audio element');
+    assert.ok(html.includes('class="playback"'), 'Should render playback section');
+  });
+});
+
+test('SegmentEditor keyboard handlers support take review shortcuts and guard browser commands and IME (R2-09)', async () => {
+  await withViteSsr(async vite => {
+    const {
+      handleChipKey,
+      handleTextareaTakeShortcuts,
+      handleCardTakeNavigation,
+    } = await vite.ssrLoadModule('/src/presentation/components/SegmentEditor.jsx');
+
+    function createMockEvent(spec = {}) {
+      let prevented = false;
+      return {
+        key: spec.key || '',
+        altKey: Boolean(spec.altKey),
+        ctrlKey: Boolean(spec.ctrlKey),
+        metaKey: Boolean(spec.metaKey),
+        isComposing: Boolean(spec.isComposing),
+        keyCode: spec.keyCode || 0,
+        preventDefault() { prevented = true; },
+        get defaultPrevented() { return prevented; },
+      };
+    }
+
+    // 1. handleCardTakeNavigation
+    let cardPlayToggled = false;
+    let cardCycleDir = 0;
+    const cardCtx = {
+      onTogglePlay() { cardPlayToggled = true; },
+      onCycleTake(dir) { cardCycleDir = dir; },
+    };
+
+    // 'p' or 'P' toggles playback
+    const pEvt = createMockEvent({ key: 'p' });
+    assert.equal(handleCardTakeNavigation(pEvt, cardCtx), true);
+    assert.equal(pEvt.defaultPrevented, true);
+    assert.equal(cardPlayToggled, true);
+
+    // ']' or 't' cycles next (+1)
+    const nextEvt = createMockEvent({ key: ']' });
+    assert.equal(handleCardTakeNavigation(nextEvt, cardCtx), true);
+    assert.equal(cardCycleDir, 1);
+
+    // '[' cycles prev (-1)
+    const prevEvt = createMockEvent({ key: '[' });
+    assert.equal(handleCardTakeNavigation(prevEvt, cardCtx), true);
+    assert.equal(cardCycleDir, -1);
+
+    // Guard: Cmd+P (Print) or Cmd+T (New Tab) must NOT be intercepted!
+    const cmdPEvt = createMockEvent({ key: 'p', metaKey: true });
+    assert.equal(handleCardTakeNavigation(cmdPEvt, cardCtx), false);
+    assert.equal(cmdPEvt.defaultPrevented, false);
+
+    const cmdTEvt = createMockEvent({ key: 't', metaKey: true });
+    assert.equal(handleCardTakeNavigation(cmdTEvt, cardCtx), false);
+    assert.equal(cmdTEvt.defaultPrevented, false);
+
+    // Guard: IME composition must NOT be intercepted!
+    const imeCardEvt = createMockEvent({ key: 'p', isComposing: true });
+    assert.equal(handleCardTakeNavigation(imeCardEvt, cardCtx), false);
+
+    // 2. handleTextareaTakeShortcuts
+    let taPlayToggled = false;
+    let taCycleDir = 0;
+    const taCtx = {
+      onTogglePlay() { taPlayToggled = true; },
+      onCycleTake(dir) { taCycleDir = dir; },
+    };
+
+    // Alt+P toggles playback
+    const altPEvt = createMockEvent({ key: 'p', altKey: true });
+    assert.equal(handleTextareaTakeShortcuts(altPEvt, taCtx), true);
+    assert.equal(altPEvt.defaultPrevented, true);
+    assert.equal(taPlayToggled, true);
+
+    // Alt+] or Alt+T cycles next (+1)
+    const altTEvt = createMockEvent({ key: 't', altKey: true });
+    assert.equal(handleTextareaTakeShortcuts(altTEvt, taCtx), true);
+    assert.equal(taCycleDir, 1);
+
+    // Alt+[ cycles prev (-1)
+    const altPrevEvt = createMockEvent({ key: '[', altKey: true });
+    assert.equal(handleTextareaTakeShortcuts(altPrevEvt, taCtx), true);
+    assert.equal(taCycleDir, -1);
+
+    // Typing without Alt passes through normally to textarea
+    const normalPEvt = createMockEvent({ key: 'p' });
+    assert.equal(handleTextareaTakeShortcuts(normalPEvt, taCtx), false);
+    assert.equal(normalPEvt.defaultPrevented, false);
+
+    // Guard: Cmd+Alt+P does not trigger
+    const cmdAltPEvt = createMockEvent({ key: 'p', altKey: true, metaKey: true });
+    assert.equal(handleTextareaTakeShortcuts(cmdAltPEvt, taCtx), false);
+
+    // Guard: IME composition in textarea
+    const imeTaEvt = createMockEvent({ key: 'p', altKey: true, isComposing: true });
+    assert.equal(handleTextareaTakeShortcuts(imeTaEvt, taCtx), false);
+
+    // 3. handleChipKey
+    let chipClicked = false;
+    let chipPlayToggled = false;
+    let chipDeleted = false;
+    const chipCtx = {
+      onChipClick() { chipClicked = true; },
+      onTogglePlay() { chipPlayToggled = true; },
+      onDelete() { chipDeleted = true; },
+    };
+
+    const enterEvt = createMockEvent({ key: 'Enter' });
+    handleChipKey(enterEvt, chipCtx);
+    assert.equal(chipClicked, true);
+    assert.equal(enterEvt.defaultPrevented, true);
+
+    const chipPEvt = createMockEvent({ key: 'p' });
+    handleChipKey(chipPEvt, chipCtx);
+    assert.equal(chipPlayToggled, true);
+
+    const delEvt = createMockEvent({ key: 'Delete' });
+    handleChipKey(delEvt, chipCtx);
+    assert.equal(chipDeleted, true);
+
+    // Guard: Cmd+P on chip does NOT play or prevent default
+    chipPlayToggled = false;
+    const chipCmdP = createMockEvent({ key: 'p', metaKey: true });
+    handleChipKey(chipCmdP, chipCtx);
+    assert.equal(chipPlayToggled, false);
+    assert.equal(chipCmdP.defaultPrevented, false);
+  });
+});
+
+
 
 

@@ -125,14 +125,27 @@ export function assertSegmentStatus(status) {
   return normalized;
 }
 
-function isTakeOutdated(take, segment) {
+/**
+ * Checks whether a specific take's recorded text or voice differs from current segment state.
+ * Inputs: take entity, segment entity.
+ * Outputs: boolean true if take is outdated.
+ * Side effects: none.
+ * Failure modes: returns false for missing or invalid inputs.
+ * @param {object} take - SegmentTake entity.
+ * @param {object} segment - ProjectSegment entity.
+ * @returns {boolean} Whether take is outdated.
+ */
+export function isTakeOutdated(take, segment) {
+  if (!take || !segment) return false;
   const takeText = take.text ?? take.settings?.text;
-  if (typeof takeText === 'string' && takeText.trim() !== segment.text.trim()) {
+  if (typeof takeText === 'string' && takeText.trim() !== (segment.text || '').trim()) {
     return true;
   }
-  const takeVoice = take.voiceId ?? take.settings?.voiceId;
-  if (typeof takeVoice === 'string' && segment.voiceId && takeVoice !== segment.voiceId) {
-    return true;
+  const takeVoice = take.voiceId !== undefined ? take.voiceId : take.settings?.voiceId;
+  if (takeVoice !== undefined) {
+    const normTakeVoice = takeVoice || null;
+    const normSegVoice = segment.voiceId || null;
+    if (normTakeVoice !== normSegVoice) return true;
   }
   return false;
 }
@@ -453,6 +466,20 @@ function resolveTakeContext(fallbackVoiceOrContext, recordingId) {
   return fallbackVoiceOrContext && typeof fallbackVoiceOrContext === 'object' ? fallbackVoiceOrContext : {};
 }
 
+function buildTakeSettings(seg, chunk, context, voiceId) {
+  return {
+    text: seg.text,
+    voiceId,
+    seed: chunk?.seed ?? context.seed ?? null,
+    anchorVersion: context.anchorVersion ?? 1,
+    guidance: context.guidance ?? null,
+    steps: context.steps ?? null,
+    styleMode: context.styleMode ?? null,
+    customStyle: context.customStyle || '',
+    ...(context.settings || {}),
+  };
+}
+
 function buildTakeForSegment(seg, chunk, fallbackVoiceOrContext, recordingId) {
   const context = resolveTakeContext(fallbackVoiceOrContext, recordingId);
   const duration = chunk?.durationSeconds ?? chunk?.audioDurationSeconds ?? chunk?.duration ?? 1.0;
@@ -464,17 +491,7 @@ function buildTakeForSegment(seg, chunk, fallbackVoiceOrContext, recordingId) {
     audioAssetId: chunk?.audioAssetId || context.audioAssetId || null,
     duration: validDuration,
     isSelected: true,
-    settings: {
-      text: seg.text,
-      voiceId,
-      seed: chunk?.seed ?? context.seed ?? null,
-      anchorVersion: context.anchorVersion ?? 1,
-      guidance: context.guidance ?? null,
-      steps: context.steps ?? null,
-      styleMode: context.styleMode ?? null,
-      customStyle: context.customStyle || '',
-      ...(context.settings || {}),
-    },
+    settings: buildTakeSettings(seg, chunk, context, voiceId),
     blob: chunk?.blob || context.blob || null,
     audioUrl: chunk?.audioUrl || context.audioUrl || null,
   });
@@ -557,7 +574,8 @@ export function selectSegmentTake(segment, takeId) {
   const exists = segment.takes.some(t => t.id === takeId);
   if (!exists) return segment;
   const takes = segment.takes.map(t => (t.id === takeId ? { ...t, isSelected: true } : { ...t, isSelected: false }));
-  return createEditableSegment({ ...segment, takes, status: 'ready' });
+  const candidate = { ...segment, takes };
+  return createEditableSegment({ ...candidate, status: computeSegmentStatus(candidate) });
 }
 
 /**
@@ -581,7 +599,8 @@ export function removeSegmentTake(segment, takeId) {
   const takes = hasSelected
     ? remaining
     : remaining.map((t, idx) => (idx === remaining.length - 1 ? { ...t, isSelected: true } : t));
-  return createEditableSegment({ ...segment, takes, status: 'ready' });
+  const candidate = { ...segment, takes };
+  return createEditableSegment({ ...candidate, status: computeSegmentStatus(candidate) });
 }
 
 /**
@@ -633,6 +652,47 @@ export function removeSegmentTakeInList(segments, segmentId, takeId) {
     return Array.isArray(segments) ? [...segments] : [];
   }
   return segments.map(seg => (seg.id === segmentId ? removeSegmentTake(seg, takeId) : seg));
+}
+
+/**
+ * Cycles the selected take of a segment forward (+1) or backward (-1).
+ * Inputs: segment entity, optional direction (+1 or -1).
+ * Outputs: updated ProjectSegment entity with new active take.
+ * Side effects: none.
+ * Failure modes: returns segment unchanged if takes array has 0 or 1 items.
+ * @param {object} segment - Segment entity.
+ * @param {number} [direction=1] - Cycle direction step.
+ * @returns {object} Updated segment entity.
+ */
+export function cycleSegmentTake(segment, direction = 1) {
+  if (!segment || !Array.isArray(segment.takes) || segment.takes.length <= 1) {
+    return segment;
+  }
+  const takes = segment.takes;
+  const currentIndex = takes.findIndex(t => t.isSelected);
+  const baseIndex = currentIndex >= 0 ? currentIndex : takes.length - 1;
+  const numDir = Number.isFinite(direction) ? Math.trunc(direction) : 1;
+  const step = numDir % takes.length;
+  const nextIndex = (baseIndex + step + takes.length) % takes.length;
+  return selectSegmentTake(segment, takes[nextIndex].id);
+}
+
+/**
+ * Cycles the selected take for a specific segment in a segments list.
+ * Inputs: segments array, segmentId, optional direction.
+ * Outputs: new array of segments with cycled take.
+ * Side effects: none.
+ * Failure modes: returns copy of segments if segmentId is not found.
+ * @param {object[]} segments - Segments array.
+ * @param {string} segmentId - Target segment ID.
+ * @param {number} [direction=1] - Step direction (+1 or -1).
+ * @returns {object[]} New array of segments.
+ */
+export function cycleSegmentTakeInList(segments, segmentId, direction = 1) {
+  if (!Array.isArray(segments) || !segmentId) {
+    return Array.isArray(segments) ? [...segments] : [];
+  }
+  return segments.map(seg => (seg.id === segmentId ? cycleSegmentTake(seg, direction) : seg));
 }
 
 /**

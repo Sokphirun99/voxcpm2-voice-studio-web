@@ -4465,6 +4465,36 @@ a {
   color: var(--action-text, #fff);
 }
 
+.segment-take-outdated-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(234, 179, 8, 0.2);
+  color: #eab308;
+  border: 1px solid rgba(234, 179, 8, 0.35);
+}
+
+.segment-take-chip.is-outdated {
+  border-style: dashed;
+}
+
+.segment-take-chip.is-playing {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.segment-card.is-playing {
+  border-color: var(--accent);
+}
+
+.segment-duration-badge.is-playing {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .segment-take-play-btn,
 .segment-take-delete-btn {
   width: 20px;

@@ -44,6 +44,9 @@ import {
   assignSegmentVoiceInList,
   isMultiSpeakerScript,
   getScriptVoiceIds,
+  isTakeOutdated,
+  cycleSegmentTake,
+  cycleSegmentTakeInList,
 } from '../../src/domain/projectSegments.js';
 
 test('Khmer grapheme integrity: splitGraphemeClusters preserves complex clusters without corruption', () => {
@@ -921,6 +924,160 @@ test('getScriptVoiceIds: returns unique voice IDs in order of segment appearance
   assert.deepEqual(getScriptVoiceIds([]), []);
   assert.deepEqual(getScriptVoiceIds(null), []);
 });
+
+test('isTakeOutdated: flags outdated take when text or voice changed, returns false when identical', () => {
+  const take1 = createSegmentTake({
+    id: 'take-1',
+    duration: 1.2,
+    isSelected: true,
+    settings: { text: 'សួស្តី', voiceId: 'char-1' },
+  });
+  const segCurrent = createEditableSegment({
+    id: 'seg-1',
+    text: 'សួស្តី',
+    voiceId: 'char-1',
+    takes: [take1],
+  });
+
+  // Up to date
+  assert.equal(isTakeOutdated(take1, segCurrent), false);
+
+  // Text differs
+  const segTextEdited = createEditableSegment({
+    id: 'seg-1',
+    text: 'សួស្តីលោកគ្រូ',
+    voiceId: 'char-1',
+    takes: [take1],
+  });
+  assert.equal(isTakeOutdated(take1, segTextEdited), true);
+
+  // Voice differs
+  const segVoiceEdited = createEditableSegment({
+    id: 'seg-1',
+    text: 'សួស្តី',
+    voiceId: 'char-2',
+    takes: [take1],
+  });
+  assert.equal(isTakeOutdated(take1, segVoiceEdited), true);
+
+  // Fallback checks on take.text / take.voiceId directly
+  const takeDirect = { id: 't2', text: 'ចាស់', voiceId: 'v1' };
+  assert.equal(isTakeOutdated(takeDirect, { text: 'ថ្មី', voiceId: 'v1' }), true);
+  assert.equal(isTakeOutdated(takeDirect, { text: 'ចាស់', voiceId: 'v2' }), true);
+  assert.equal(isTakeOutdated(takeDirect, { text: 'ចាស់', voiceId: 'v1' }), false);
+
+  // Voice reset to default (null) or set from null to custom voice
+  const takeWithVoice = createSegmentTake({ id: 't-v', settings: { text: 'សួស្តី', voiceId: 'char-1' } });
+  const segVoiceReset = createEditableSegment({ id: 'seg-reset', text: 'សួស្តី', voiceId: null, takes: [takeWithVoice] });
+  assert.equal(isTakeOutdated(takeWithVoice, segVoiceReset), true, 'Take should be outdated when segment voice reset to null');
+
+  const takeWithDefaultVoice = createSegmentTake({ id: 't-def', settings: { text: 'សួស្តី', voiceId: null } });
+  const segVoiceAssigned = createEditableSegment({ id: 'seg-assigned', text: 'សួស្តី', voiceId: 'char-2', takes: [takeWithDefaultVoice] });
+  assert.equal(isTakeOutdated(takeWithDefaultVoice, segVoiceAssigned), true, 'Take should be outdated when segment assigned custom voice');
+
+  const segVoiceBothNull = createEditableSegment({ id: 'seg-null', text: 'សួស្តី', voiceId: null, takes: [takeWithDefaultVoice] });
+  assert.equal(isTakeOutdated(takeWithDefaultVoice, segVoiceBothNull), false, 'Take should not be outdated when both voiceIds are null');
+
+  // Edge cases: null/undefined
+  assert.equal(isTakeOutdated(null, segCurrent), false);
+  assert.equal(isTakeOutdated(take1, null), false);
+});
+
+test('cycleSegmentTake: cycles active take forward and backward with wrapping (R2-09)', () => {
+  const take1 = createSegmentTake({ id: 't-1', duration: 1.0, isSelected: true });
+  const take2 = createSegmentTake({ id: 't-2', duration: 1.5, isSelected: false });
+  const take3 = createSegmentTake({ id: 't-3', duration: 2.0, isSelected: false });
+
+  const seg3Takes = createEditableSegment({
+    id: 's-multi',
+    text: 'អត្ថបទ',
+    takes: [take1, take2, take3],
+  });
+
+  // Forward (+1): t-1 -> t-2
+  const stepped1 = cycleSegmentTake(seg3Takes, 1);
+  assert.equal(getSegmentActiveTake(stepped1).id, 't-2');
+
+  // Forward (+1) again: t-2 -> t-3
+  const stepped2 = cycleSegmentTake(stepped1, 1);
+  assert.equal(getSegmentActiveTake(stepped2).id, 't-3');
+
+  // Forward (+1) wraps: t-3 -> t-1
+  const stepped3 = cycleSegmentTake(stepped2, 1);
+  assert.equal(getSegmentActiveTake(stepped3).id, 't-1');
+
+  // Backward (-1): t-1 -> t-3
+  const steppedBack = cycleSegmentTake(seg3Takes, -1);
+  assert.equal(getSegmentActiveTake(steppedBack).id, 't-3');
+
+  // Large negative steps wrap safely without negative index crashes
+  // -4 on length 3 from index 0: (0 + (-4 % 3) + 3) % 3 = (0 - 1 + 3) % 3 = 2 -> t-3
+  assert.equal(getSegmentActiveTake(cycleSegmentTake(seg3Takes, -4)).id, 't-3');
+  // -5 on length 3 from index 0: (0 + (-5 % 3) + 3) % 3 = (0 - 2 + 3) % 3 = 1 -> t-2
+  assert.equal(getSegmentActiveTake(cycleSegmentTake(seg3Takes, -5)).id, 't-2');
+  // -10 on length 3 from index 0: -10 % 3 = -1 -> (0 - 1 + 3) % 3 = 2 -> t-3
+  assert.equal(getSegmentActiveTake(cycleSegmentTake(seg3Takes, -10)).id, 't-3');
+
+  // Single take segment returns unchanged
+  const segSingle = createEditableSegment({ id: 's-single', text: 'តែមួយ', takes: [take1] });
+  assert.equal(cycleSegmentTake(segSingle, 1), segSingle);
+
+  // Edge cases
+  assert.equal(cycleSegmentTake(null, 1), null);
+});
+
+test('cycleSegmentTakeInList: updates target segment and leaves others untouched (R2-09)', () => {
+  const takeA1 = createSegmentTake({ id: 'ta-1', isSelected: true });
+  const takeA2 = createSegmentTake({ id: 'ta-2', isSelected: false });
+  const segA = createEditableSegment({ id: 's-a', text: 'Seg A', takes: [takeA1, takeA2] });
+
+  const takeB1 = createSegmentTake({ id: 'tb-1', isSelected: true });
+  const segB = createEditableSegment({ id: 's-b', text: 'Seg B', takes: [takeB1] });
+
+  const list = [segA, segB];
+  const cycledList = cycleSegmentTakeInList(list, 's-a', 1);
+
+  assert.equal(getSegmentActiveTake(cycledList[0]).id, 'ta-2');
+  assert.equal(cycledList[1], segB);
+
+  // Non-matching segmentId returns shallow copy
+  assert.deepEqual(cycleSegmentTakeInList(list, 'nonexistent', 1), list);
+  assert.deepEqual(cycleSegmentTakeInList(null, 's-a', 1), []);
+});
+
+test('selectSegmentTake and removeSegmentTake: compute segment status dynamically (R2-10)', () => {
+  const takeOld = createSegmentTake({ id: 'take-old', settings: { text: 'អត្ថបទចាស់', voiceId: 'char-1' }, isSelected: false });
+  const takeCurrent = createSegmentTake({ id: 'take-curr', settings: { text: 'អត្ថបទថ្មី', voiceId: 'char-1' }, isSelected: true });
+
+  const segment = createEditableSegment({
+    id: 'seg-10',
+    text: 'អត្ថបទថ្មី',
+    voiceId: 'char-1',
+    takes: [takeOld, takeCurrent],
+  });
+
+  // Currently takeCurrent is selected, status is ready
+  assert.equal(segment.status, 'ready');
+
+  // Switch to takeOld: takeOld has text 'អត្ថបទចាស់' which does NOT match 'អត្ថបទថ្មី'
+  const switchedToOld = selectSegmentTake(segment, 'take-old');
+  assert.equal(switchedToOld.status, 'outdated', 'Status should be outdated when selecting an outdated take');
+
+  // Switch back to takeCurrent: matches current text
+  const switchedBack = selectSegmentTake(switchedToOld, 'take-curr');
+  assert.equal(switchedBack.status, 'ready', 'Status should return to ready when selecting an up-to-date take');
+
+  // Remove the current take: only takeOld remains, so status must be outdated
+  const removedCurrent = removeSegmentTake(switchedBack, 'take-curr');
+  assert.equal(removedCurrent.takes.length, 1);
+  assert.equal(removedCurrent.status, 'outdated', 'Status should be outdated when only outdated take remains');
+
+  // Remove the remaining take: 0 takes left, status must be draft
+  const removedAll = removeSegmentTake(removedCurrent, 'take-old');
+  assert.equal(removedAll.takes.length, 0);
+  assert.equal(removedAll.status, 'draft', 'Status should be draft when all takes are deleted');
+});
+
 
 
 

@@ -403,15 +403,19 @@ function reportAudioElementError({ event, url, logger, setMedia, onPlaybackError
  * @param {{ audioRef: React.RefObject<HTMLAudioElement|null>, url: string|null, logger: import('../../domain/ports.js').LoggerPort, setMedia: Function, onPlaybackError: () => void }} props - Media element props.
  * @returns {React.ReactElement} Keyed `<audio>` element.
  */
-function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError }) {
+function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError, onPlay }) {
   const syncDuration = event => syncAudioDurationFromEvent(event, setMedia);
   const syncSeconds = event => syncAudioSecondsFromEvent(event, setMedia);
   const handleError = event => reportAudioElementError({ event, url, logger, setMedia, onPlaybackError });
+  const handlePlay = () => {
+    setMedia(previous => ({ ...previous, playing: true }));
+    onPlay?.();
+  };
   return (
     <audio key={url || 'empty'} id="audio" ref={audioRef} src={url || undefined} preload="auto"
       onLoadedMetadata={syncDuration} onDurationChange={syncDuration} onLoadedData={syncDuration} onCanPlay={syncDuration}
       onTimeUpdate={syncSeconds}
-      onPlay={() => setMedia(previous => ({ ...previous, playing: true }))}
+      onPlay={handlePlay}
       onPause={() => setMedia(previous => ({ ...previous, playing: false }))}
       onEnded={() => setMedia(previous => ({ ...previous, playing: false, seconds: 0 }))}
       onError={handleError} />
@@ -420,14 +424,14 @@ function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError
 
 /**
  * Renders the playback dock with status line, play/pause toggle, waveform scrubber, take A/B pills, character lock, and WAV download.
- * Inputs: `{ recording, takes, activeTakeId, activeCharacter, activeAnchor, status, onPinTake, onSelectTake, onDeleteTake, onPlaybackError }`.
+ * Inputs: `{ recording, takes, activeTakeId, activeCharacter, activeAnchor, status, onPinTake, onSelectTake, onDeleteTake, onPlaybackError, onAudioPlay }`.
  * Outputs: `<section className="playback">` element.
  * Side effects: mounts a fresh `<audio>` per recording URL, tracks playback timing, and delegates decoding to `useRecordingMedia`.
  * Failure modes: calls `onPlaybackError` if `<audio>` fails to load or `play()` rejects.
  * @param {object} props - Player props.
  * @returns {React.ReactElement} Audio player dock.
  */
-export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError }) {
+export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError, onAudioPlay }) {
   const { logger } = useStudioServices();
   const audio = useRef(null);
   const [media, setMedia] = useRecordingMedia(recording);
@@ -450,7 +454,7 @@ export function AudioPlayer({ recording, takes = [], activeTakeId = null, active
       <TakeHistoryPills takes={takes} activeTakeId={activeTakeId || recording?.id || null}
         onSelectTake={onSelectTake} onDeleteTake={onDeleteTake} />
       <SpeechVerificationPanel verification={verification} />
-      <PlaybackAudioElement audioRef={audio} url={media.url} logger={logger} setMedia={setMedia} onPlaybackError={onPlaybackError} />
+      <PlaybackAudioElement audioRef={audio} url={media.url} logger={logger} setMedia={setMedia} onPlaybackError={onPlaybackError} onPlay={onAudioPlay} />
     </section>
   );
 }

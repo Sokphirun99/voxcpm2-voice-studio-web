@@ -33,21 +33,43 @@ export async function persistTakeAsset({ assetRepository, blob, segmentId, seed,
 }
 
 /**
+ * Safely creates an object URL for a candidate Blob, returning null on failure.
+ * Inputs: candidate blob, optional logger.
+ * Outputs: string URL or null.
+ * Side effects: allocates object URL when successful.
+ * Failure modes: returns null and logs debug info if createObjectURL throws.
+ * @param {unknown} blob - Candidate audio blob.
+ * @param {object|null} [logger=null] - Optional logger.
+ * @returns {string|null} Object URL or null.
+ */
+function tryCreateBlobUrl(blob, logger = null) {
+  if (!blob || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+    return null;
+  }
+  try {
+    return URL.createObjectURL(blob);
+  } catch (error) {
+    logger?.debug?.('takeAssetStorage.tryCreateBlobUrl', error);
+    return null;
+  }
+}
+
+/**
  * Resolves a playable audio URL for a take from memory or durable asset storage.
- * Inputs: take entity, optional baseUrl.
+ * Inputs: take entity, optional baseUrl, optional logger.
  * Outputs: string audio URL or null.
  * Side effects: none.
  * Failure modes: returns null for missing take or unresolvable audio.
  * @param {object} take - SegmentTake entity.
  * @param {string} [baseUrl='/api/v1'] - Storage API base URL.
+ * @param {object|null} [logger=null] - Optional logger for debugging.
  * @returns {string|null} Audio URL or null.
  */
-export function resolveTakeAudioUrl(take, baseUrl = DEFAULT_API_BASE) {
+export function resolveTakeAudioUrl(take, baseUrl = DEFAULT_API_BASE, logger = null) {
   if (!take) return null;
   if (typeof take.audioUrl === 'string' && take.audioUrl) return take.audioUrl;
-  if (take.blob && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
-    return URL.createObjectURL(take.blob);
-  }
+  const blobUrl = tryCreateBlobUrl(take.blob, logger);
+  if (blobUrl) return blobUrl;
   if (take.audioAssetId) {
     return `${baseUrl}/assets/${encodeURIComponent(take.audioAssetId)}/binary`;
   }
