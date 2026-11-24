@@ -312,3 +312,5 @@ export async function assembleAudioNarration(params) {
   const recording = createAssembledRecording({ combinedBlob: finalBlob, duration, entries, character, mastered, filename });
   return { recording, blob: finalBlob, filename };
 }
+
+export { assembleTimelineAlignedVoiceover } from './subtitleTts.js';

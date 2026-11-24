@@ -23,6 +23,23 @@ function resolveTrackClickTime(event, trackEl, totalDuration) {
   return ratio * totalDuration;
 }
 
+function CueVoiceTimingPill({ interval }) {
+  if (!interval?.hasVoiceClip || !interval.clipDuration) return null;
+  if (interval.isClipOverflowing) {
+    return (
+      <span className="subtitle-timeline-voice-timing is-overflow" title="Voice duration exceeds cue interval">
+        Speech: {interval.clipDuration.toFixed(2)}s (+{interval.overflowDuration.toFixed(2)}s)
+      </span>
+    );
+  }
+  const silence = interval.trailingSilenceDuration > 0 ? ` · Silence: ${interval.trailingSilenceDuration.toFixed(2)}s` : '';
+  return (
+    <span className="subtitle-timeline-voice-timing">
+      Speech: {interval.clipDuration.toFixed(2)}s{silence}
+    </span>
+  );
+}
+
 function CueBadgeTiming({ activeInterval }) {
   if (!activeInterval) return null;
   const cueLabel = `Cue #${activeInterval.index + 1}`;
@@ -34,12 +51,9 @@ function CueBadgeTiming({ activeInterval }) {
       <span className="subtitle-speaker-dot" aria-hidden="true" />
       <strong className="subtitle-timeline-cue-title">{cueLabel}</strong>
       <span className="subtitle-timeline-cue-time">{cueTime}</span>
+      <CueVoiceTimingPill interval={activeInterval} />
       {activeInterval.hasOverlap && <span className="subtitle-timeline-overlap-pill">Overlap</span>}
-      {issuePill && (
-        <span className={`subtitle-timeline-issue-pill is-${issuePill.toLowerCase()}`}>
-          {issuePill}
-        </span>
-      )}
+      {issuePill && <span className={`subtitle-timeline-issue-pill is-${issuePill.toLowerCase()}`}>{issuePill}</span>}
     </div>
   );
 }
@@ -82,7 +96,16 @@ function TimelineClockHeader({
 
 function buildCueTitle(interval) {
   const time = `${formatTimelineClock(interval.start, false)} - ${formatTimelineClock(interval.end, false)}`;
-  const voice = interval.hasVoiceClip ? ' · Voice generated' : '';
+  let voice = '';
+  if (interval.hasVoiceClip) {
+    if (interval.isClipOverflowing) {
+      voice = ` · Voice: ${interval.clipDuration.toFixed(2)}s (+${interval.overflowDuration.toFixed(2)}s overflow)`;
+    } else if (interval.trailingSilenceDuration > 0) {
+      voice = ` · Voice: ${interval.clipDuration.toFixed(2)}s · Silence: ${interval.trailingSilenceDuration.toFixed(2)}s`;
+    } else {
+      voice = ` · Voice: ${interval.clipDuration.toFixed(2)}s`;
+    }
+  }
   const overlap = interval.hasOverlap ? ' · Overlaps neighbor' : '';
   const validation = interval.issueCount ? ` · ${interval.issueCount} issue(s)` : '';
   return `Cue #${interval.index + 1} (${time})${voice}${overlap}${validation}`;
@@ -93,6 +116,7 @@ function TimelineIntervalCue({ interval, onClick }) {
     'subtitle-timeline-cue',
     interval.isActive ? 'is-active' : '',
     interval.hasVoiceClip ? 'has-voice' : '',
+    interval.isClipOverflowing ? 'is-speech-overflow' : '',
     interval.hasOverlap ? 'has-overlap' : '',
     interval.hasError ? 'has-error' : '',
     interval.hasWarning ? 'has-warning' : '',
@@ -111,6 +135,13 @@ function TimelineIntervalCue({ interval, onClick }) {
         onClick(interval);
       }}
     >
+      {interval.hasVoiceClip && interval.speechPercent > 0 && (
+        <span
+          className="subtitle-timeline-cue-speech"
+          style={{ width: `${Math.min(100, interval.speechPercent)}%` }}
+          aria-hidden="true"
+        />
+      )}
       <span className="subtitle-timeline-cue-label">#{interval.index + 1}</span>
       {interval.hasVoiceClip && <Icon name="waveform" className="subtitle-timeline-cue-wave" />}
     </button>

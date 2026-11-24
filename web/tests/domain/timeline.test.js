@@ -98,6 +98,11 @@ test('computeTimelineIntervals calculates exact percentages, speaker color, acti
   assert.equal(intervals[0].widthPercent, 10);
   assert.equal(intervals[0].isActive, true);
   assert.equal(intervals[0].hasVoiceClip, true);
+  assert.equal(intervals[0].clipDuration, 4.2);
+  assert.equal(intervals[0].speechPercent, 42);
+  assert.equal(intervals[0].trailingSilenceDuration, 5.8);
+  assert.equal(intervals[0].isClipOverflowing, false);
+  assert.equal(intervals[0].overflowDuration, 0);
   assert.ok(intervals[0].speakerColor);
   assert.equal(intervals[0].text, 'ជំរាបសួរ');
 
@@ -159,4 +164,23 @@ test('computeTimelineIntervals attaches validation error and warning flags from 
   assert.equal(intervals[1].hasError, false);
   assert.equal(intervals[1].hasWarning, true);
   assert.equal(intervals[1].issueCount, 1);
+});
+
+test('computeTimelineIntervals detects speech clip overflow when voice exceeds cue duration', () => {
+  const segments = [
+    { id: 'cue-1', start: 1.0, end: 4.0, speakerId: 'speaker-1' },
+  ];
+  const segmentClips = {
+    'cue-1': { url: 'blob:audio/1', durationSeconds: 5.2 },
+  };
+  const intervals = computeTimelineIntervals({
+    segments,
+    totalDuration: 10,
+    segmentClips,
+  });
+  assert.equal(intervals[0].clipDuration, 5.2);
+  assert.equal(intervals[0].isClipOverflowing, true);
+  assert.equal(intervals[0].overflowDuration, 2.2);
+  assert.equal(intervals[0].trailingSilenceDuration, 0);
+  assert.equal(intervals[0].speechPercent, 100);
 });

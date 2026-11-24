@@ -2,7 +2,7 @@
  * @fileoverview Selection toolbar and bottom combined voiceover player for generating VoxCPM2 speech directly from subtitle frames.
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import { Blocks } from 'loading-dev';
 import { formatTime } from '../../domain/audioValidation.js';
 import {
@@ -179,9 +179,100 @@ function SubtitleDubExportBar({ dubAudioMode, dubBusy, disabled, disabledReason,
   );
 }
 
+function SubtitleVoiceModeToggle({ mode, onChangeMode }) {
+  return (
+    <div className="subtitle-voice-mode-toggle" role="group" aria-label="Playback mode">
+      <button
+        type="button"
+        id="subtitle-mode-aligned-btn"
+        className={mode === 'aligned' ? 'subtitle-voice-mode-tab is-active' : 'subtitle-voice-mode-tab'}
+        aria-pressed={mode === 'aligned'}
+        onClick={() => onChangeMode('aligned')}
+      >
+        Time-aligned dub
+      </button>
+      <button
+        type="button"
+        id="subtitle-mode-sequential-btn"
+        className={mode === 'sequential' ? 'subtitle-voice-mode-tab is-active' : 'subtitle-voice-mode-tab'}
+        aria-pressed={mode === 'sequential'}
+        onClick={() => onChangeMode('sequential')}
+      >
+        Sequential voice
+      </button>
+    </div>
+  );
+}
+
+function formatVoiceHeaderMeta(activeClip) {
+  const durationLabel = activeClip.durationSeconds ? formatTime(activeClip.durationSeconds) : '';
+  const gapLabel = activeClip.count >= 2 && activeClip.pauseGapMs != null
+    ? `${formatSubtitleVoiceoverGapLabel(activeClip.pauseGapMs)} gap` : '';
+  return [activeClip.characterName, durationLabel, gapLabel].filter(Boolean).join(' · ');
+}
+
+function SubtitleVoiceHeaderCopy({ activeClip }) {
+  const frameWord = activeClip.count === 1 ? 'frame' : 'frames';
+  const scope = activeClip.scope === 'selected' ? 'Selected voiceover' : 'Generated voiceover';
+  const scopeLabel = `${scope} · ${activeClip.count} ${frameWord}`;
+  const metaLabel = formatVoiceHeaderMeta(activeClip);
+  const warnTitle = activeClip.warnings?.map(w => w.message).join('\n') || '';
+  return (
+    <div className="subtitle-voice-output-copy">
+      <strong><Icon name="waveform" /><span>{scopeLabel}</span></strong>
+      {metaLabel && <span>{metaLabel}</span>}
+      {activeClip.warnings?.length > 0 && (
+        <span className="subtitle-voice-warn-pill" title={warnTitle}>
+          {activeClip.warnings.length} clamped to fit
+        </span>
+      )}
+    </div>
+  );
+}
+
+function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAligned, hasAligned }) {
+  return (
+    <div className="subtitle-voice-download-group">
+      <button
+        type="button"
+        id="subtitle-download-voice-btn"
+        className="button button-secondary subtitle-voice-btn"
+        disabled={busy || dubBusy}
+        onClick={onDownload}
+      >
+        <Icon name="arrow_down_to_line" />
+        <span>Download voice (.wav)</span>
+      </button>
+      {hasAligned && onDownloadAligned && (
+        <button
+          type="button"
+          id="subtitle-download-aligned-voice-btn"
+          className="button button-primary subtitle-voice-btn"
+          disabled={busy || dubBusy}
+          title="Export synchronized time-aligned WAV ready for video editors"
+          onClick={onDownloadAligned}
+        >
+          <Icon name="waveform" />
+          <span>Time-aligned dub WAV</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SubtitleVoiceCardHeader({ activeClip, hasAligned, mode, onChangeMode, actionsProps }) {
+  return (
+    <div className="subtitle-voice-output-head">
+      <SubtitleVoiceHeaderCopy activeClip={activeClip} />
+      {hasAligned && <SubtitleVoiceModeToggle mode={mode} onChangeMode={onChangeMode} />}
+      <SubtitleVoiceDownloadActions {...actionsProps} hasAligned={hasAligned} />
+    </div>
+  );
+}
+
 /**
  * Renders the combined generated voiceover audio player, WAV download bar, and dubbed MP4 export controls directly below the subtitle list.
- * Inputs: `{ combinedClip, busy, dubAudioMode, dubBusy, canExportDub, isAudioOnly, hasJobId, onDownload, onChangeDubAudioMode, onExportDub }`.
+ * Inputs: `{ combinedClip, alignedClip, busy, dubAudioMode, dubBusy, canExportDub, isAudioOnly, hasJobId, onDownload, onDownloadAligned, onChangeDubAudioMode, onExportDub }`.
  * Outputs: `<section id="subtitle-voice-output">` or null when no voice clips exist yet.
  * Side effects: plays audio via native HTML5 `<audio>`, downloads `.wav`, or exports time-aligned dubbed `.mp4`.
  * Failure modes: returns null cleanly before any frame voice is generated; disables dubbing for audio-only or missing `jobId`.
@@ -190,6 +281,7 @@ function SubtitleDubExportBar({ dubAudioMode, dubBusy, disabled, disabledReason,
  */
 export function SubtitleVoiceOutputCard({
   combinedClip,
+  alignedClip = null,
   busy = false,
   dubAudioMode = DEFAULT_DUB_AUDIO_MODE,
   dubBusy = false,
@@ -197,39 +289,29 @@ export function SubtitleVoiceOutputCard({
   isAudioOnly = false,
   hasJobId = false,
   onDownload,
+  onDownloadAligned,
   onChangeDubAudioMode,
   onExportDub,
 }) {
-  if (!combinedClip?.url) return null;
-  const frameWord = combinedClip.count === 1 ? 'frame' : 'frames';
-  const scopeLabel = combinedClip.scope === 'selected' ? `Selected voiceover · ${combinedClip.count} ${frameWord}` : `Generated voiceover · ${combinedClip.count} ${frameWord}`;
-  const durationLabel = combinedClip.durationSeconds ? formatTime(combinedClip.durationSeconds) : '';
-  const gapLabel = combinedClip.count >= 2 && combinedClip.pauseGapMs != null
-    ? `${formatSubtitleVoiceoverGapLabel(combinedClip.pauseGapMs)} gap`
-    : '';
-  const metaParts = [combinedClip.characterName, durationLabel, gapLabel].filter(Boolean).join(' · ');
+  const [mode, setMode] = useState('sequential');
+  const hasCombined = Boolean(combinedClip?.url);
+  const hasAligned = Boolean(alignedClip?.url);
+  const effectiveMode = (mode === 'aligned' && hasAligned) || (!hasCombined && hasAligned) ? 'aligned' : 'sequential';
+  const activeClip = effectiveMode === 'aligned' ? alignedClip : combinedClip;
+  if (!activeClip?.url) return null;
   const dubDisabled = busy || dubBusy || !canExportDub;
   const dubDisabledReason = !canExportDub ? resolveDubDisabledReason({ isAudioOnly, hasJobId }) : undefined;
 
   return (
     <section id="subtitle-voice-output" className="subtitle-voice-output" aria-label="Generated subtitle voiceover">
-      <div className="subtitle-voice-output-head">
-        <div className="subtitle-voice-output-copy">
-          <strong><Icon name="waveform" /><span>{scopeLabel}</span></strong>
-          {metaParts ? <span>{metaParts}</span> : null}
-        </div>
-        <button
-          type="button"
-          id="subtitle-download-voice-btn"
-          className="button button-secondary subtitle-voice-btn"
-          disabled={busy || dubBusy}
-          onClick={onDownload}
-        >
-          <Icon name="arrow_down_to_line" />
-          <span>Download voice (.wav)</span>
-        </button>
-      </div>
-      <audio controls className="subtitle-voice-audio" src={combinedClip.url} preload="metadata" />
+      <SubtitleVoiceCardHeader
+        activeClip={activeClip}
+        hasAligned={hasAligned}
+        mode={effectiveMode}
+        onChangeMode={setMode}
+        actionsProps={{ busy, dubBusy, onDownload, onDownloadAligned }}
+      />
+      <audio key={activeClip.url} controls className="subtitle-voice-audio" src={activeClip.url} preload="metadata" />
       <SubtitleDubExportBar
         dubAudioMode={dubAudioMode}
         dubBusy={dubBusy}

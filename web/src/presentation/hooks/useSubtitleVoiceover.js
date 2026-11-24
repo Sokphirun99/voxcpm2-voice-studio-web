@@ -6,12 +6,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
 import {
   DEFAULT_DUB_AUDIO_MODE,
+  DEFAULT_TIME_ALIGNED_SUFFIX,
   SUBTITLE_VOICEOVER_PAUSE_MS,
+  assembleTimelineAlignedVoiceover,
   buildCombinedVoiceoverBlob,
   buildDubDownloadFilename,
   buildDubExportClips,
   buildSubtitleSpeechSignature,
   buildSubtitleSynthesisCommand,
+  buildTimeAlignedDubDownloadFilename,
   buildVoiceoverDownloadFilename,
   normalizeDubAudioMode,
   normalizeSubtitleVoiceoverGapMs,
@@ -216,6 +219,56 @@ function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseG
   return { combinedClip, clearCombined: () => replaceCombined(null) };
 }
 
+async function runTrackAlignment({ matched, segmentClips, totalDuration, audioMaster, scope, clips }) {
+  const targetIds = matched.map(seg => seg.id);
+  const res = await assembleTimelineAlignedVoiceover({
+    segments: matched,
+    segmentClips,
+    totalDuration,
+    audioMaster,
+    selectedIds: scope === 'selected' ? targetIds : null,
+  });
+  if (!res?.blob) return null;
+  return {
+    blob: res.blob,
+    count: res.clipCount,
+    scope,
+    durationSeconds: res.duration,
+    warnings: res.warnings || [],
+    segmentIds: targetIds,
+    characterName: resolveCombinedVoiceLabel(clips),
+  };
+}
+
+function useAlignedVoiceoverState({ segments, selectedIds, segmentClips, totalDuration, audioMaster, logger }) {
+  const [alignedClip, setAlignedClip] = useState(null);
+  const urlRef = useRef('');
+  const seqRef = useRef(0);
+  const replace = useCallback(next => {
+    revokeBlobUrl(urlRef.current);
+    urlRef.current = next?.url || '';
+    setAlignedClip(next);
+  }, []);
+  useEffect(() => () => { revokeBlobUrl(urlRef.current); urlRef.current = ''; }, []);
+  useEffect(() => {
+    const seq = ++seqRef.current;
+    const { scope, matched } = collectCombinedTargetClips(segments, selectedIds, segmentClips);
+    if (!matched.length) { replace(null); return; }
+    const clips = matched.map(seg => segmentClips[seg.id]);
+    runTrackAlignment({ matched, segmentClips, totalDuration, audioMaster, scope, clips })
+      .then(res => {
+        if (seq !== seqRef.current || !res) return;
+        replace({ ...res, url: createBlobUrl(res.blob) });
+      })
+      .catch(err => {
+        if (seq !== seqRef.current) return;
+        logger?.warn?.('useSubtitleVoiceover.align', err?.message || 'Could not align WAV');
+        replace(null);
+      });
+  }, [segments, selectedIds, segmentClips, totalDuration, audioMaster, replace, logger]);
+  return { alignedClip, clearAligned: () => replace(null) };
+}
+
 function useVoiceSelectionState(segments) {
   const [selectedIds, setSelectedIds] = useState([]);
 
@@ -416,12 +469,14 @@ export function useSubtitleVoiceover({
   jobId = '',
   isAudioOnly = false,
   voiceCatalog = null,
+  mediaDuration = 0,
+  totalDuration = 0,
   onStatus,
   onNotify,
   onUnlockSound,
   onEngineFailure,
 } = {}) {
-  const { synthesizeSpeech, mediaSubtitleGateway, logger } = useStudioServices();
+  const { synthesizeSpeech, mediaSubtitleGateway, audioMaster, logger } = useStudioServices();
   const characters = useMemo(
     () => (voiceCatalog?.characters?.length ? voiceCatalog.characters : BUILT_IN_VOICES),
     [voiceCatalog?.characters]
@@ -434,6 +489,7 @@ export function useSubtitleVoiceover({
   const activeCharacter = useMemo(() => findCharacterById(characters, selectedVoiceId), [characters, selectedVoiceId]);
   const activeAnchor = anchors[activeCharacter.id] || null;
   const anchorTag = buildAnchorTag(activeAnchor);
+  const effectiveTotalDuration = totalDuration || mediaDuration || 0;
 
   const [segmentClips, setSegmentClips] = useState({});
   const [pauseGapMs, setPauseGapMsState] = useState(SUBTITLE_VOICEOVER_PAUSE_MS);
@@ -461,6 +517,14 @@ export function useSubtitleVoiceover({
   const { selectedIds, toggleSelectSegment, toggleSelectAll, clearSelection } = useVoiceSelectionState(segments);
   const { togglePlaySegment, stopPlayback } = useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, logger });
   const { combinedClip, clearCombined } = useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseGapMs, logger });
+  const { alignedClip, clearAligned } = useAlignedVoiceoverState({
+    segments,
+    selectedIds,
+    segmentClips,
+    totalDuration: effectiveTotalDuration,
+    audioMaster,
+    logger,
+  });
 
   const storeClip = useCallback((segId, clip) => {
     const prevUrl = clipUrlsRef.current.get(segId);
@@ -488,10 +552,11 @@ export function useSubtitleVoiceover({
     stopPlayback();
     clearSelection();
     clearCombined();
+    clearAligned();
     for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
     clipUrlsRef.current.clear();
     setSegmentClips({});
-  }, [stopPlayback, clearSelection, clearCombined]);
+  }, [stopPlayback, clearSelection, clearCombined, clearAligned]);
 
   useEffect(() => {
     const validIds = new Set((segments || []).map(seg => seg.id));
@@ -545,6 +610,12 @@ export function useSubtitleVoiceover({
     triggerFileDownload(combinedClip.blob, buildVoiceoverDownloadFilename(videoFile, suffix));
   }, [combinedClip, videoFile]);
 
+  const downloadAlignedVoice = useCallback(() => {
+    if (!alignedClip?.blob) return;
+    const suffix = alignedClip.scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX;
+    triggerFileDownload(alignedClip.blob, buildTimeAlignedDubDownloadFilename(videoFile, suffix));
+  }, [alignedClip, videoFile]);
+
   const isClipStale = useCallback(segment => {
     const clip = segmentClips[segment?.id];
     if (!clip) return false;
@@ -574,6 +645,7 @@ export function useSubtitleVoiceover({
     clearSelection,
     segmentClips,
     combinedClip,
+    alignedClip,
     playingSegmentId,
     voiceBusy,
     generatingSegmentId,
@@ -585,6 +657,7 @@ export function useSubtitleVoiceover({
     resetVoiceover,
     downloadSegmentVoice,
     downloadCombinedVoice,
+    downloadAlignedVoice,
     ...synthesis,
   };
 }

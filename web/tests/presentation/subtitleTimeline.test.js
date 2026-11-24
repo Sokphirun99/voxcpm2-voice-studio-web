@@ -174,3 +174,36 @@ test('SubtitleTimeline displays validation error and warning markers on affected
     assert.ok(html.includes('subtitle-timeline-issue-pill is-error'), 'Active Cue 1 badge must show error pill');
   });
 });
+
+test('SubtitleTimeline renders speech duration bar, trailing silence pill, and overflow indicator', async () => {
+  await withViteSsr(async vite => {
+    const { SubtitleTimeline } = await vite.ssrLoadModule('/src/presentation/components/SubtitleTimeline.jsx');
+    const segments = [
+      { id: 'c1', start: 0, end: 10, speakerId: 'speaker-1' },
+      { id: 'c2', start: 10, end: 12, speakerId: 'speaker-2' },
+    ];
+    const segmentClips = {
+      c1: { url: 'blob:clip-1', characterName: 'Sovath', durationSeconds: 6.0 },
+      c2: { url: 'blob:clip-2', characterName: 'Nisa', durationSeconds: 3.5 },
+    };
+
+    const html = renderToStaticMarkup(
+      React.createElement(SubtitleTimeline, {
+        currentTime: 1.0,
+        mediaDuration: 20,
+        segments,
+        activeSegmentId: 'c1',
+        segmentClips,
+      })
+    );
+
+    // c1: 6.0s on 10s cue -> 60% speech fill, trailing silence 4.00s
+    assert.ok(html.includes('subtitle-timeline-cue-speech'), 'Must render speech bar element');
+    assert.ok(html.includes('width:60%'), 'Cue 1 speech bar must have width:60%');
+    assert.ok(html.includes('Speech: 6.00s · Silence: 4.00s'), 'Must display active cue speech and trailing silence');
+
+    // c2: 3.5s on 2.0s cue -> overflow
+    assert.ok(html.includes('is-speech-overflow'), 'Cue 2 must have is-speech-overflow class');
+    assert.ok(html.includes('+1.50s overflow'), 'Cue 2 title must note +1.50s overflow');
+  });
+});

@@ -167,10 +167,14 @@ export function readWavDurationSeconds(buffer) {
 
 /**
  * Builds a frame-aligned zero-byte silence buffer for inserting pauses between stitched clips.
+ * Inputs: timing specification ({ byteRate, blockAlign, pauseMs }).
+ * Outputs: zero-filled PCM silence Uint8Array.
+ * Side effects: none.
+ * Failure modes: returns empty Uint8Array for non-finite or negative pauseMs.
  * @param {{ byteRate: number, blockAlign: number, pauseMs: number }} spec - Timing specification.
  * @returns {Uint8Array} Zero-filled PCM silence slice.
  */
-function buildSilenceBytes({ byteRate, blockAlign, pauseMs }) {
+export function buildSilenceBytes({ byteRate, blockAlign, pauseMs }) {
   if (!Number.isFinite(pauseMs) || pauseMs <= 0) return new Uint8Array(0);
   const rawBytes = Math.round((byteRate * pauseMs) / MS_PER_SECOND);
   const alignedBytes = Math.floor(rawBytes / blockAlign) * blockAlign;
@@ -179,10 +183,14 @@ function buildSilenceBytes({ byteRate, blockAlign, pauseMs }) {
 
 /**
  * Creates a standard 44-byte RIFF/WAVE PCM header.
+ * Inputs: format and payload size metadata.
+ * Outputs: 44-byte Uint8Array WAV header.
+ * Side effects: none.
+ * Failure modes: none.
  * @param {{ numChannels: number, sampleRate: number, byteRate: number, blockAlign: number, bitsPerSample: number, dataLength: number }} meta - PCM format and total payload size.
  * @returns {Uint8Array} 44-byte WAV header.
  */
-function buildWaveHeader(meta) {
+export function buildWaveHeader(meta) {
   const header = new ArrayBuffer(RIFF_HEADER_BYTES);
   const view = new DataView(header);
   writeTag(view, 0, 'RIFF');
@@ -282,11 +290,15 @@ function applyMicroFadeInPlace(pcmBytes, info) {
 
 /**
  * Extracts a trimmed, micro-faded PCM segment from a validated WAV buffer when 16-bit PCM constraints apply.
+ * Inputs: raw WAV ArrayBuffer and parsed format metadata.
+ * Outputs: clean PCM byte Uint8Array.
+ * Side effects: none.
+ * Failure modes: returns un-trimmed raw slice if non-16-bit PCM.
  * @param {ArrayBuffer} buffer - Raw WAV buffer.
  * @param {object} info - Parsed WAV format metadata.
  * @returns {Uint8Array} Clean PCM byte slice.
  */
-function prepareCleanPcmSlice(buffer, info) {
+export function prepareCleanPcmSlice(buffer, info) {
   if (info.bitsPerSample !== PCM_BITS_16 || info.blockAlign !== info.numChannels * 2) {
     return new Uint8Array(buffer, info.dataOffset, info.dataSize);
   }

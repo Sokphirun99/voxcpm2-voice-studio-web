@@ -1,13 +1,24 @@
 /**
- * @fileoverview Pure domain helpers for per-frame and selected-batch subtitle Text-to-Speech generation and WAV stitching.
+ * @fileoverview Pure domain helpers for per-frame and selected-batch subtitle Text-to-Speech generation, timeline alignment, and WAV stitching.
  */
 
+import { SynthesisError } from './errors.js';
+import { assertMatchingWaveFormats, assertPcmFormat } from './audioAssembly.js';
 import { DEFAULT_STEPS, STYLE_MODES } from './presets.js';
 import { pickSegmentText } from './subtitles.js';
-import { concatenateWavBlobs, ensureAudioWavBlob } from './wavCodec.js';
+import {
+  applyBoundaryMicroFades,
+  buildWaveHeader,
+  concatenateWavBlobs,
+  ensureAudioWavBlob,
+  inspectWavBuffer,
+  prepareCleanPcmSlice,
+} from './wavCodec.js';
 
 export const DEFAULT_SUBTITLE_TTS_GUIDANCE = 2;
 export const DEFAULT_SUBTITLE_TTS_STEPS = DEFAULT_STEPS;
+export const DEFAULT_ALIGNED_FADE_MS = 5;
+export const DEFAULT_TIME_ALIGNED_SUFFIX = '-time-aligned-dub';
 export const SUBTITLE_VOICEOVER_GAP_OPTIONS = Object.freeze([
   Object.freeze({ ms: 100, label: '0.1s' }),
   Object.freeze({ ms: 200, label: '0.2s' }),
@@ -221,4 +232,157 @@ export function buildDubExportClips(segments, selectedIds, segmentClips) {
 export function buildDubDownloadFilename(videoFile) {
   const stem = String(videoFile?.name || 'subtitle').replace(/\.[^.]+$/, '') || 'subtitle';
   return `${stem}-dubbed.mp4`;
+}
+
+/**
+ * Derives a clean time-aligned dub `.wav` export filename from the active video file.
+ * Inputs: optional `videoFile` and filename `suffix`.
+ * Outputs: sanitized filename ending in `.wav`.
+ * Side effects: none.
+ * Failure modes: falls back to `subtitle` stem when filename is unavailable.
+ * @param {{ name?: string }|null|undefined} videoFile - Source media file.
+ * @param {string} [suffix='-time-aligned-dub'] - Descriptive suffix appended before `.wav`.
+ * @returns {string} Export filename ending in `.wav`.
+ */
+export function buildTimeAlignedDubDownloadFilename(videoFile, suffix = DEFAULT_TIME_ALIGNED_SUFFIX) {
+  return buildVoiceoverDownloadFilename(videoFile, suffix);
+}
+
+function filterAndOrderTargetClips(segments, selectedIds, segmentClips) {
+  if (!Array.isArray(segments) || !segments.length || !segmentClips) return [];
+  const selected = selectOrderedSegments(segments, selectedIds).filter(s => Boolean(segmentClips[s.id]?.blob));
+  const pool = selected.length > 0 ? selected : segments.filter(s => Boolean(segmentClips[s.id]?.blob));
+  return pool
+    .map(s => {
+      const start = Number.isFinite(Number(s.start)) ? Math.max(0, Number(s.start)) : 0;
+      const rawEnd = Number.isFinite(Number(s.end)) ? Number(s.end) : start;
+      return { id: s.id, start, end: Math.max(start, rawEnd), blob: segmentClips[s.id].blob };
+    })
+    .sort((a, b) => a.start - b.start);
+}
+
+async function decodeAlignmentClip(item, index, baseInfo, expectedSampleRate) {
+  const buffer = await item.blob.arrayBuffer();
+  const info = inspectWavBuffer(buffer);
+  assertPcmFormat(info, index);
+  if (expectedSampleRate && info.sampleRate !== expectedSampleRate) {
+    throw new SynthesisError(
+      `Segment #${index + 1} has mismatched sample rate: expected ${expectedSampleRate} Hz, received ${info.sampleRate} Hz.`,
+      { code: 'WAV_FORMAT_MISMATCH' }
+    );
+  }
+  if (baseInfo) assertMatchingWaveFormats(baseInfo, info, index);
+  const pcm = prepareCleanPcmSlice(buffer, info);
+  return { ...item, info, pcm };
+}
+
+async function decodeTargetClips(targets, sampleRate) {
+  const decoded = [];
+  for (let i = 0; i < targets.length; i++) {
+    const baseInfo = i > 0 ? decoded[0].info : null;
+    decoded.push(await decodeAlignmentClip(targets[i], i, baseInfo, sampleRate));
+  }
+  return decoded;
+}
+
+function resolveNextBoundaryFrame(index, ordered, totalDuration, sampleRate) {
+  if (index < ordered.length - 1) {
+    return Math.round(ordered[index + 1].start * sampleRate);
+  }
+  if (Number.isFinite(totalDuration) && totalDuration > 0) {
+    return Math.round(totalDuration * sampleRate);
+  }
+  return Infinity;
+}
+
+function placeClipWithinWindow(spec) {
+  const { clipPcm, targetStartFrame, boundaryFrame, baseInfo } = spec;
+  const clipFrames = Math.floor(clipPcm.byteLength / baseInfo.blockAlign);
+  const maxAvailableFrames = Math.max(0, boundaryFrame - targetStartFrame);
+  if (clipFrames <= maxAvailableFrames) {
+    return { pcm: clipPcm, placedFrames: clipFrames, clamped: false, requestedFrames: clipFrames };
+  }
+  const clampedBytes = new Uint8Array(clipPcm.slice(0, maxAvailableFrames * baseInfo.blockAlign));
+  applyBoundaryMicroFades(clampedBytes, baseInfo, DEFAULT_ALIGNED_FADE_MS);
+  return { pcm: clampedBytes, placedFrames: maxAvailableFrames, clamped: true, requestedFrames: clipFrames };
+}
+
+function createClampedWarning(item, requestedFrames, maxFrames, sampleRate) {
+  const requestedSec = requestedFrames / sampleRate;
+  const maxSec = maxFrames / sampleRate;
+  return {
+    segmentId: item.id,
+    requestedDuration: requestedSec,
+    maxDuration: maxSec,
+    message: `Clip for cue #${item.id} (${requestedSec.toFixed(2)}s) exceeded window (${maxSec.toFixed(2)}s); clamped with micro-fade.`,
+  };
+}
+
+function assembleAlignedTrackFrames(decoded, totalDuration, baseInfo) {
+  const { sampleRate, blockAlign } = baseInfo;
+  const parts = [];
+  const warnings = [];
+  let currentFrame = 0;
+  for (let i = 0; i < decoded.length; i++) {
+    const item = decoded[i];
+    const startFrame = Math.round(item.start * sampleRate);
+    if (startFrame > currentFrame) {
+      parts.push(new Uint8Array((startFrame - currentFrame) * blockAlign));
+      currentFrame = startFrame;
+    }
+    const boundary = resolveNextBoundaryFrame(i, decoded, totalDuration, sampleRate);
+    const res = placeClipWithinWindow({ clipPcm: item.pcm, targetStartFrame: startFrame, boundaryFrame: boundary, baseInfo });
+    if (res.clamped) warnings.push(createClampedWarning(item, res.requestedFrames, res.placedFrames, sampleRate));
+    parts.push(res.pcm);
+    currentFrame += res.placedFrames;
+  }
+  return { parts, currentFrame, warnings };
+}
+
+function appendTrailingSilence(parts, totalDuration, currentFrame, baseInfo) {
+  if (!Number.isFinite(totalDuration) || totalDuration <= 0) return currentFrame;
+  const targetTotal = Math.round(totalDuration * baseInfo.sampleRate);
+  if (targetTotal <= currentFrame) return currentFrame;
+  parts.push(new Uint8Array((targetTotal - currentFrame) * baseInfo.blockAlign));
+  return targetTotal;
+}
+
+function createTrackWavBlob(baseInfo, parts) {
+  const dataLength = parts.reduce((sum, p) => sum + p.byteLength, 0);
+  const header = buildWaveHeader({ ...baseInfo, dataLength });
+  return new Blob([header, ...parts], { type: 'audio/wav' });
+}
+
+async function applyTrackMastering(blob, audioMaster, signal) {
+  if (!audioMaster?.masterWav) return { blob, mastered: false };
+  try {
+    const res = await audioMaster.masterWav(blob, { signal });
+    return { blob: res.blob || blob, mastered: res.mastered ?? true };
+  } catch (_err) {
+    return { blob, mastered: false };
+  }
+}
+
+/**
+ * Assembles generated subtitle clips into a single time-aligned PCM WAV track.
+ * Inputs: { segments, segmentClips, totalDuration, sampleRate, audioMaster, signal, selectedIds }.
+ * Outputs: Promise resolving to { blob, duration, clipCount, warnings, sampleRate, mastered }.
+ * Side effects: reads ArrayBuffer from clips, applies optional audio mastering.
+ * Failure modes: returns empty descriptor on missing clips; throws SynthesisError on WAV format mismatch.
+ * @param {object} params - Assembly spec.
+ * @returns {Promise<{ blob: Blob|null, duration: number, clipCount: number, warnings: Array<object>, sampleRate: number, mastered: boolean }>} Aligned WAV result.
+ */
+export async function assembleTimelineAlignedVoiceover(spec = {}) {
+  const { segments = [], segmentClips = {}, totalDuration = 0, sampleRate = null, audioMaster = null, signal = null, selectedIds = null } = spec;
+  const targets = filterAndOrderTargetClips(segments, selectedIds, segmentClips);
+  if (!targets.length) {
+    return { blob: null, duration: 0, clipCount: 0, warnings: [], sampleRate: sampleRate || 0, mastered: false };
+  }
+  const decoded = await decodeTargetClips(targets, sampleRate);
+  const baseInfo = decoded[0].info;
+  const { parts, currentFrame, warnings } = assembleAlignedTrackFrames(decoded, totalDuration, baseInfo);
+  const finalFrame = appendTrailingSilence(parts, totalDuration, currentFrame, baseInfo);
+  const rawBlob = createTrackWavBlob(baseInfo, parts);
+  const { blob, mastered } = await applyTrackMastering(rawBlob, audioMaster, signal);
+  return { blob, duration: finalFrame / baseInfo.sampleRate, clipCount: targets.length, warnings, sampleRate: baseInfo.sampleRate, mastered };
 }

@@ -117,6 +117,24 @@ function computeIntervalGeometry(start, end, safeTotal) {
   return { leftPercent, widthPercent };
 }
 
+function calculateSpeechRatioPercent(clipDuration, safeCueDur) {
+  if (safeCueDur <= 0 || clipDuration <= 0) return 0;
+  return Math.min(100, Math.round((clipDuration / safeCueDur) * 1000) / 10);
+}
+
+function resolveClipTimingDetails(clip, cueDuration) {
+  const clipDuration = Number.isFinite(clip?.durationSeconds) && clip.durationSeconds > 0
+    ? roundToMs(clip.durationSeconds) : 0;
+  const hasVoiceClip = Boolean(clip?.url || clip?.blob);
+  const safeCueDur = Math.max(0, cueDuration);
+  const speechPercent = calculateSpeechRatioPercent(clipDuration, safeCueDur);
+  const isClipOverflowing = clipDuration > safeCueDur && safeCueDur > 0;
+  const trailingSilenceDuration = safeCueDur > clipDuration && clipDuration > 0
+    ? roundToMs(safeCueDur - clipDuration) : 0;
+  const overflowDuration = isClipOverflowing ? roundToMs(clipDuration - safeCueDur) : 0;
+  return { clipDuration, hasVoiceClip, speechPercent, trailingSilenceDuration, isClipOverflowing, overflowDuration };
+}
+
 function buildTimelineIntervalItem(seg, index, context) {
   const { segments, safeTotal, activeSegmentId, segmentClips, validationBySegmentId } = context;
   const start = Number.isFinite(seg.start) ? Math.max(0, seg.start) : 0;
@@ -125,15 +143,16 @@ function buildTimelineIntervalItem(seg, index, context) {
   const { pauseBefore, pauseAfter, hasOverlap } = resolveTimelineGapStatus(start, end, index, segments);
   const { issues, hasError, hasWarning, issueCount } = resolveTimelineValidationStatus(seg.id, validationBySegmentId);
   const clip = segmentClips[seg.id];
-  const hasVoiceClip = Boolean(clip?.url || clip?.blob);
+  const timing = resolveClipTimingDetails(clip, end - start);
   return {
     id: seg.id, index, start, end, duration: roundToMs(end - start),
     leftPercent, widthPercent, speakerId: seg.speakerId || 'speaker-1',
     speakerColor: getSpeakerColor(seg.speakerId), isActive: seg.id === activeSegmentId,
-    hasVoiceClip, voiceClip: hasVoiceClip ? clip : null,
+    voiceClip: timing.hasVoiceClip ? clip : null,
     pauseBefore, pauseAfter, hasOverlap,
     hasError, hasWarning, issueCount, validationIssues: issues,
     text: (seg.text || seg.translatedText || '').trim(),
+    ...timing,
   };
 }
 

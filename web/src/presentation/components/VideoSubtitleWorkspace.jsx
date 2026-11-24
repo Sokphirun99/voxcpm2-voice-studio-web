@@ -765,6 +765,7 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
       )}
       <SubtitleVoiceOutputCard
         combinedClip={voice.combinedClip}
+        alignedClip={voice.alignedClip}
         busy={busy || voice.voiceBusy}
         dubAudioMode={voice.dubAudioMode}
         dubBusy={voice.dubBusy}
@@ -772,6 +773,7 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
         isAudioOnly={Boolean(ctrl.state.isAudioOnly)}
         hasJobId={Boolean(ctrl.state.jobId)}
         onDownload={voice.downloadCombinedVoice}
+        onDownloadAligned={voice.downloadAlignedVoice}
         onChangeDubAudioMode={voice.setDubAudioMode}
         onExportDub={() => void voice.exportDubbedVideo()}
       />
@@ -821,6 +823,7 @@ export function VideoSubtitleWorkspace({
     jobId: state.jobId,
     isAudioOnly: state.isAudioOnly,
     voiceCatalog,
+    mediaDuration: ctrl.mediaDuration,
     onStatus: ctrl.setStatus,
     onNotify,
     onUnlockSound,
@@ -957,6 +960,8 @@ export function VideoSubtitleWorkspace({
         busyAction={state.busyAction}
         busyMeta={ctrl.busyMeta}
         status={state.status}
+        hasAlignedVoice={Boolean(voice.alignedClip?.blob)}
+        onExportAlignedVoice={voice.downloadAlignedVoice}
         onExportFile={ctrl.exportFile}
         onCopyDialogue={() => void ctrl.copyDialogue()}
         onBurnVideo={() => void ctrl.burnVideo()}

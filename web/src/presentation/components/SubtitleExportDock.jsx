@@ -27,9 +27,29 @@ function ExportFormatButtons({ hasSegments, busy, onExportFile, onCopyDialogue }
   );
 }
 
+function ExportAlignedDubButton({ hasAlignedVoice, busy, onExportAlignedVoice }) {
+  if (!onExportAlignedVoice) return null;
+  const title = !hasAlignedVoice
+    ? 'Generate subtitle voice clips before exporting time-aligned WAV'
+    : 'Export synchronized time-aligned voiceover WAV for video editing';
+  return (
+    <button
+      type="button"
+      id="subtitle-export-aligned-wav-btn"
+      className="button button-secondary"
+      disabled={!hasAlignedVoice || busy}
+      title={title}
+      onClick={onExportAlignedVoice}
+    >
+      <Icon name="waveform" />
+      <span>Time-aligned dub WAV</span>
+    </button>
+  );
+}
+
 /**
  * Renders the Subtitle workspace footer with live status, export buttons, optional speaker TTS filter, and burn-in action.
- * Inputs: `{ hasSegments, hasSubtitleText, canBurn, isAudioOnly, speakers, speakerNames, ttsSpeakerId, onChangeTtsSpeakerId, busy, busyAction, busyMeta, status, onExportFile, onCopyDialogue, onBurnVideo, onSendToTts }`.
+ * Inputs: `{ hasSegments, hasSubtitleText, selectedCount, canBurn, hasVideoJob, isAudioOnly, speakers, speakerNames, ttsSpeakerId, onChangeTtsSpeakerId, busy, busyAction, busyMeta, status, hasAlignedVoice, onExportAlignedVoice, onExportFile, onCopyDialogue, onBurnVideo, onSendToTts }`.
  * Outputs: `<section className="playback subtitle-dock">`.
  * Side effects: triggers file download, clipboard copy, MP4 burn-in, or TTS transfer.
  * Failure modes: disables invalid export buttons cleanly until extraction completes or when audio-only.
@@ -51,6 +71,8 @@ export function SubtitleExportDock({
   busyAction,
   busyMeta = null,
   status,
+  hasAlignedVoice = false,
+  onExportAlignedVoice = null,
   onExportFile,
   onCopyDialogue,
   onBurnVideo,
@@ -74,6 +96,11 @@ export function SubtitleExportDock({
             <Icon name="arrow_down_to_line" />
             <span>{busyAction === 'burn' ? 'Rendering MP4...' : 'Export burned MP4'}</span>
           </button>
+          <ExportAlignedDubButton
+            hasAlignedVoice={hasAlignedVoice}
+            busy={busy}
+            onExportAlignedVoice={onExportAlignedVoice}
+          />
           {showSpeakerFilter && (
             <div className="select-field select-field--plain subtitle-tts-speaker-wrap">
               <select id="subtitle-tts-speaker" aria-label="Speaker for Text to speech" value={ttsSpeakerId} disabled={busy}
