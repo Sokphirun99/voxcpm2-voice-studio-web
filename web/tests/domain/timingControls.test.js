@@ -144,6 +144,37 @@ test('detectCueOverlaps and findCueOverlap identify collision intervals', () => 
     { id: 't-2', start: 2.0, end: 4.0 },
   ];
   assert.deepEqual(detectCueOverlaps(touching), []);
+
+  // Nested cues: Cue B inside Cue A calculates true overlap duration
+  const nested = [
+    { id: 'n-1', start: 0.0, end: 10.0 },
+    { id: 'n-2', start: 2.0, end: 5.0 },
+  ];
+  const nestedOverlaps = detectCueOverlaps(nested);
+  assert.equal(nestedOverlaps.length, 1);
+  assert.equal(nestedOverlaps[0].overlapStart, 2.0);
+  assert.equal(nestedOverlaps[0].overlapEnd, 5.0);
+  assert.equal(nestedOverlaps[0].overlapDuration, 3.0);
+
+  // Spanning cue overlapping multiple subsequent cues across non-adjacent indices
+  const spanning = [
+    { id: 'sp-1', start: 0.0, end: 8.0 },
+    { id: 'sp-2', start: 1.0, end: 3.0 },
+    { id: 'sp-3', start: 4.0, end: 6.0 },
+  ];
+  const spanOverlaps = detectCueOverlaps(spanning);
+  assert.equal(spanOverlaps.length, 2);
+  assert.equal(spanOverlaps[0].cueAId, 'sp-1');
+  assert.equal(spanOverlaps[0].cueBId, 'sp-2');
+  assert.equal(spanOverlaps[1].cueAId, 'sp-1');
+  assert.equal(spanOverlaps[1].cueBId, 'sp-3');
+
+  // Out of order non-overlapping cues must not produce false overlap
+  const outOfOrderClean = [
+    { id: 'o-1', start: 5.0, end: 7.0 },
+    { id: 'o-2', start: 1.0, end: 2.0 },
+  ];
+  assert.deepEqual(detectCueOverlaps(outOfOrderClean), []);
 });
 
 test('getCuePause measures pause gaps before and after cues accurately', () => {

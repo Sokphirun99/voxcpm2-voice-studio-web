@@ -600,8 +600,23 @@ export function assertValidCueInterval(params) {
   }
 }
 
+function buildOverlapDescriptor(a, b, indexA, indexB) {
+  const start = Math.max(roundToMs(a.start), roundToMs(b.start));
+  const end = Math.min(roundToMs(a.end), roundToMs(b.end));
+  if (end <= start) return null;
+  return {
+    cueAId: a.id,
+    cueBId: b.id,
+    indexA,
+    indexB,
+    overlapStart: start,
+    overlapEnd: end,
+    overlapDuration: roundToMs(end - start),
+  };
+}
+
 /**
- * Detects overlapping time intervals between adjacent cues in a segment list.
+ * Detects overlapping time intervals across cues in a segment list.
  * Inputs: timed segments array. Outputs: array of detected overlap records.
  * Side effects: none. Failure modes: empty array on invalid inputs.
  * @param {Array<object>} segments - Timed subtitle segments.
@@ -610,22 +625,10 @@ export function assertValidCueInterval(params) {
 export function detectCueOverlaps(segments) {
   if (!Array.isArray(segments) || segments.length < 2) return [];
   const overlaps = [];
-  for (let i = 0; i < segments.length - 1; i++) {
-    const a = segments[i];
-    const b = segments[i + 1];
-    if (!a || !b) continue;
-    const aEnd = roundToMs(a.end);
-    const bStart = roundToMs(b.start);
-    if (aEnd > bStart) {
-      overlaps.push({
-        cueAId: a.id,
-        cueBId: b.id,
-        indexA: i,
-        indexB: i + 1,
-        overlapStart: bStart,
-        overlapEnd: aEnd,
-        overlapDuration: roundToMs(aEnd - bStart),
-      });
+  for (let i = 0; i < segments.length; i++) {
+    for (let j = i + 1; j < segments.length; j++) {
+      const desc = buildOverlapDescriptor(segments[i], segments[j], i, j);
+      if (desc) overlaps.push(desc);
     }
   }
   return overlaps;
@@ -742,7 +745,8 @@ export function adjustCuePause(segments, segId, pauseSec, options = {}) {
   return shiftSubsequentCues(list, idx + 1, delta, rippleAll);
 }
 
-function resolveOverlapPair(a, b, resolutionMode, minDuration, minGap) {
+function resolveOverlapPair(a, b, options) {
+  const { resolutionMode, minDuration, minGap } = options;
   if (resolutionMode === OVERLAP_RESOLVE_MODES.TRIM_NEXT) {
     const newBStart = roundToMs(a.end + minGap);
     const newBEnd = Math.max(newBStart + minDuration, b.end);
@@ -775,7 +779,7 @@ export function resolveCueOverlaps(segments, options = {}) {
     const prev = out[i - 1];
     const cur = segments[i];
     if (roundToMs(prev.end) > roundToMs(cur.start - minGap)) {
-      const [fixedPrev, fixedCur] = resolveOverlapPair(prev, cur, resolutionMode, minDuration, minGap);
+      const [fixedPrev, fixedCur] = resolveOverlapPair(prev, cur, { resolutionMode, minDuration, minGap });
       out[i - 1] = fixedPrev;
       out.push(fixedCur);
     } else {
@@ -816,11 +820,29 @@ function resolveSegmentTimingBounds(list, idx, minGap) {
   };
 }
 
-function computeClampedCueTimes(cur, rawStart, rawEnd, bounds, minDuration) {
+function computeClampedCueTimes(rawStart, rawEnd, bounds, minDuration) {
   const boundedStart = Math.max(bounds.prevEnd, rawStart);
   const minEnd = roundToMs(boundedStart + minDuration);
   const boundedEnd = Math.min(bounds.nextStart, Math.max(minEnd, rawEnd));
   return { start: boundedStart, end: boundedEnd };
+}
+
+function applyTimingWithOverlapMode(list, idx, params) {
+  const { rawStart, rawEnd, bounds, minDuration, overlapMode, minGap } = params;
+  if (overlapMode === OVERLAP_BEHAVIOR_MODES.PREVENT) {
+    const clamped = computeClampedCueTimes(rawStart, rawEnd, bounds, minDuration);
+    return list.map((seg, i) => (i === idx ? { ...seg, ...clamped } : seg));
+  }
+  const nextEnd = Math.max(roundToMs(rawStart + minDuration), rawEnd);
+  if (overlapMode === OVERLAP_BEHAVIOR_MODES.REJECT && (rawStart < bounds.prevEnd || nextEnd > bounds.nextStart)) {
+    throw new ValidationError('Cue interval overlaps with an adjacent cue.', 'timing', 'CUE_OVERLAP');
+  }
+  if (overlapMode === OVERLAP_BEHAVIOR_MODES.SHIFT_NEXT && nextEnd > bounds.nextStart) {
+    const delta = roundToMs(nextEnd - bounds.nextStart + minGap);
+    const updated = list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
+    return shiftSubsequentCues(updated, idx + 1, delta, true);
+  }
+  return list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
 }
 
 /**
@@ -844,20 +866,7 @@ export function adjustSubtitleSegmentTiming(segments, segId, patch = {}, options
   const candidateEnd = Number.isFinite(patch?.duration) ? roundToMs(rawStart + patch.duration) : patch?.end;
   const rawEnd = Number.isFinite(candidateEnd) ? roundToMs(candidateEnd) : cur.end;
   const bounds = resolveSegmentTimingBounds(list, idx, minGap);
-  if (overlapMode === OVERLAP_BEHAVIOR_MODES.PREVENT) {
-    const clamped = computeClampedCueTimes(cur, rawStart, rawEnd, bounds, minDuration);
-    return list.map((seg, i) => (i === idx ? { ...seg, ...clamped } : seg));
-  }
-  const nextEnd = Math.max(roundToMs(rawStart + minDuration), rawEnd);
-  if (overlapMode === OVERLAP_BEHAVIOR_MODES.REJECT && (rawStart < bounds.prevEnd || nextEnd > bounds.nextStart)) {
-    throw new ValidationError('Cue interval overlaps with an adjacent cue.', 'timing', 'CUE_OVERLAP');
-  }
-  if (overlapMode === OVERLAP_BEHAVIOR_MODES.SHIFT_NEXT && nextEnd > bounds.nextStart) {
-    const delta = roundToMs(nextEnd - bounds.nextStart + minGap);
-    const updated = list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
-    return shiftSubsequentCues(updated, idx + 1, delta, true);
-  }
-  return list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
+  return applyTimingWithOverlapMode(list, idx, { rawStart, rawEnd, bounds, minDuration, overlapMode, minGap });
 }
 
 /**

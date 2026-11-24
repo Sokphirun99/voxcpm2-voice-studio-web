@@ -108,6 +108,38 @@ test('TimingInlineEditor renders overlap warning and fix action when cues collid
   });
 });
 
+test('TimingInlineEditor accurately measures nested cue overlap and suppresses warnings for clean cues', async () => {
+  await withViteSsr(async vite => {
+    const { TimingInlineEditor } = await vite.ssrLoadModule('/src/presentation/components/SubtitleSegmentRow.jsx');
+
+    // Nested cue: prevSegment [0, 10], segment [2, 5] -> true overlap is 3.00s
+    const nestedPrev = { id: 'seg-0', start: 0.0, end: 10.0 };
+    const nestedCur = { id: 'seg-1', start: 2.0, end: 5.0 };
+    const nestedHtml = renderToStaticMarkup(
+      React.createElement(TimingInlineEditor, {
+        segment: nestedCur,
+        prevSegment: nestedPrev,
+        nextSegment: null,
+        onUpdateTiming() {},
+        onUpdatePause() {},
+      })
+    );
+    assert.ok(nestedHtml.includes('Overlaps previous cue by 3.00s'), 'Must compute true overlap duration (3.00s) for nested cues');
+
+    // Out-of-order non-overlapping: prevSegment [5, 7], segment [1, 2] -> no overlap
+    const cleanHtml = renderToStaticMarkup(
+      React.createElement(TimingInlineEditor, {
+        segment: { id: 'seg-1', start: 1.0, end: 2.0 },
+        prevSegment: { id: 'seg-0', start: 5.0, end: 7.0 },
+        nextSegment: null,
+        onUpdateTiming() {},
+        onUpdatePause() {},
+      })
+    );
+    assert.equal(cleanHtml.includes('subtitle-timing-warning'), false, 'Clean non-overlapping cues must not trigger overlap warning');
+  });
+});
+
 test('SubtitleTimeline displays cue duration, pause gap, and overlap pill when cue collides', async () => {
   await withViteSsr(async vite => {
     const { SubtitleTimeline } = await vite.ssrLoadModule('/src/presentation/components/SubtitleTimeline.jsx');

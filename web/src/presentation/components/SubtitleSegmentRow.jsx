@@ -17,6 +17,7 @@ import {
   parseEditableTimestamp,
   resolveSpeakerLabel,
   roundToMs,
+  validateCueInterval,
 } from '../../domain/subtitles.js';
 import { Icon } from './Icon.jsx';
 
@@ -42,27 +43,42 @@ function SpeakerBadgeSelect({ speakerId, speakers, speakerNames, busy, onChangeS
   );
 }
 
-function resolveTimingCommit(field, raw, segment) {
+function checkCurrentTimingValid(segment, mediaDuration) {
+  return validateCueInterval({
+    start: segment.start,
+    end: segment.end,
+    minDuration: MIN_CUE_DURATION_SEC,
+    maxDuration: mediaDuration,
+  }).valid;
+}
+
+function resolveCandidateTiming(field, parsed, segment) {
+  if (field === 'start') {
+    return { start: Math.max(0, parsed), end: segment.end };
+  }
+  const minEnd = roundToMs(segment.start + MIN_SPLIT_GAP_SEC);
+  return { start: segment.start, end: Math.max(minEnd, parsed) };
+}
+
+function resolveTimingCommit(field, raw, segment, mediaDuration = null) {
   const currentVal = field === 'start' ? segment.start : segment.end;
-  const isAlreadyValid = Number(segment.end) >= Number(segment.start) + MIN_SPLIT_GAP_SEC;
-  if (raw === formatEditableTimestamp(currentVal) && isAlreadyValid) {
+  if (raw === formatEditableTimestamp(currentVal) && checkCurrentTimingValid(segment, mediaDuration)) {
     return { valid: true, unchanged: true };
   }
   const parsed = parseEditableTimestamp(raw);
-  if (parsed === null) {
+  const cand = parsed !== null ? resolveCandidateTiming(field, parsed, segment) : null;
+  const check = cand ? validateCueInterval({ start: cand.start, end: cand.end, minDuration: MIN_CUE_DURATION_SEC, maxDuration: mediaDuration }) : null;
+  if (!cand || !check?.valid) {
     return {
       valid: false,
-      error: 'Invalid timestamp format. Use MM:SS.mmm or SS.s.',
+      error: check?.error || 'Invalid timestamp format. Use MM:SS.mmm or SS.s.',
+      code: check?.code || 'INVALID_FORMAT',
       startDraft: formatEditableTimestamp(segment.start),
       endDraft: formatEditableTimestamp(segment.end),
     };
   }
-  if (field === 'start') {
-    const nextStart = Math.max(0, parsed);
-    return { valid: true, unchanged: false, patch: { start: nextStart }, startDraft: formatEditableTimestamp(nextStart) };
-  }
-  const clampedEnd = Math.round(Math.max(segment.start + MIN_SPLIT_GAP_SEC, parsed) * 1000) / 1000;
-  return { valid: true, unchanged: false, patch: { end: clampedEnd }, endDraft: formatEditableTimestamp(clampedEnd) };
+  const patch = field === 'start' ? { start: roundToMs(cand.start) } : { end: roundToMs(cand.end) };
+  return { valid: true, unchanged: false, patch, startDraft: formatEditableTimestamp(cand.start), endDraft: formatEditableTimestamp(cand.end) };
 }
 
 function parseSecondsInput(raw) {
@@ -71,31 +87,42 @@ function parseSecondsInput(raw) {
   return Number.isFinite(parsed) ? roundToMs(parsed) : null;
 }
 
-function resolveDurationCommit(raw, segment) {
+function resolveDurationCommit(raw, segment, mediaDuration = null) {
   const parsed = parseSecondsInput(raw);
   if (parsed === null || parsed < MIN_CUE_DURATION_SEC) {
     return { valid: false, error: `Duration must be at least ${MIN_CUE_DURATION_SEC}s.` };
   }
-  return { valid: true, patch: { end: roundToMs(segment.start + parsed) } };
+  const candidateEnd = roundToMs(segment.start + parsed);
+  const check = validateCueInterval({
+    start: segment.start,
+    end: candidateEnd,
+    minDuration: MIN_CUE_DURATION_SEC,
+    maxDuration: mediaDuration,
+  });
+  if (!check.valid) return { valid: false, error: check.error, code: check.code };
+  return { valid: true, patch: { end: candidateEnd } };
 }
 
 function resolvePauseCommit(raw) {
   const parsed = parseSecondsInput(raw);
   if (parsed === null || parsed < 0) {
-    return { valid: false, error: 'Pause must be a positive number of seconds.' };
+    return { valid: false, error: 'Pause must be a non-negative number of seconds.' };
   }
   return { valid: true, pauseSec: roundToMs(parsed) };
 }
 
+function computeCueOverlapAmount(segA, segB) {
+  if (!segA || !segB) return 0;
+  const start = Math.max(roundToMs(segA.start), roundToMs(segB.start));
+  const end = Math.min(roundToMs(segA.end), roundToMs(segB.end));
+  return end > start ? roundToMs(end - start) : 0;
+}
+
 function computeOverlapWarning(segment, prevSegment, nextSegment) {
-  if (prevSegment && roundToMs(prevSegment.end) > roundToMs(segment.start)) {
-    const diff = roundToMs(prevSegment.end - segment.start);
-    return `Overlaps previous cue by ${diff.toFixed(2)}s`;
-  }
-  if (nextSegment && roundToMs(segment.end) > roundToMs(nextSegment.start)) {
-    const diff = roundToMs(segment.end - nextSegment.start);
-    return `Overlaps next cue by ${diff.toFixed(2)}s`;
-  }
+  const prevDiff = computeCueOverlapAmount(prevSegment, segment);
+  if (prevDiff > 0) return `Overlaps previous cue by ${prevDiff.toFixed(2)}s`;
+  const nextDiff = computeCueOverlapAmount(segment, nextSegment);
+  if (nextDiff > 0) return `Overlaps next cue by ${nextDiff.toFixed(2)}s`;
   return '';
 }
 
@@ -152,26 +179,29 @@ function TimingFeedback({ error, overlapNotice, onFixOverlap }) {
   );
 }
 
+function formatDurationDraft(start, end) {
+  return `${Math.max(0, roundToMs(end - start)).toFixed(2)}s`;
+}
+
+function formatPauseDraft(seg, nextSeg) {
+  if (!nextSeg) return '0.00s';
+  return `${roundToMs(nextSeg.start - seg.end).toFixed(2)}s`;
+}
+
 function useTimingDrafts(segment, nextSegment) {
   const [startDraft, setStartDraft] = useState(() => formatEditableTimestamp(segment.start));
   const [endDraft, setEndDraft] = useState(() => formatEditableTimestamp(segment.end));
-  const durVal = Math.max(0, roundToMs(segment.end - segment.start));
-  const [durDraft, setDurDraft] = useState(() => `${durVal.toFixed(2)}s`);
-  const pauseVal = nextSegment ? roundToMs(nextSegment.start - segment.end) : 0;
-  const [pauseDraft, setPauseDraft] = useState(() => `${pauseVal.toFixed(2)}s`);
+  const [durDraft, setDurDraft] = useState(() => formatDurationDraft(segment.start, segment.end));
+  const [pauseDraft, setPauseDraft] = useState(() => formatPauseDraft(segment, nextSegment));
   const [error, setError] = useState('');
 
   useEffect(() => {
     setStartDraft(formatEditableTimestamp(segment.start));
     setEndDraft(formatEditableTimestamp(segment.end));
-    const nextDur = Math.max(0, roundToMs(segment.end - segment.start));
-    setDurDraft(`${nextDur.toFixed(2)}s`);
-    if (nextSegment) {
-      const nextPause = roundToMs(nextSegment.start - segment.end);
-      setPauseDraft(`${nextPause.toFixed(2)}s`);
-    }
+    setDurDraft(formatDurationDraft(segment.start, segment.end));
+    setPauseDraft(formatPauseDraft(segment, nextSegment));
     setError('');
-  }, [segment.start, segment.end, nextSegment?.start]);
+  }, [segment.id, segment.start, segment.end, nextSegment?.id, nextSegment?.start]);
 
   return { startDraft, setStartDraft, endDraft, setEndDraft, durDraft, setDurDraft, pauseDraft, setPauseDraft, error, setError };
 }
@@ -197,10 +227,75 @@ function handleFixOverlapAction(segment, prevSegment, nextSegment, onUpdateTimin
   }
 }
 
+function commitMetricField(field, raw, context) {
+  const { segment, mediaDuration, drafts, onUpdateTiming, onUpdatePause } = context;
+  if (field === 'duration') {
+    const outcome = resolveDurationCommit(raw, segment, mediaDuration);
+    if (!outcome.valid) return drafts.setError(outcome.error);
+    drafts.setError('');
+    return onUpdateTiming(segment.id, outcome.patch);
+  }
+  const outcome = resolvePauseCommit(raw);
+  if (!outcome.valid) return drafts.setError(outcome.error);
+  drafts.setError('');
+  return onUpdatePause?.(segment.id, outcome.pauseSec);
+}
+
+function executeTimingCommit(params) {
+  const { field, raw, segment, mediaDuration, drafts, onUpdateTiming } = params;
+  try {
+    if (field === 'duration' || field === 'pause') return commitMetricField(field, raw, params);
+    const outcome = resolveTimingCommit(field, raw, segment, mediaDuration);
+    if (outcome.unchanged) return drafts.setError('');
+    if (outcome.startDraft !== undefined) drafts.setStartDraft(outcome.startDraft);
+    if (outcome.endDraft !== undefined) drafts.setEndDraft(outcome.endDraft);
+    if (!outcome.valid) return drafts.setError(outcome.error || 'Invalid timestamp.');
+    drafts.setError('');
+    onUpdateTiming(segment.id, outcome.patch);
+  } catch (err) {
+    drafts.setError(err?.message || 'Failed to update timing.');
+  }
+}
+
+function handleTimingKeyDown({ field, draft, e, cancellingRef, drafts, segment, onCommit }) {
+  if (e.key === 'Enter') {
+    cancellingRef.current = '';
+    onCommit(field, draft);
+  } else if (e.key === 'Escape') {
+    cancellingRef.current = field;
+    drafts.setStartDraft(formatEditableTimestamp(segment.start));
+    drafts.setEndDraft(formatEditableTimestamp(segment.end));
+    drafts.setError('');
+    e.currentTarget.blur?.();
+  }
+}
+
+function TimingFieldsInputs({ drafts, cancellingRef, busy, nextSegment, canPause, onBlur, onKeyDown }) {
+  return (
+    <>
+      <TimingInputField label="Start" ariaLabel="Start timestamp" value={drafts.startDraft} disabled={busy}
+        onChange={e => { cancellingRef.current = ''; drafts.setStartDraft(e.target.value); }}
+        onBlur={() => onBlur('start', drafts.startDraft)} onKeyDown={e => onKeyDown('start', drafts.startDraft, e)} />
+      <TimingInputField label="End" ariaLabel="End timestamp" value={drafts.endDraft} disabled={busy}
+        onChange={e => { cancellingRef.current = ''; drafts.setEndDraft(e.target.value); }}
+        onBlur={() => onBlur('end', drafts.endDraft)} onKeyDown={e => onKeyDown('end', drafts.endDraft, e)} />
+      <TimingInputField label="Duration" ariaLabel="Cue duration" value={drafts.durDraft} disabled={busy} className="subtitle-timing-dur-input"
+        onChange={e => { cancellingRef.current = ''; drafts.setDurDraft(e.target.value); }}
+        onBlur={() => onBlur('duration', drafts.durDraft)} onKeyDown={e => onKeyDown('duration', drafts.durDraft, e)} />
+      {nextSegment && (
+        <TimingInputField label="Pause" ariaLabel="Pause to next cue" value={drafts.pauseDraft} disabled={busy || !canPause} className="subtitle-timing-pause-input"
+          onChange={e => { cancellingRef.current = ''; drafts.setPauseDraft(e.target.value); }}
+          onBlur={() => onBlur('pause', drafts.pauseDraft)} onKeyDown={e => onKeyDown('pause', drafts.pauseDraft, e)} />
+      )}
+    </>
+  );
+}
+
 export function TimingInlineEditor({
   segment,
   prevSegment = null,
   nextSegment = null,
+  mediaDuration = null,
   busy = false,
   onUpdateTiming,
   onUpdatePause = null,
@@ -209,72 +304,25 @@ export function TimingInlineEditor({
   const cancellingRef = useRef('');
   const overlapNotice = computeOverlapWarning(segment, prevSegment, nextSegment);
 
-  const commitField = (field, raw) => {
-    if (field === 'duration') {
-      const outcome = resolveDurationCommit(raw, segment);
-      if (!outcome.valid) return drafts.setError(outcome.error);
-      drafts.setError('');
-      return onUpdateTiming(segment.id, outcome.patch);
-    }
-    if (field === 'pause') {
-      const outcome = resolvePauseCommit(raw);
-      if (!outcome.valid) return drafts.setError(outcome.error);
-      drafts.setError('');
-      return onUpdatePause?.(segment.id, outcome.pauseSec);
-    }
-    const outcome = resolveTimingCommit(field, raw, segment);
-    if (outcome.unchanged) return drafts.setError('');
-    if (!outcome.valid) {
-      if (outcome.startDraft !== undefined) drafts.setStartDraft(outcome.startDraft);
-      if (outcome.endDraft !== undefined) drafts.setEndDraft(outcome.endDraft);
-      return drafts.setError(outcome.error || 'Invalid timestamp.');
-    }
-    drafts.setError('');
-    if (outcome.startDraft !== undefined) drafts.setStartDraft(outcome.startDraft);
-    if (outcome.endDraft !== undefined) drafts.setEndDraft(outcome.endDraft);
-    onUpdateTiming(segment.id, outcome.patch);
+  const onCommit = (field, raw) => {
+    executeTimingCommit({ field, raw, segment, mediaDuration, drafts, onUpdateTiming, onUpdatePause });
   };
-
-  const handleBlur = (field, draft) => {
-    if (cancellingRef.current === field) {
-      cancellingRef.current = '';
-      return;
-    }
+  const onKeyDown = (field, draft, e) => {
+    handleTimingKeyDown({ field, draft, e, cancellingRef, drafts, segment, onCommit });
+  };
+  const onBlur = (field, draft) => {
+    if (cancellingRef.current === field) { cancellingRef.current = ''; return; }
     cancellingRef.current = '';
-    commitField(field, draft);
-  };
-
-  const handleKeyDown = (field, draft, e) => {
-    if (e.key === 'Enter') {
-      cancellingRef.current = '';
-      commitField(field, draft);
-    } else if (e.key === 'Escape') {
-      cancellingRef.current = field;
-      drafts.setStartDraft(formatEditableTimestamp(segment.start));
-      drafts.setEndDraft(formatEditableTimestamp(segment.end));
-      drafts.setError('');
-      e.currentTarget.blur?.();
-    }
+    onCommit(field, draft);
   };
 
   return (
     <div className="subtitle-timing-bar">
-      <TimingInputField label="Start" ariaLabel="Start timestamp" value={drafts.startDraft} disabled={busy}
-        onChange={e => { cancellingRef.current = ''; drafts.setStartDraft(e.target.value); }}
-        onBlur={() => handleBlur('start', drafts.startDraft)} onKeyDown={e => handleKeyDown('start', drafts.startDraft, e)} />
-      <TimingInputField label="End" ariaLabel="End timestamp" value={drafts.endDraft} disabled={busy}
-        onChange={e => { cancellingRef.current = ''; drafts.setEndDraft(e.target.value); }}
-        onBlur={() => handleBlur('end', drafts.endDraft)} onKeyDown={e => handleKeyDown('end', drafts.endDraft, e)} />
-      <TimingInputField label="Duration" ariaLabel="Cue duration" value={drafts.durDraft} disabled={busy} className="subtitle-timing-dur-input"
-        onChange={e => { cancellingRef.current = ''; drafts.setDurDraft(e.target.value); }}
-        onBlur={() => handleBlur('duration', drafts.durDraft)} onKeyDown={e => handleKeyDown('duration', drafts.durDraft, e)} />
-      {nextSegment && (
-        <TimingInputField label="Pause" ariaLabel="Pause to next cue" value={drafts.pauseDraft} disabled={busy || !onUpdatePause} className="subtitle-timing-pause-input"
-          onChange={e => { cancellingRef.current = ''; drafts.setPauseDraft(e.target.value); }}
-          onBlur={() => handleBlur('pause', drafts.pauseDraft)} onKeyDown={e => handleKeyDown('pause', drafts.pauseDraft, e)} />
-      )}
+      <TimingFieldsInputs drafts={drafts} cancellingRef={cancellingRef} busy={busy} nextSegment={nextSegment}
+        canPause={Boolean(onUpdatePause)} onBlur={onBlur} onKeyDown={onKeyDown} />
       <TimingNudgeButtons busy={busy} onNudge={delta => handleNudgeTiming(segment, delta, onUpdateTiming)} />
-      <TimingFeedback error={drafts.error} overlapNotice={overlapNotice} onFixOverlap={() => handleFixOverlapAction(segment, prevSegment, nextSegment, onUpdateTiming)} />
+      <TimingFeedback error={drafts.error} overlapNotice={overlapNotice}
+        onFixOverlap={() => handleFixOverlapAction(segment, prevSegment, nextSegment, onUpdateTiming)} />
     </div>
   );
 }
@@ -536,6 +584,7 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
           segment={segment}
           prevSegment={prevSegment}
           nextSegment={nextSegment}
+          mediaDuration={mediaDuration}
           busy={busy}
           onUpdateTiming={onUpdateTiming}
           onUpdatePause={onUpdatePause}
