@@ -23,6 +23,21 @@ function resolveTrackClickTime(event, trackEl, totalDuration) {
   return ratio * totalDuration;
 }
 
+function CueBadgeTiming({ activeInterval }) {
+  if (!activeInterval) return null;
+  const cueLabel = `Cue #${activeInterval.index + 1}`;
+  const durLabel = activeInterval.duration ? ` (${activeInterval.duration.toFixed(2)}s)` : '';
+  const cueTime = `${formatTimelineClock(activeInterval.start, false)} – ${formatTimelineClock(activeInterval.end, false)}${durLabel}`;
+  return (
+    <div className="subtitle-timeline-cue-badge" style={{ '--spk-color': activeInterval.speakerColor }}>
+      <span className="subtitle-speaker-dot" aria-hidden="true" />
+      <strong className="subtitle-timeline-cue-title">{cueLabel}</strong>
+      <span className="subtitle-timeline-cue-time">{cueTime}</span>
+      {activeInterval.hasOverlap && <span className="subtitle-timeline-overlap-pill">Overlap</span>}
+    </div>
+  );
+}
+
 function TimelineClockHeader({
   currentTime,
   totalDuration,
@@ -31,23 +46,13 @@ function TimelineClockHeader({
   isPlayingVoice,
   onTogglePlayVoice,
 }) {
-  const cueLabel = activeInterval ? `Cue #${activeInterval.index + 1}` : 'No cue selected';
-  const cueTime = activeInterval
-    ? `${formatTimelineClock(activeInterval.start, false)} – ${formatTimelineClock(activeInterval.end, false)}`
-    : '';
   return (
     <div className="subtitle-timeline-head">
       <div className="subtitle-timeline-clock" aria-label="Playback time">
         <span className="subtitle-timeline-current">{formatTimelineClock(currentTime)}</span>
         <span className="subtitle-timeline-duration">/ {formatTimelineClock(totalDuration)}</span>
       </div>
-      {activeInterval && (
-        <div className="subtitle-timeline-cue-badge" style={{ '--spk-color': activeInterval.speakerColor }}>
-          <span className="subtitle-speaker-dot" aria-hidden="true" />
-          <strong className="subtitle-timeline-cue-title">{cueLabel}</strong>
-          <span className="subtitle-timeline-cue-time">{cueTime}</span>
-        </div>
-      )}
+      <CueBadgeTiming activeInterval={activeInterval} />
       {activeClip && (
         <div className="subtitle-timeline-audio-badge">
           <Icon name="waveform" className="subtitle-timeline-audio-icon" />
@@ -58,7 +63,7 @@ function TimelineClockHeader({
             type="button"
             className={isPlayingVoice ? 'button subtle-button subtitle-timeline-play-btn is-playing' : 'button subtle-button subtitle-timeline-play-btn'}
             aria-label={isPlayingVoice ? 'Pause voice clip' : 'Play voice clip'}
-            onClick={() => onTogglePlayVoice?.(activeInterval.id)}
+            onClick={() => onTogglePlayVoice?.(activeInterval?.id)}
           >
             <Icon name={isPlayingVoice ? 'pause_fill' : 'play_fill'} />
             <span>{isPlayingVoice ? 'Pause' : 'Play'}</span>
@@ -69,25 +74,29 @@ function TimelineClockHeader({
   );
 }
 
+function buildCueTitle(interval) {
+  const time = `${formatTimelineClock(interval.start, false)} - ${formatTimelineClock(interval.end, false)}`;
+  const voice = interval.hasVoiceClip ? ' · Voice generated' : '';
+  const overlap = interval.hasOverlap ? ' · Overlaps neighbor' : '';
+  return `Cue #${interval.index + 1} (${time})${voice}${overlap}`;
+}
+
 function TimelineIntervalCue({ interval, onClick }) {
   const classNames = [
     'subtitle-timeline-cue',
     interval.isActive ? 'is-active' : '',
     interval.hasVoiceClip ? 'has-voice' : '',
+    interval.hasOverlap ? 'has-overlap' : '',
   ].filter(Boolean).join(' ');
-  const title = `Cue #${interval.index + 1} (${formatTimelineClock(interval.start, false)} - ${formatTimelineClock(interval.end, false)})${interval.hasVoiceClip ? ' · Voice generated' : ''}`;
+  const style = { left: `${interval.leftPercent}%`, width: `${interval.widthPercent}%`, '--spk-color': interval.speakerColor };
   return (
     <button
       type="button"
       className={classNames}
-      style={{
-        left: `${interval.leftPercent}%`,
-        width: `${interval.widthPercent}%`,
-        '--spk-color': interval.speakerColor,
-      }}
+      style={style}
       aria-label={`Cue ${interval.index + 1}`}
       aria-current={interval.isActive ? 'true' : undefined}
-      title={title}
+      title={buildCueTitle(interval)}
       onClick={e => {
         e.stopPropagation();
         onClick(interval);

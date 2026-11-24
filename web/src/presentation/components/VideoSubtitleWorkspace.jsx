@@ -601,6 +601,9 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
         <SubtitleSegmentRow
           key={seg.id}
           segment={seg}
+          prevSegment={index > 0 ? segments[index - 1] : null}
+          nextSegment={index < segments.length - 1 ? segments[index + 1] : null}
+          mediaDuration={ctrl.mediaDuration}
           speakers={ctrl.speakers}
           speakerNames={speakerNames}
           useTranslation={ctrl.useTranslation}
@@ -620,6 +623,7 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
           onSeek={seconds => ctrl.seekToSegment(seconds, seg.id)}
           onUpdate={ctrl.updateSegment}
           onUpdateTiming={ctrl.updateSegmentTiming}
+          onUpdatePause={ctrl.updateSegmentPause}
           onSplit={ctrl.splitSegment}
           onMergeNext={ctrl.mergeSegmentWithNext}
           onDelete={onDeleteSegment}

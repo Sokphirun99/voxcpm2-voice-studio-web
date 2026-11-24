@@ -9,6 +9,7 @@ import {
   DEFAULT_KHMER_TARGET,
   MAX_SUBTITLE_FILE_BYTES,
   SUBTITLE_STYLE_DEFAULTS,
+  adjustCuePause,
   adjustSubtitleSegmentTiming,
   buildBoundedTtsHandoff,
   buildDialogueText,
@@ -26,6 +27,7 @@ import {
   pickDefaultTargetLanguage,
   pickSegmentText,
   replaceTextInSegments,
+  resolveCueOverlaps,
   resolveTargetLanguageMeta,
   splitSubtitleSegment,
 } from '../../domain/subtitles.js';
@@ -567,8 +569,25 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     setState(prev => ({ ...prev, segments: splitSubtitleSegment(prev.segments, segId, { ratio }) }));
   }, [setState]);
 
-  const updateSegmentTiming = useCallback((segId, timingPatch) => {
-    setState(prev => ({ ...prev, segments: adjustSubtitleSegmentTiming(prev.segments, segId, timingPatch) }));
+  const updateSegmentTiming = useCallback((segId, timingPatch, options = {}) => {
+    setState(prev => ({
+      ...prev,
+      segments: adjustSubtitleSegmentTiming(prev.segments, segId, timingPatch, options),
+    }));
+  }, [setState]);
+
+  const updateSegmentPause = useCallback((segId, pauseSec, options = {}) => {
+    setState(prev => ({
+      ...prev,
+      segments: adjustCuePause(prev.segments, segId, pauseSec, options),
+    }));
+  }, [setState]);
+
+  const resolveOverlaps = useCallback((options = {}) => {
+    setState(prev => ({
+      ...prev,
+      segments: resolveCueOverlaps(prev.segments, options),
+    }));
   }, [setState]);
 
   const applySegmentSuggestion = useCallback(segId => {
@@ -610,7 +629,19 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     return { matchCount: result.matchCount, segmentCount: result.segmentCount };
   }, [segments, setState, useTranslation]);
 
-  return { updateSegment, deleteSegment, mergeSegmentWithNext, splitSegment, updateSegmentTiming, applySegmentSuggestion, dismissSegmentSuggestion, countMatches, findAndReplace };
+  return {
+    updateSegment,
+    deleteSegment,
+    mergeSegmentWithNext,
+    splitSegment,
+    updateSegmentTiming,
+    updateSegmentPause,
+    resolveOverlaps,
+    applySegmentSuggestion,
+    dismissSegmentSuggestion,
+    countMatches,
+    findAndReplace,
+  };
 }
 
 /**

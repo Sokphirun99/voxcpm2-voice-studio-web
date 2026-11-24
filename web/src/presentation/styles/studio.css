@@ -2811,6 +2811,85 @@ a {
   font-size: 11px;
 }
 
+.subtitle-timing-dur-input,
+.subtitle-timing-pause-input {
+  width: 66px;
+}
+
+.subtitle-timing-nudges {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.studio-page .subtitle-nudge-fine {
+  opacity: 0.9;
+  font-size: 10.5px;
+}
+
+.subtitle-timing-feedback-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.subtitle-timing-feedback {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+
+.subtitle-timing-error {
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+}
+
+.subtitle-timing-warning {
+  color: #f5a623;
+  background: rgba(245, 166, 35, 0.12);
+  border: 1px solid rgba(245, 166, 35, 0.3);
+}
+
+.studio-page .subtitle-fix-overlap-btn {
+  min-height: 20px;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  border: 1px solid rgba(245, 166, 35, 0.5);
+  color: inherit;
+  margin-left: 6px;
+}
+
+.subtitle-timeline-cue.has-overlap {
+  border-left: 2px dashed #ff4d4f;
+  border-right: 2px dashed #ff4d4f;
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 3px,
+    rgba(255, 77, 79, 0.25) 3px,
+    rgba(255, 77, 79, 0.25) 6px
+  );
+}
+
+.subtitle-timeline-overlap-pill {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(255, 77, 79, 0.2);
+  color: #ff4d4f;
+  border: 1px solid rgba(255, 77, 79, 0.4);
+  margin-left: 6px;
+}
+
 .subtitle-source-ref {
   margin: 0;
   padding: 4px 8px;

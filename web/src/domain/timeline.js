@@ -2,7 +2,7 @@
  * @fileoverview Pure domain logic for timeline duration, interval layout calculation, clock formatting, and voice clip association.
  */
 
-import { getSpeakerColor } from './subtitles.js';
+import { getSpeakerColor, roundToMs } from './subtitles.js';
 
 export const DEFAULT_MIN_TIMELINE_DURATION_SEC = 1.0;
 export const MIN_TIMELINE_INTERVAL_PERCENT = 0.5;
@@ -94,6 +94,30 @@ export function resolveActiveSpeechClip(activeSegmentId, segmentClips) {
   return clip?.url || clip?.blob ? clip : null;
 }
 
+function buildTimelineIntervalItem(seg, index, context) {
+  const { segments, safeTotal, activeSegmentId, segmentClips } = context;
+  const start = Number.isFinite(seg.start) ? Math.max(0, seg.start) : 0;
+  const end = Number.isFinite(seg.end) ? Math.max(start, seg.end) : start;
+  const leftPercent = Math.min(100, Math.max(0, (start / safeTotal) * 100));
+  const rawWidth = Math.max(0, ((end - start) / safeTotal) * 100);
+  const widthPercent = Math.min(100 - leftPercent, Math.max(MIN_TIMELINE_INTERVAL_PERCENT, rawWidth));
+  const prevSeg = index > 0 ? segments[index - 1] : null;
+  const nextSeg = index < segments.length - 1 ? segments[index + 1] : null;
+  const pauseBefore = prevSeg ? roundToMs(start - prevSeg.end) : null;
+  const pauseAfter = nextSeg ? roundToMs(nextSeg.start - end) : null;
+  const hasOverlap = Boolean((pauseBefore !== null && pauseBefore < 0) || (pauseAfter !== null && pauseAfter < 0));
+  const clip = segmentClips[seg.id];
+  const hasVoiceClip = Boolean(clip?.url || clip?.blob);
+  return {
+    id: seg.id, index, start, end, duration: roundToMs(end - start),
+    leftPercent, widthPercent, speakerId: seg.speakerId || 'speaker-1',
+    speakerColor: getSpeakerColor(seg.speakerId), isActive: seg.id === activeSegmentId,
+    hasVoiceClip, voiceClip: hasVoiceClip ? clip : null,
+    pauseBefore, pauseAfter, hasOverlap,
+    text: (seg.text || seg.translatedText || '').trim(),
+  };
+}
+
 /**
  * Calculates display geometry and states for subtitle intervals across the timeline.
  * @param {object} params - Calculation parameters.
@@ -111,27 +135,6 @@ export function computeTimelineIntervals({
 }) {
   const safeTotal = Math.max(DEFAULT_MIN_TIMELINE_DURATION_SEC, totalDuration || 0);
   if (!Array.isArray(segments)) return [];
-  return segments.map((seg, index) => {
-    const start = Number.isFinite(seg.start) ? Math.max(0, seg.start) : 0;
-    const end = Number.isFinite(seg.end) ? Math.max(start, seg.end) : start;
-    const leftPercent = Math.min(100, Math.max(0, (start / safeTotal) * 100));
-    const rawWidth = Math.max(0, ((end - start) / safeTotal) * 100);
-    const widthPercent = Math.min(100 - leftPercent, Math.max(MIN_TIMELINE_INTERVAL_PERCENT, rawWidth));
-    const clip = segmentClips[seg.id];
-    const hasVoiceClip = Boolean(clip?.url || clip?.blob);
-    return {
-      id: seg.id,
-      index,
-      start,
-      end,
-      leftPercent,
-      widthPercent,
-      speakerId: seg.speakerId || 'speaker-1',
-      speakerColor: getSpeakerColor(seg.speakerId),
-      isActive: seg.id === activeSegmentId,
-      hasVoiceClip,
-      voiceClip: hasVoiceClip ? clip : null,
-      text: (seg.text || seg.translatedText || '').trim(),
-    };
-  });
+  const context = { segments, safeTotal, activeSegmentId, segmentClips };
+  return segments.map((seg, index) => buildTimelineIntervalItem(seg, index, context));
 }

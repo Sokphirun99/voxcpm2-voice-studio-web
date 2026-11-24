@@ -101,11 +101,35 @@ test('computeTimelineIntervals calculates exact percentages, speaker color, acti
   assert.ok(intervals[0].speakerColor);
   assert.equal(intervals[0].text, 'ជំរាបសួរ');
 
+  assert.equal(intervals[0].duration, 10);
+  assert.equal(intervals[0].pauseBefore, null);
+  assert.equal(intervals[0].pauseAfter, 10);
+  assert.equal(intervals[0].hasOverlap, false);
+
   assert.equal(intervals[1].id, 'seg-2');
   assert.equal(intervals[1].leftPercent, 20);
   assert.equal(intervals[1].widthPercent, 30);
   assert.equal(intervals[1].isActive, false);
   assert.equal(intervals[1].hasVoiceClip, false);
+  assert.equal(intervals[1].duration, 30);
+  assert.equal(intervals[1].pauseBefore, 10);
+  assert.equal(intervals[1].pauseAfter, null);
+  assert.equal(intervals[1].hasOverlap, false);
+});
+
+test('computeTimelineIntervals flags overlapping cues', () => {
+  const overlappingSegments = [
+    { id: 'c1', start: 1.0, end: 3.5, speakerId: 'speaker-1' },
+    { id: 'c2', start: 3.0, end: 5.0, speakerId: 'speaker-2' },
+  ];
+  const intervals = computeTimelineIntervals({
+    segments: overlappingSegments,
+    totalDuration: 10,
+  });
+  assert.equal(intervals[0].hasOverlap, true);
+  assert.equal(intervals[0].pauseAfter, -0.5);
+  assert.equal(intervals[1].hasOverlap, true);
+  assert.equal(intervals[1].pauseBefore, -0.5);
 });
 
 test('computeTimelineIntervals enforces minimum width for instantaneous or zero-duration cues', () => {
