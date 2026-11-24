@@ -2,7 +2,7 @@
  * @fileoverview Self-contained Function 2 workspace: Multi-language Video -> Subtitle Extractor, Editor, Translator, and Burn-in Studio.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Blocks } from 'loading-dev';
 import {
   POPULAR_SOURCE_LANGUAGE_IDS,
@@ -12,11 +12,15 @@ import {
   SUBTITLE_FONT_SCALE_OPTIONS,
   SUBTITLE_POSITION_OPTIONS,
   TARGET_LANGUAGE_OPTIONS,
+  filterSegmentsWithIssues,
+  findNextSegmentWithIssue,
+  findPreviousSegmentWithIssue,
   getSpeakerColor,
   groupLanguageOptions,
   isSameSubtitleLanguage,
   resolveModelReadinessHints,
   resolveSpeakerLabel,
+  validateSubtitleSegments,
 } from '../../domain/subtitles.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
@@ -547,9 +551,96 @@ function FindReplaceBar({ busy, countMatches, onReplace }) {
   );
 }
 
-function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
+function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverlaps, showOnlyIssues, onToggleShowOnlyIssues }) {
+  return (
+    <>
+      <div className="subtitle-validation-nav-group">
+        <button
+          type="button"
+          className="button subtle-button subtitle-cue-btn subtitle-issue-nav-btn"
+          title="Previous issue"
+          aria-label="Previous issue"
+          onClick={onJumpPrev}
+        >
+          <Icon name="chevron_up" />
+        </button>
+        <button
+          type="button"
+          className="button subtle-button subtitle-cue-btn subtitle-issue-nav-btn"
+          title="Next issue"
+          aria-label="Next issue"
+          onClick={onJumpNext}
+        >
+          <Icon name="chevron_down" />
+        </button>
+      </div>
+      {hasOverlaps && onFixOverlaps && (
+        <button
+          type="button"
+          className="button subtle-button subtitle-cue-btn subtitle-fix-all-btn"
+          title="Auto-resolve all overlapping cues"
+          onClick={onFixOverlaps}
+        >
+          <Icon name="sparkles" />
+          <span>Fix overlaps</span>
+        </button>
+      )}
+      <button
+        type="button"
+        className={`button subtle-button subtitle-cue-btn subtitle-filter-issues-btn ${showOnlyIssues ? 'is-active' : ''}`}
+        title="Filter list to show only cues with issues"
+        aria-pressed={showOnlyIssues}
+        onClick={onToggleShowOnlyIssues}
+      >
+        <Icon name="filter" />
+        <span>{showOnlyIssues ? 'Show all' : 'Issues only'}</span>
+      </button>
+    </>
+  );
+}
+
+function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOverlaps, showOnlyIssues, onToggleShowOnlyIssues }) {
+  if (!validation) return null;
+  const { isValid, totalIssues, errorCount, warningCount } = validation;
+  if (isValid) {
+    return (
+      <span className="subtitle-validation-badge is-clean" title="All subtitle cues pass validation rules">
+        <Icon name="check_circle" className="subtitle-validation-badge-icon" />
+        <span>Valid</span>
+      </span>
+    );
+  }
+  const badgeClass = `subtitle-validation-badge has-issues is-${errorCount > 0 ? 'error' : 'warning'}`;
+  const title = `${errorCount} error(s), ${warningCount} warning(s). Click to jump to next issue.`;
+  const hasOverlaps = validation.issues?.some(i => i.type === 'overlap');
+  return (
+    <div className="subtitle-validation-summary-bar" role="toolbar" aria-label="Subtitle validation">
+      <button
+        type="button"
+        className={badgeClass}
+        title={title}
+        onClick={onJumpNext}
+        aria-label={`Jump to next issue: ${totalIssues} issues found`}
+      >
+        <Icon name="warning" className="subtitle-validation-badge-icon" />
+        <span>{totalIssues} {totalIssues === 1 ? 'issue' : 'issues'}</span>
+      </button>
+      <ValidationNavActions
+        onJumpNext={onJumpNext}
+        onJumpPrev={onJumpPrev}
+        hasOverlaps={hasOverlaps}
+        onFixOverlaps={onFixOverlaps}
+        showOnlyIssues={showOnlyIssues}
+        onToggleShowOnlyIssues={onToggleShowOnlyIssues}
+      />
+    </div>
+  );
+}
+
+export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
   const { segments, speakerNames, detectedLanguage, busyAction } = ctrl.state;
   const [showFind, setShowFind] = useState(false);
+  const [showOnlyIssues, setShowOnlyIssues] = useState(false);
   const mediaBusy = Boolean(busyAction);
   const busy = mediaBusy || voice.voiceBusy || voice.dubBusy;
   const selectedSet = new Set(voice.selectedIds);
@@ -563,6 +654,23 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
     );
   }
   const hasMultiSpeakers = ctrl.speakers.length > 1;
+  const jumpToSegmentIssue = (targetId) => {
+    if (!targetId) return;
+    const target = segments.find(s => s.id === targetId);
+    if (target) {
+      ctrl.seekToSegment(target.start, targetId);
+      const el = typeof document !== 'undefined' ? document.querySelector(`[data-segment-id="${targetId}"]`) : null;
+      el?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+      el?.querySelector?.('textarea')?.focus?.();
+    }
+  };
+  const handleAssignVoice = (segmentId) => {
+    const targetSeg = segments.find(s => s.id === segmentId);
+    if (targetSeg?.voiceId) voice.setSelectedVoiceId?.(targetSeg.voiceId);
+    if (!voice.selectedIds.includes(segmentId)) voice.toggleSelectSegment?.(segmentId);
+    if (typeof document !== 'undefined') document.getElementById('subtitle-tts-voice')?.focus?.();
+  };
+  const displayedSegments = showOnlyIssues ? filterSegmentsWithIssues(segments, validation?.issuesBySegmentId) : segments;
   return (
     <div className="subtitle-cue-list">
       <div className="subtitle-cue-meta">
@@ -570,6 +678,14 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
           {segments.length} {segments.length === 1 ? 'segment' : 'segments'}
           {hasMultiSpeakers ? ` · ${ctrl.speakers.length} speakers` : ''}
         </span>
+        <ValidationSummaryControls
+          validation={validation}
+          onJumpNext={() => jumpToSegmentIssue(findNextSegmentWithIssue(segments, validation?.issuesBySegmentId, ctrl.activeSegmentId))}
+          onJumpPrev={() => jumpToSegmentIssue(findPreviousSegmentWithIssue(segments, validation?.issuesBySegmentId, ctrl.activeSegmentId))}
+          onFixOverlaps={() => ctrl.resolveOverlaps?.()}
+          showOnlyIssues={showOnlyIssues}
+          onToggleShowOnlyIssues={() => setShowOnlyIssues(v => !v)}
+        />
         <div className="subtitle-cue-meta-right">
           {detectedLanguage ? <span>Detected: {detectedLanguage.toUpperCase()}</span> : null}
           <button type="button" id="subtitle-find-toggle" className="button subtle-button subtitle-cue-btn"
@@ -597,43 +713,56 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
         onCancelVoice={voice.cancelVoiceGeneration}
       />
       {showFind && <FindReplaceBar busy={busy} countMatches={ctrl.countMatches} onReplace={ctrl.findAndReplace} />}
-      {segments.map((seg, index) => (
-        <SubtitleSegmentRow
-          key={seg.id}
-          segment={seg}
-          prevSegment={index > 0 ? segments[index - 1] : null}
-          nextSegment={index < segments.length - 1 ? segments[index + 1] : null}
-          mediaDuration={ctrl.mediaDuration}
-          speakers={ctrl.speakers}
-          speakerNames={speakerNames}
-          useTranslation={ctrl.useTranslation}
-          targetLangMeta={ctrl.translatedLanguageMeta}
-          sourceLanguage={detectedLanguage || ctrl.state.options.sourceLanguage}
-          showSpeakerBadge={hasMultiSpeakers}
-          isActive={seg.id === ctrl.activeSegmentId}
-          isSelected={selectedSet.has(seg.id)}
-          canMergeNext={index < segments.length - 1}
-          busy={busy}
-          voiceClip={voice.segmentClips[seg.id] || null}
-          isVoiceStale={voice.isClipStale(seg)}
-          isGeneratingVoice={voice.generatingSegmentId === seg.id}
-          isPlayingVoice={voice.playingSegmentId === seg.id}
-          voiceDisabled={voice.voiceBusy}
-          onToggleSelect={voice.toggleSelectSegment}
-          onSeek={seconds => ctrl.seekToSegment(seconds, seg.id)}
-          onUpdate={ctrl.updateSegment}
-          onUpdateTiming={ctrl.updateSegmentTiming}
-          onUpdatePause={ctrl.updateSegmentPause}
-          onSplit={ctrl.splitSegment}
-          onMergeNext={ctrl.mergeSegmentWithNext}
-          onDelete={onDeleteSegment}
-          onApplySuggestion={ctrl.applySegmentSuggestion}
-          onDismissSuggestion={ctrl.dismissSegmentSuggestion}
-          onGenerateVoice={segment => void voice.generateSegmentVoice(segment)}
-          onTogglePlayVoice={voice.togglePlaySegment}
-          onDownloadVoice={segment => voice.downloadSegmentVoice(segment, index)}
-        />
-      ))}
+      {displayedSegments.length === 0 && showOnlyIssues ? (
+        <div className="subtitle-empty-state">
+          <p>No cues have validation issues.</p>
+        </div>
+      ) : (
+        displayedSegments.map((seg) => {
+          const realIndex = segments.findIndex(s => s.id === seg.id);
+          const prevSeg = realIndex > 0 ? segments[realIndex - 1] : null;
+          const nextSeg = realIndex >= 0 && realIndex < segments.length - 1 ? segments[realIndex + 1] : null;
+          return (
+            <SubtitleSegmentRow
+              key={seg.id}
+              segment={seg}
+              prevSegment={prevSeg}
+              nextSegment={nextSeg}
+              mediaDuration={ctrl.mediaDuration}
+              speakers={ctrl.speakers}
+              speakerNames={speakerNames}
+              useTranslation={ctrl.useTranslation}
+              targetLangMeta={ctrl.translatedLanguageMeta}
+              sourceLanguage={detectedLanguage || ctrl.state.options.sourceLanguage}
+              showSpeakerBadge={hasMultiSpeakers}
+              isActive={seg.id === ctrl.activeSegmentId}
+              isSelected={selectedSet.has(seg.id)}
+              canMergeNext={Boolean(nextSeg)}
+              validationIssues={validation?.issuesBySegmentId?.[seg.id] || []}
+              busy={busy}
+              voiceClip={voice.segmentClips[seg.id] || null}
+              isVoiceStale={voice.isClipStale(seg)}
+              isGeneratingVoice={voice.generatingSegmentId === seg.id}
+              isPlayingVoice={voice.playingSegmentId === seg.id}
+              voiceDisabled={voice.voiceBusy}
+              onToggleSelect={voice.toggleSelectSegment}
+              onSeek={seconds => ctrl.seekToSegment(seconds, seg.id)}
+              onUpdate={ctrl.updateSegment}
+              onUpdateTiming={ctrl.updateSegmentTiming}
+              onUpdatePause={ctrl.updateSegmentPause}
+              onSplit={ctrl.splitSegment}
+              onMergeNext={ctrl.mergeSegmentWithNext}
+              onDelete={onDeleteSegment}
+              onApplySuggestion={ctrl.applySegmentSuggestion}
+              onDismissSuggestion={ctrl.dismissSegmentSuggestion}
+              onGenerateVoice={segment => void voice.generateSegmentVoice(segment)}
+              onTogglePlayVoice={voice.togglePlaySegment}
+              onDownloadVoice={segment => voice.downloadSegmentVoice(segment, realIndex)}
+              onAssignVoice={() => handleAssignVoice(seg.id)}
+            />
+          );
+        })
+      )}
       <SubtitleVoiceOutputCard
         combinedClip={voice.combinedClip}
         busy={busy || voice.voiceBusy}
@@ -739,6 +868,17 @@ export function VideoSubtitleWorkspace({
     }
     onSendToTts?.(handoff.text);
   };
+  const validation = useMemo(() => validateSubtitleSegments({
+    segments: state.segments,
+    useTranslation: ctrl.useTranslation,
+    targetLanguage: state.options.targetLanguage,
+    sourceLanguage: state.options.sourceLanguage,
+    hasVoiceover: Boolean(ctrl.speakers.length > 1 && voice.selectedVoiceId),
+    requireVoiceAssignment: Boolean(ctrl.speakers.length > 1 && voice.selectedVoiceId),
+    characters: voice.characters,
+    selectedVoiceId: voice.selectedVoiceId,
+    mediaDuration: ctrl.mediaDuration,
+  }), [state.segments, ctrl.useTranslation, state.options.targetLanguage, state.options.sourceLanguage, ctrl.speakers.length, voice.selectedVoiceId, voice.characters, ctrl.mediaDuration]);
   return (
     <div className="workspace-panel subtitle-workspace" hidden={hidden}>
       <div className="workspace-notices">
@@ -782,6 +922,7 @@ export function VideoSubtitleWorkspace({
             activeSegmentId={ctrl.activeSegmentId}
             segmentClips={voice.segmentClips}
             playingSegmentId={voice.playingSegmentId}
+            validationBySegmentId={validation.issuesBySegmentId}
             busy={busy}
             onSeekTime={ctrl.seekToTime}
             onSelectCue={cue => ctrl.seekToSegment(cue.start, cue.id)}
@@ -798,7 +939,7 @@ export function VideoSubtitleWorkspace({
           />
         </section>
         <section className="subtitle-right-pane studio-form" aria-label="Extracted dialogue subtitles">
-          <SubtitleCueList ctrl={ctrl} voice={voice} onDeleteSegment={handleDeleteSegment} />
+          <SubtitleCueList ctrl={ctrl} voice={voice} onDeleteSegment={handleDeleteSegment} validation={validation} />
         </section>
       </div>
       <SubtitleExportDock

@@ -138,3 +138,25 @@ test('computeTimelineIntervals enforces minimum width for instantaneous or zero-
   assert.equal(intervals[0].leftPercent, 5);
   assert.equal(intervals[0].widthPercent, MIN_TIMELINE_INTERVAL_PERCENT);
 });
+
+test('computeTimelineIntervals attaches validation error and warning flags from validationBySegmentId', () => {
+  const segments = [
+    { id: 'c1', start: 0, end: 5, speakerId: 'speaker-1' },
+    { id: 'c2', start: 6, end: 12, speakerId: 'speaker-1' },
+  ];
+  const validationBySegmentId = {
+    c1: [{ severity: 'error', message: 'Duration too short' }],
+    c2: [{ severity: 'warning', message: 'Line exceeds limit' }],
+  };
+  const intervals = computeTimelineIntervals({
+    segments,
+    totalDuration: 20,
+    validationBySegmentId,
+  });
+  assert.equal(intervals[0].hasError, true);
+  assert.equal(intervals[0].hasWarning, false);
+  assert.equal(intervals[0].issueCount, 1);
+  assert.equal(intervals[1].hasError, false);
+  assert.equal(intervals[1].hasWarning, true);
+  assert.equal(intervals[1].issueCount, 1);
+});

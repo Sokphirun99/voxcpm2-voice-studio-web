@@ -19,6 +19,27 @@ export {
   pickDefaultTargetLanguage,
   resolveTargetLanguageMeta,
 } from './subtitleLanguages.js';
+export {
+  MAX_CHARS_PER_LINE,
+  MAX_LINE_BREAKS,
+  MAX_READING_SPEED_CPS,
+  REMEDY_ACTIONS,
+  SUBTITLE_ISSUE_SEVERITIES,
+  SUBTITLE_ISSUE_TYPES,
+  VALIDATION_MAX_DURATION_SEC,
+  VALIDATION_MIN_DURATION_SEC,
+  autoBreakLongLine,
+  detectValidationOverlaps,
+  filterSegmentsWithIssues,
+  findNextSegmentWithIssue,
+  findPreviousSegmentWithIssue,
+  validateSegmentDuration,
+  validateSegmentLineLengths,
+  validateSegmentText,
+  validateSegmentVoice,
+  validateSingleSegment,
+  validateSubtitleSegments,
+} from './subtitleValidation.js';
 
 export const SUBTITLE_SPEAKER_COLORS = Object.freeze([
   '#eeeeec',

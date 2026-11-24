@@ -94,18 +94,36 @@ export function resolveActiveSpeechClip(activeSegmentId, segmentClips) {
   return clip?.url || clip?.blob ? clip : null;
 }
 
-function buildTimelineIntervalItem(seg, index, context) {
-  const { segments, safeTotal, activeSegmentId, segmentClips } = context;
-  const start = Number.isFinite(seg.start) ? Math.max(0, seg.start) : 0;
-  const end = Number.isFinite(seg.end) ? Math.max(start, seg.end) : start;
-  const leftPercent = Math.min(100, Math.max(0, (start / safeTotal) * 100));
-  const rawWidth = Math.max(0, ((end - start) / safeTotal) * 100);
-  const widthPercent = Math.min(100 - leftPercent, Math.max(MIN_TIMELINE_INTERVAL_PERCENT, rawWidth));
+function resolveTimelineGapStatus(start, end, index, segments) {
   const prevSeg = index > 0 ? segments[index - 1] : null;
   const nextSeg = index < segments.length - 1 ? segments[index + 1] : null;
   const pauseBefore = prevSeg ? roundToMs(start - prevSeg.end) : null;
   const pauseAfter = nextSeg ? roundToMs(nextSeg.start - end) : null;
   const hasOverlap = Boolean((pauseBefore !== null && pauseBefore < 0) || (pauseAfter !== null && pauseAfter < 0));
+  return { pauseBefore, pauseAfter, hasOverlap };
+}
+
+function resolveTimelineValidationStatus(segId, validationBySegmentId) {
+  const issues = validationBySegmentId?.[segId] || [];
+  const hasError = issues.some(iss => iss.severity === 'error');
+  const hasWarning = !hasError && issues.some(iss => iss.severity === 'warning');
+  return { issues, hasError, hasWarning, issueCount: issues.length };
+}
+
+function computeIntervalGeometry(start, end, safeTotal) {
+  const leftPercent = Math.min(100, Math.max(0, (start / safeTotal) * 100));
+  const rawWidth = Math.max(0, ((end - start) / safeTotal) * 100);
+  const widthPercent = Math.min(100 - leftPercent, Math.max(MIN_TIMELINE_INTERVAL_PERCENT, rawWidth));
+  return { leftPercent, widthPercent };
+}
+
+function buildTimelineIntervalItem(seg, index, context) {
+  const { segments, safeTotal, activeSegmentId, segmentClips, validationBySegmentId } = context;
+  const start = Number.isFinite(seg.start) ? Math.max(0, seg.start) : 0;
+  const end = Number.isFinite(seg.end) ? Math.max(start, seg.end) : start;
+  const { leftPercent, widthPercent } = computeIntervalGeometry(start, end, safeTotal);
+  const { pauseBefore, pauseAfter, hasOverlap } = resolveTimelineGapStatus(start, end, index, segments);
+  const { issues, hasError, hasWarning, issueCount } = resolveTimelineValidationStatus(seg.id, validationBySegmentId);
   const clip = segmentClips[seg.id];
   const hasVoiceClip = Boolean(clip?.url || clip?.blob);
   return {
@@ -114,6 +132,7 @@ function buildTimelineIntervalItem(seg, index, context) {
     speakerColor: getSpeakerColor(seg.speakerId), isActive: seg.id === activeSegmentId,
     hasVoiceClip, voiceClip: hasVoiceClip ? clip : null,
     pauseBefore, pauseAfter, hasOverlap,
+    hasError, hasWarning, issueCount, validationIssues: issues,
     text: (seg.text || seg.translatedText || '').trim(),
   };
 }
@@ -125,6 +144,7 @@ function buildTimelineIntervalItem(seg, index, context) {
  * @param {number} params.totalDuration - Total timeline duration in seconds.
  * @param {string} [params.activeSegmentId=''] - Currently selected or active segment ID.
  * @param {Record<string, object>} [params.segmentClips={}] - Voice clips keyed by segment ID.
+ * @param {Record<string, Array<object>>} [params.validationBySegmentId={}] - Validation issues by cue ID.
  * @returns {Array<object>} Interval render descriptors.
  */
 export function computeTimelineIntervals({
@@ -132,9 +152,10 @@ export function computeTimelineIntervals({
   totalDuration,
   activeSegmentId = '',
   segmentClips = {},
+  validationBySegmentId = {},
 }) {
   const safeTotal = Math.max(DEFAULT_MIN_TIMELINE_DURATION_SEC, totalDuration || 0);
   if (!Array.isArray(segments)) return [];
-  const context = { segments, safeTotal, activeSegmentId, segmentClips };
+  const context = { segments, safeTotal, activeSegmentId, segmentClips, validationBySegmentId };
   return segments.map((seg, index) => buildTimelineIntervalItem(seg, index, context));
 }

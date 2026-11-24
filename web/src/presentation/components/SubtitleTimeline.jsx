@@ -28,12 +28,18 @@ function CueBadgeTiming({ activeInterval }) {
   const cueLabel = `Cue #${activeInterval.index + 1}`;
   const durLabel = activeInterval.duration ? ` (${activeInterval.duration.toFixed(2)}s)` : '';
   const cueTime = `${formatTimelineClock(activeInterval.start, false)} – ${formatTimelineClock(activeInterval.end, false)}${durLabel}`;
+  const issuePill = activeInterval.hasError ? 'Error' : activeInterval.hasWarning ? 'Warning' : '';
   return (
     <div className="subtitle-timeline-cue-badge" style={{ '--spk-color': activeInterval.speakerColor }}>
       <span className="subtitle-speaker-dot" aria-hidden="true" />
       <strong className="subtitle-timeline-cue-title">{cueLabel}</strong>
       <span className="subtitle-timeline-cue-time">{cueTime}</span>
       {activeInterval.hasOverlap && <span className="subtitle-timeline-overlap-pill">Overlap</span>}
+      {issuePill && (
+        <span className={`subtitle-timeline-issue-pill is-${issuePill.toLowerCase()}`}>
+          {issuePill}
+        </span>
+      )}
     </div>
   );
 }
@@ -78,7 +84,8 @@ function buildCueTitle(interval) {
   const time = `${formatTimelineClock(interval.start, false)} - ${formatTimelineClock(interval.end, false)}`;
   const voice = interval.hasVoiceClip ? ' · Voice generated' : '';
   const overlap = interval.hasOverlap ? ' · Overlaps neighbor' : '';
-  return `Cue #${interval.index + 1} (${time})${voice}${overlap}`;
+  const validation = interval.issueCount ? ` · ${interval.issueCount} issue(s)` : '';
+  return `Cue #${interval.index + 1} (${time})${voice}${overlap}${validation}`;
 }
 
 function TimelineIntervalCue({ interval, onClick }) {
@@ -87,6 +94,8 @@ function TimelineIntervalCue({ interval, onClick }) {
     interval.isActive ? 'is-active' : '',
     interval.hasVoiceClip ? 'has-voice' : '',
     interval.hasOverlap ? 'has-overlap' : '',
+    interval.hasError ? 'has-error' : '',
+    interval.hasWarning ? 'has-warning' : '',
   ].filter(Boolean).join(' ');
   const style = { left: `${interval.leftPercent}%`, width: `${interval.widthPercent}%`, '--spk-color': interval.speakerColor };
   return (
@@ -120,6 +129,7 @@ export const SubtitleTimeline = memo(function SubtitleTimeline({
   activeSegmentId = '',
   segmentClips = {},
   playingSegmentId = '',
+  validationBySegmentId = {},
   busy = false,
   onSeekTime,
   onSelectCue,
@@ -131,8 +141,8 @@ export const SubtitleTimeline = memo(function SubtitleTimeline({
     [segments, mediaDuration]
   );
   const intervals = useMemo(
-    () => computeTimelineIntervals({ segments, totalDuration, activeSegmentId, segmentClips }),
-    [segments, totalDuration, activeSegmentId, segmentClips]
+    () => computeTimelineIntervals({ segments, totalDuration, activeSegmentId, segmentClips, validationBySegmentId }),
+    [segments, totalDuration, activeSegmentId, segmentClips, validationBySegmentId]
   );
   const activeInterval = useMemo(
     () => intervals.find(item => item.id === activeSegmentId) || null,

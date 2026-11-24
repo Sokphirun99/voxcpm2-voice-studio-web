@@ -146,3 +146,31 @@ test('SubtitleTimeline toggles play/pause button label when active voice clip is
     assert.ok(html.includes('Pause'), 'Play button must show Pause text when playing');
   });
 });
+
+test('SubtitleTimeline displays validation error and warning markers on affected cues', async () => {
+  await withViteSsr(async vite => {
+    const { SubtitleTimeline } = await vite.ssrLoadModule('/src/presentation/components/SubtitleTimeline.jsx');
+    const segments = [
+      { id: 'c1', start: 0, end: 5, speakerId: 'speaker-1' },
+      { id: 'c2', start: 6, end: 12, speakerId: 'speaker-2' },
+    ];
+    const validationBySegmentId = {
+      c1: [{ severity: 'error', message: 'Missing text' }],
+      c2: [{ severity: 'warning', message: 'Reading speed high' }],
+    };
+
+    const html = renderToStaticMarkup(
+      React.createElement(SubtitleTimeline, {
+        currentTime: 0,
+        mediaDuration: 15,
+        segments,
+        activeSegmentId: 'c1',
+        validationBySegmentId,
+      })
+    );
+
+    assert.ok(html.includes('has-error'), 'Cue 1 must have has-error class');
+    assert.ok(html.includes('has-warning'), 'Cue 2 must have has-warning class');
+    assert.ok(html.includes('subtitle-timeline-issue-pill is-error'), 'Active Cue 1 badge must show error pill');
+  });
+});
