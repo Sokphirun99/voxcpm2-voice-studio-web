@@ -632,6 +632,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
   const [busyMeta, setBusyMeta] = useState(null);
   const [activeSegmentId, setActiveSegmentId] = useState('');
   const [ttsSpeakerId, setTtsSpeakerId] = useState('');
+  const [currentTime, setCurrentTime] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState(0);
   const [state, setState] = useState({
     videoFile: null,
     videoFileName: null,
@@ -701,6 +703,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
 
   const selectVideoFile = useCallback(file => {
     if (!file) return;
+    setCurrentTime(0);
+    setMediaDuration(0);
     if (!ALLOWED_EXT_PATTERN.test(file.name || '') && !String(file.type || '').startsWith('video/') && !String(file.type || '').startsWith('audio/')) {
       const msg = 'Choose a valid video or audio file (.mp4, .mov, .mkv, .webm, .wav, .mp3).';
       setState(prev => ({ ...prev, status: { message: msg, error: true } }));
@@ -721,6 +725,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setBusyMeta(null);
     setActiveSegmentId('');
     setTtsSpeakerId('');
+    setCurrentTime(0);
+    setMediaDuration(0);
     setState(prev => ({
       ...prev,
       videoFile: file,
@@ -797,6 +803,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setBusyMeta(null);
     setActiveSegmentId('');
     setTtsSpeakerId('');
+    setCurrentTime(0);
+    setMediaDuration(0);
     setState(prev => ({
       ...prev,
       videoFile: null,
@@ -851,23 +859,45 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setState(prev => ({ ...prev, speakerNames: { ...prev.speakerNames, [speakerId]: name } }));
   }, []);
 
-  const seekToSegment = useCallback(seconds => {
+  const seekToSegment = useCallback((seconds, segmentId) => {
     const el = videoRef.current;
-    if (!el || !Number.isFinite(seconds)) return;
-    el.currentTime = Math.max(0, seconds);
-    void el.play?.().catch(err => services?.logger?.debug?.('useVideoSubtitles.seekToSegment', err?.message || 'Playback skipped'));
-  }, [services]);
+    if (!Number.isFinite(seconds)) return;
+    const safeSec = Math.max(0, seconds);
+    if (el) {
+      el.currentTime = safeSec;
+      void el.play?.().catch(err => services?.logger?.debug?.('useVideoSubtitles.seekToSegment', err?.message || 'Playback skipped'));
+    }
+    setCurrentTime(safeSec);
+    const targetId = segmentId || findActiveSegmentId(state.segments, safeSec);
+    if (targetId) setActiveSegmentId(targetId);
+  }, [services, state.segments]);
+
+  const seekToTime = useCallback(seconds => {
+    const el = videoRef.current;
+    if (!Number.isFinite(seconds)) return;
+    const safeSec = Math.max(0, seconds);
+    if (el) el.currentTime = safeSec;
+    setCurrentTime(safeSec);
+    const nextId = findActiveSegmentId(state.segments, safeSec);
+    setActiveSegmentId(prev => (prev === nextId ? prev : nextId));
+  }, [state.segments]);
 
   const handleVideoMetadata = useCallback(videoEl => {
     const width = Number(videoEl?.videoWidth) || 0;
     const height = Number(videoEl?.videoHeight) || 0;
+    const dur = Number(videoEl?.duration);
+    if (Number.isFinite(dur) && dur > 0) setMediaDuration(dur);
     if (width <= 0 || height <= 0) return;
     setState(prev => ({ ...prev, videoSize: { width, height } }));
   }, []);
 
-  const handleVideoTimeUpdate = useCallback(currentTime => {
-    const nextId = findActiveSegmentId(state.segments, currentTime);
-    setActiveSegmentId(prev => (prev === nextId ? prev : nextId));
+  const handleVideoTimeUpdate = useCallback((currTime, dur) => {
+    if (Number.isFinite(currTime)) {
+      setCurrentTime(currTime);
+      const nextId = findActiveSegmentId(state.segments, currTime);
+      setActiveSegmentId(prev => (prev === nextId ? prev : nextId));
+    }
+    if (Number.isFinite(dur) && dur > 0) setMediaDuration(dur);
   }, [state.segments]);
 
   const exportFile = useCallback(format => {
@@ -1093,6 +1123,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     state,
     busyMeta,
     activeSegmentId,
+    currentTime,
+    mediaDuration,
     ttsSpeakerId,
     setTtsSpeakerId,
     projectId: state.projectId,
@@ -1120,6 +1152,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     updateSubtitleStyle,
     updateSpeakerName,
     seekToSegment,
+    seekToTime,
     handleVideoMetadata,
     handleVideoTimeUpdate,
     exportFile,

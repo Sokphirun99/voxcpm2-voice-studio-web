@@ -28,6 +28,7 @@ import { OfflineReadinessBadge } from './OfflineReadinessBadge.jsx';
 import { ProjectAutosaveBadge } from './ProjectAutosaveBadge.jsx';
 import { SubtitleExportDock } from './SubtitleExportDock.jsx';
 import { SubtitleSegmentRow } from './SubtitleSegmentRow.jsx';
+import { SubtitleTimeline } from './SubtitleTimeline.jsx';
 import { SubtitleVoiceOutputCard, SubtitleVoiceToolbar } from './SubtitleVoiceControls.jsx';
 
 const GENERATE_SPINNER_SIZE_PX = 16;
@@ -120,7 +121,7 @@ function VideoPreviewCard({ ctrl, busy = false, onSelectFile, onImportSubtitle }
             playsInline
             className="subtitle-video-player"
             onLoadedMetadata={e => { handleVideoMetadata?.(e.currentTarget); showTrack(); }}
-            onTimeUpdate={e => handleVideoTimeUpdate?.(e.currentTarget.currentTime)}
+            onTimeUpdate={e => handleVideoTimeUpdate?.(e.currentTarget.currentTime, e.currentTarget.duration)}
           >
             {vttUrl && (
               <track
@@ -616,7 +617,7 @@ function SubtitleCueList({ ctrl, voice, onDeleteSegment }) {
           isPlayingVoice={voice.playingSegmentId === seg.id}
           voiceDisabled={voice.voiceBusy}
           onToggleSelect={voice.toggleSelectSegment}
-          onSeek={ctrl.seekToSegment}
+          onSeek={seconds => ctrl.seekToSegment(seconds, seg.id)}
           onUpdate={ctrl.updateSegment}
           onUpdateTiming={ctrl.updateSegmentTiming}
           onSplit={ctrl.splitSegment}
@@ -770,6 +771,18 @@ export function VideoSubtitleWorkspace({
       <div className="studio-grid subtitle-grid">
         <section className="subtitle-left-pane" aria-label="Video and controls">
           <VideoPreviewCard ctrl={ctrl} busy={busy} onSelectFile={handleSelectFile} onImportSubtitle={handleImportSubtitle} />
+          <SubtitleTimeline
+            currentTime={ctrl.currentTime}
+            mediaDuration={ctrl.mediaDuration}
+            segments={state.segments}
+            activeSegmentId={ctrl.activeSegmentId}
+            segmentClips={voice.segmentClips}
+            playingSegmentId={voice.playingSegmentId}
+            busy={busy}
+            onSeekTime={ctrl.seekToTime}
+            onSelectCue={cue => ctrl.seekToSegment(cue.start, cue.id)}
+            onTogglePlayVoice={voice.togglePlaySegment}
+          />
           <ProjectSelector ctrl={ctrl} />
           <SubtitleSettingsForm ctrl={ctrl} modelHints={modelHints} />
           <SpeakerRosterCard
