@@ -83,7 +83,7 @@ async function readHttpErrorDetail(response, fallback) {
  * @param {object} spec - Upload file and analysis options.
  * @returns {FormData} Multipart form payload.
  */
-function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, diarize = true, translateTo = '', translateToKhmer = false, doubleCheck = false }) {
+function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, diarize = true, translateTo = '', translateToKhmer = false, doubleCheck = false, terminology = null }) {
   const form = new FormData();
   const target = String(translateTo || '').trim() || (translateToKhmer ? 'km' : '');
   form.append('file', file, file?.name || 'video.mp4');
@@ -92,6 +92,9 @@ function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, dia
   form.append('diarize', String(Boolean(diarize)));
   form.append('translate_to', target);
   form.append('double_check', String(Boolean(doubleCheck)));
+  if (Array.isArray(terminology) && terminology.length > 0) {
+    form.append('terminology', JSON.stringify(terminology));
+  }
   return form;
 }
 
@@ -181,12 +184,16 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       }
     },
 
-    async translateSegments({ segments, sourceLanguage, targetLanguage = 'km', signal }) {
+    async translateSegments({ segments, sourceLanguage, targetLanguage = 'km', terminology = null, signal }) {
       try {
+        const body = { segments, sourceLanguage, targetLanguage };
+        if (Array.isArray(terminology) && terminology.length > 0) {
+          body.terminology = terminology;
+        }
         const res = await fetchImpl(TRANSLATE_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ segments, sourceLanguage, targetLanguage }),
+          body: JSON.stringify(body),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not translate subtitles'), { status: res.status });

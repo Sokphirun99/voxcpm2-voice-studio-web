@@ -14,7 +14,10 @@ import {
   resolveProjectType,
   useProjects,
 } from '../hooks/useProjects.js';
+import { useStudioServices } from '../StudioContext.jsx';
+import { useTerminology } from '../hooks/useTerminology.js';
 import { Icon } from './Icon.jsx';
+import { TerminologyManagerModal } from './TerminologyManagerModal.jsx';
 
 const TYPE_ICONS = Object.freeze({
   tts: 'square_pencil',
@@ -48,11 +51,23 @@ function handleBackdropClick(event, dialogRef, onClose) {
   if (isOutside) onClose();
 }
 
-function ProjectsToolbar({ onCreate, busy }) {
+function ProjectsToolbar({ onCreate, onOpenTerminology, termCount = 0, busy }) {
   return (
     <header className="studio-toolbar">
       <h1>Projects</h1>
       <div className="toolbar-actions">
+        {onOpenTerminology && (
+          <button
+            type="button"
+            id="open-global-terminology"
+            className="button subtle-button"
+            disabled={busy}
+            onClick={onOpenTerminology}
+          >
+            <Icon name="list_bullet" />
+            <span>Terminology{termCount > 0 ? ` (${termCount})` : ''}</span>
+          </button>
+        )}
         <button
           type="button"
           id="new-project-btn"
@@ -440,11 +455,26 @@ function ProjectsBannerAndContent({ api }) {
  * @param {object} props - Workspace props.
  * @returns {React.ReactElement} Projects workspace component.
  */
-export function ProjectsWorkspace({ hidden = false, onOpenProject, onNotify, projectRepository, initialProjects = [] }) {
+export function ProjectsWorkspace({ hidden = false, onOpenProject, onNotify, projectRepository, initialProjects = [], globalTerminology = null }) {
   const api = useProjects({ onOpenProject, onNotify, projectRepository, initialProjects });
+  const services = useStudioServices();
+  const [terminologyOpen, setTerminologyOpen] = useState(false);
+  const terminologyCtrl = useTerminology({
+    globalController: globalTerminology,
+    terminologyRepository: services?.terminologyRepository,
+    glossaryRepository: services?.glossaryRepository,
+    onNotify,
+    logger: services?.logger,
+  });
+  const canManageTerminology = Boolean(globalTerminology || services?.terminologyRepository);
   return (
     <div className="workspace-panel projects-workspace" hidden={hidden} aria-label="Projects workspace">
-      <ProjectsToolbar onCreate={api.openCreateModal} busy={api.busy} />
+      <ProjectsToolbar
+        onCreate={api.openCreateModal}
+        onOpenTerminology={canManageTerminology ? () => setTerminologyOpen(true) : null}
+        termCount={terminologyCtrl.counts.approved}
+        busy={api.busy}
+      />
       <ProjectsFilterBar
         filterType={api.filterType}
         searchQuery={api.searchQuery}
@@ -454,6 +484,14 @@ export function ProjectsWorkspace({ hidden = false, onOpenProject, onNotify, pro
       />
       <ProjectsBannerAndContent api={api} />
       <ProjectModals api={api} />
+      {canManageTerminology && (
+        <TerminologyManagerModal
+          open={terminologyOpen}
+          terminologyCtrl={terminologyCtrl}
+          canEditProject={false}
+          onClose={() => setTerminologyOpen(false)}
+        />
+      )}
     </div>
   );
 }

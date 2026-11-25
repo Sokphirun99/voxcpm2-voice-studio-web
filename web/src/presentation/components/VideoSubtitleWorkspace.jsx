@@ -23,7 +23,9 @@ import {
   validateSubtitleSegments,
 } from '../../domain/subtitles.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
+import { useStudioServices } from '../StudioContext.jsx';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
+import { useTerminology } from '../hooks/useTerminology.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
 import { DraftRecoveryBanner } from './DraftRecoveryBanner.jsx';
@@ -34,6 +36,7 @@ import { SubtitleExportDock } from './SubtitleExportDock.jsx';
 import { SubtitleSegmentRow } from './SubtitleSegmentRow.jsx';
 import { SubtitleTimeline } from './SubtitleTimeline.jsx';
 import { SubtitleVoiceOutputCard, SubtitleVoiceToolbar } from './SubtitleVoiceControls.jsx';
+import { TerminologyManagerModal } from './TerminologyManagerModal.jsx';
 
 const GENERATE_SPINNER_SIZE_PX = 16;
 
@@ -45,7 +48,7 @@ const SPEAKER_COUNT_OPTIONS = Object.freeze([
   { id: '6', label: '5+ speakers' },
 ]);
 
-function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract, autosave, offlineReadiness, onSelectModels }) {
+function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, onClear, onCancel, onExtract, autosave, offlineReadiness, onSelectModels, onOpenTerminology, terminologyCount = 0 }) {
   return (
     <header className="studio-toolbar">
       <div className="toolbar-heading-group">
@@ -54,6 +57,13 @@ function SubtitleToolbar({ busy, extracting, relinking, hasFile, hasSegments, on
         {offlineReadiness && <OfflineReadinessBadge readiness={offlineReadiness} onSelect={onSelectModels} />}
       </div>
       <div className="toolbar-actions">
+        {onOpenTerminology && (
+          <button type="button" id="subtitle-terminology-btn" className="button subtle-button"
+            disabled={busy} onClick={onOpenTerminology}>
+            <Icon name="list_bullet" />
+            <span>Terminology{terminologyCount > 0 ? ` (${terminologyCount})` : ''}</span>
+          </button>
+        )}
         {!busy && (
           <button type="button" id="subtitle-clear-btn" className="button subtle-button cancel-button"
             disabled={!hasFile && !hasSegments} onClick={onClear}>Clear</button>
@@ -551,7 +561,21 @@ function FindReplaceBar({ busy, countMatches, onReplace }) {
   );
 }
 
-function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverlaps, hasSafeDurations, onFixSafeDurations, showOnlyIssues, onToggleShowOnlyIssues }) {
+function ValidationNavActions({
+  onJumpNext,
+  onJumpPrev,
+  hasOverlaps,
+  onFixOverlaps,
+  hasSafeDurations,
+  onFixSafeDurations,
+  hasSpellingIssues,
+  onFixSpelling,
+  hasTranslationTermIssues,
+  onFixTranslationTerms,
+  showOnlyIssues,
+  onToggleShowOnlyIssues,
+  busy = false,
+}) {
   return (
     <>
       <div className="subtitle-validation-nav-group">
@@ -579,6 +603,7 @@ function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverla
           type="button"
           className="button subtle-button subtitle-cue-btn subtitle-fix-all-btn"
           title="Auto-resolve all overlapping cues"
+          disabled={busy}
           onClick={onFixOverlaps}
         >
           <Icon name="sparkles" />
@@ -590,10 +615,37 @@ function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverla
           type="button"
           className="button subtle-button subtitle-cue-btn subtitle-fix-all-btn subtitle-fix-durations-btn"
           title="Extend all non-colliding cues to match speech duration"
+          disabled={busy}
           onClick={onFixSafeDurations}
         >
           <Icon name="clock" />
           <span>Extend cues</span>
+        </button>
+      )}
+      {hasSpellingIssues && onFixSpelling && (
+        <button
+          type="button"
+          id="subtitle-fix-spelling-all"
+          className="button subtle-button subtitle-cue-btn subtitle-fix-all-btn"
+          title="Apply approved spelling terminology to all cues"
+          disabled={busy}
+          onClick={onFixSpelling}
+        >
+          <Icon name="sparkles" />
+          <span>Apply spelling</span>
+        </button>
+      )}
+      {hasTranslationTermIssues && onFixTranslationTerms && (
+        <button
+          type="button"
+          id="subtitle-fix-translation-terms-all"
+          className="button subtle-button subtitle-cue-btn subtitle-fix-all-btn"
+          title="Apply approved translation terminology to translated cues"
+          disabled={busy}
+          onClick={onFixTranslationTerms}
+        >
+          <Icon name="sparkles" />
+          <span>Apply terms</span>
         </button>
       )}
       <button
@@ -610,7 +662,7 @@ function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverla
   );
 }
 
-function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOverlaps, onFixSafeDurations, showOnlyIssues, onToggleShowOnlyIssues }) {
+function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOverlaps, onFixSafeDurations, onFixSpelling, onFixTranslationTerms, showOnlyIssues, onToggleShowOnlyIssues, busy = false }) {
   if (!validation) return null;
   const { isValid, totalIssues, errorCount, warningCount } = validation;
   if (isValid) {
@@ -625,6 +677,8 @@ function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOv
   const title = `${errorCount} error(s), ${warningCount} warning(s). Click to jump to next issue.`;
   const hasOverlaps = validation.issues?.some(i => i.type === 'overlap');
   const hasSafeDurations = validation.issues?.some(i => i.type === 'speech_exceeds_interval' && i.metadata?.remedies?.canExtendCue);
+  const hasSpellingIssues = validation.issues?.some(i => i.type === 'terminology_spelling');
+  const hasTranslationTermIssues = validation.issues?.some(i => i.type === 'terminology_translation');
   return (
     <div className="subtitle-validation-summary-bar" role="toolbar" aria-label="Subtitle validation">
       <button
@@ -644,8 +698,13 @@ function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOv
         onFixOverlaps={onFixOverlaps}
         hasSafeDurations={hasSafeDurations}
         onFixSafeDurations={onFixSafeDurations}
+        hasSpellingIssues={hasSpellingIssues}
+        onFixSpelling={onFixSpelling}
+        hasTranslationTermIssues={hasTranslationTermIssues}
+        onFixTranslationTerms={onFixTranslationTerms}
         showOnlyIssues={showOnlyIssues}
         onToggleShowOnlyIssues={onToggleShowOnlyIssues}
+        busy={busy}
       />
     </div>
   );
@@ -703,8 +762,11 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
               || [];
             ctrl.extendSafeMismatchSegments?.(safeList);
           }}
+          onFixSpelling={() => ctrl.applySpellingTerminology?.()}
+          onFixTranslationTerms={() => void ctrl.applyTranslationTerminology?.()}
           showOnlyIssues={showOnlyIssues}
           onToggleShowOnlyIssues={() => setShowOnlyIssues(v => !v)}
+          busy={busy}
         />
         <div className="subtitle-cue-meta-right">
           {detectedLanguage ? <span>Detected: {detectedLanguage.toUpperCase()}</span> : null}
@@ -788,6 +850,8 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
               onTogglePlayVoice={voice.togglePlaySegment}
               onDownloadVoice={segment => voice.downloadSegmentVoice(segment, realIndex)}
               onAssignVoice={() => handleAssignVoice(seg.id)}
+              onApplyTerminologySpelling={segId => ctrl.applySpellingTerminology?.(segId)}
+              onApplyTerminologyTranslation={segId => void ctrl.applyTranslationTerminology?.(segId)}
             />
           );
         })
@@ -827,6 +891,7 @@ export function VideoSubtitleWorkspace({
   notices,
   hidden = false,
   voiceCatalog = null,
+  globalTerminology = null,
   actionsRef = null,
   onRefreshEngine,
   onSendToTts,
@@ -836,7 +901,27 @@ export function VideoSubtitleWorkspace({
   offlineReadiness = null,
   onSelectModels = null,
 }) {
-  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden });
+  const services = useStudioServices();
+  const effectiveTermsRef = useRef([]);
+  const [terminologyOpen, setTerminologyOpen] = useState(false);
+  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden, effectiveTermsRef });
+  const effectiveSourceLanguage = (ctrl.state.detectedLanguage && ctrl.state.detectedLanguage !== 'auto')
+    ? ctrl.state.detectedLanguage
+    : ctrl.state.options.sourceLanguage;
+  const effectiveTargetLanguage = ctrl.state.translatedLanguage || ctrl.state.options.targetLanguage;
+  const terminologyCtrl = useTerminology({
+    globalController: globalTerminology,
+    terminologyRepository: services?.terminologyRepository,
+    glossaryRepository: services?.glossaryRepository,
+    projectTerminology: ctrl.state.terminology,
+    onChangeProjectTerminology: ctrl.setProjectTerminology,
+    sourceLanguage: effectiveSourceLanguage,
+    targetLanguage: effectiveTargetLanguage,
+    speechLanguage: ctrl.useTranslation ? effectiveTargetLanguage : effectiveSourceLanguage,
+    onNotify,
+    logger: services?.logger,
+  });
+  effectiveTermsRef.current = terminologyCtrl.effectiveTerms;
   if (actionsRef) {
     actionsRef.current = {
       loadProject: snapshot => {
@@ -849,6 +934,9 @@ export function VideoSubtitleWorkspace({
     };
   }
   const { state, health, speakers } = ctrl;
+  const activeSpeechLanguage = ctrl.useTranslation
+    ? (state.translatedLanguage || state.options.targetLanguage)
+    : (state.detectedLanguage || state.options.sourceLanguage);
   const voice = useSubtitleVoiceover({
     segments: state.segments,
     useTranslation: ctrl.useTranslation,
@@ -858,6 +946,9 @@ export function VideoSubtitleWorkspace({
     voiceCatalog,
     mediaDuration: ctrl.mediaDuration,
     transcriptEpoch: ctrl.transcriptEpoch,
+    terminology: terminologyCtrl.effectiveTerms,
+    pronunciationSignature: terminologyCtrl.pronunciationSignature,
+    speechLanguage: activeSpeechLanguage,
     onStatus: ctrl.setStatus,
     onNotify,
     onUnlockSound,
@@ -908,8 +999,8 @@ export function VideoSubtitleWorkspace({
   const validation = useMemo(() => validateSubtitleSegments({
     segments: state.segments,
     useTranslation: ctrl.useTranslation,
-    targetLanguage: state.options.targetLanguage,
-    sourceLanguage: state.options.sourceLanguage,
+    targetLanguage: effectiveTargetLanguage,
+    sourceLanguage: effectiveSourceLanguage,
     hasVoiceover: Boolean(ctrl.speakers.length > 1 && voice.selectedVoiceId),
     requireVoiceAssignment: Boolean(ctrl.speakers.length > 1 && voice.selectedVoiceId),
     characters: voice.characters,
@@ -918,11 +1009,12 @@ export function VideoSubtitleWorkspace({
     segmentClips: voice.segmentClips,
     spillApprovals: voice.spillApprovals,
     isClipStale: voice.isClipStale,
+    terminology: terminologyCtrl.effectiveTerms,
   }), [
     state.segments,
     ctrl.useTranslation,
-    state.options.targetLanguage,
-    state.options.sourceLanguage,
+    effectiveTargetLanguage,
+    effectiveSourceLanguage,
     ctrl.speakers.length,
     voice.selectedVoiceId,
     voice.characters,
@@ -930,6 +1022,7 @@ export function VideoSubtitleWorkspace({
     voice.segmentClips,
     voice.spillApprovals,
     voice.isClipStale,
+    terminologyCtrl.effectiveTerms,
   ]);
   return (
     <div className="workspace-panel subtitle-workspace" hidden={hidden}>
@@ -963,6 +1056,8 @@ export function VideoSubtitleWorkspace({
         autosave={ctrl.autosave}
         offlineReadiness={offlineReadiness}
         onSelectModels={onSelectModels}
+        onOpenTerminology={() => setTerminologyOpen(true)}
+        terminologyCount={terminologyCtrl.counts.approved}
       />
       <div className="studio-grid subtitle-grid">
         <section className="subtitle-left-pane" aria-label="Video and controls">
@@ -1018,6 +1113,15 @@ export function VideoSubtitleWorkspace({
         onCopyDialogue={() => void ctrl.copyDialogue()}
         onBurnVideo={() => void ctrl.burnVideo()}
         onSendToTts={handleSendToTts}
+      />
+      <TerminologyManagerModal
+        open={terminologyOpen}
+        terminologyCtrl={terminologyCtrl}
+        canEditProject={true}
+        projectTitle={state.projectTitle || state.videoFileName || 'Subtitle project'}
+        sourceLanguage={state.detectedLanguage || state.options.sourceLanguage}
+        targetLanguage={state.options.targetLanguage}
+        onClose={() => setTerminologyOpen(false)}
       />
     </div>
   );

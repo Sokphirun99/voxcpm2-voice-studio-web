@@ -320,8 +320,16 @@ function useVoiceSelectionState(segments) {
   return { selectedIds, toggleSelectSegment, toggleSelectAll, clearSelection };
 }
 
-async function synthesizeOneFrame({ synthesizeSpeech, text, character, anchor, cachedUpload, seed, signal, onReferenceUploaded }) {
-  const command = buildSubtitleSynthesisCommand({ text, character, anchor, cachedUpload, seed });
+async function synthesizeOneFrame({ synthesizeSpeech, text, character, anchor, cachedUpload, seed, terminology, speechLanguage, signal, onReferenceUploaded }) {
+  const command = buildSubtitleSynthesisCommand({
+    text,
+    character,
+    anchor,
+    cachedUpload,
+    seed,
+    terminology,
+    sourceLanguage: speechLanguage,
+  });
   return synthesizeSpeech.execute({ ...command, signal, onReferenceUploaded });
 }
 
@@ -329,6 +337,7 @@ function useVoiceSynthesisActions(ctx) {
   const {
     synthesizeSpeech, logger, segments, selectedIds, useTranslation, activeCharacter, activeAnchor,
     anchorTag, lockedSeeds, segmentClipsRef, cachedUploadsRef, abortRef,
+    terminology, pronunciationSignature, speechLanguage,
     setBusy, setGeneratingSegmentId, setBatchProgress, storeClip, onStatus, onNotify, onUnlockSound, onEngineFailure,
   } = ctx;
 
@@ -371,10 +380,17 @@ function useVoiceSynthesisActions(ctx) {
           synthesizeSpeech, text, character: activeCharacter, anchor: activeAnchor,
           cachedUpload: cachedUploadsRef.current[activeCharacter.id] || null,
           seed: lockedSeeds?.[activeCharacter.id] ?? '',
+          terminology,
+          speechLanguage,
           signal,
           onReferenceUploaded: fileData => { cachedUploadsRef.current[activeCharacter.id] = fileData; },
         });
-        const signature = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag });
+        const signature = buildSubtitleSpeechSignature({
+          text,
+          characterId: activeCharacter.id,
+          anchorTag,
+          pronunciationTag: pronunciationSignature,
+        });
         const durationSeconds = await resolveRecordingDuration(res.recording);
         storeClip(segment.id, buildClipRecord({ recording: res.recording, text, character: activeCharacter, signature, durationSeconds }));
         const doneMsg = `Voice ready for frame (${activeCharacter.name}).`;
@@ -383,7 +399,7 @@ function useVoiceSynthesisActions(ctx) {
         return 1;
       },
     });
-  }, [useTranslation, activeCharacter, activeAnchor, anchorTag, lockedSeeds, cachedUploadsRef, synthesizeSpeech, runVoiceJob, storeClip, onStatus, onNotify]);
+  }, [useTranslation, activeCharacter, activeAnchor, anchorTag, lockedSeeds, terminology, pronunciationSignature, speechLanguage, cachedUploadsRef, synthesizeSpeech, runVoiceJob, storeClip, onStatus, onNotify]);
 
   const generateSelectedVoices = useCallback(async () => {
     const targets = selectOrderedSegments(segments, selectedIds)
@@ -405,7 +421,12 @@ function useVoiceSynthesisActions(ctx) {
         for (let i = 0; i < targets.length; i++) {
           if (signal.aborted) throw new SynthesisCancelledError();
           const { seg, text } = targets[i];
-          const signature = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag });
+          const signature = buildSubtitleSpeechSignature({
+            text,
+            characterId: activeCharacter.id,
+            anchorTag,
+            pronunciationTag: pronunciationSignature,
+          });
           if (segmentClipsRef.current[seg.id]?.signature === signature) {
             done += 1;
             continue;
@@ -415,7 +436,10 @@ function useVoiceSynthesisActions(ctx) {
           onStatus?.({ message: `Generating voice ${i + 1} of ${targets.length} (${activeCharacter.name})…`, error: false });
           const res = await synthesizeOneFrame({
             synthesizeSpeech, text, character: activeCharacter, anchor: sessionAnchor,
-            cachedUpload: sessionUpload, seed: lockedSeeds?.[activeCharacter.id] ?? '', signal,
+            cachedUpload: sessionUpload, seed: lockedSeeds?.[activeCharacter.id] ?? '',
+            terminology,
+            speechLanguage,
+            signal,
             onReferenceUploaded: fileData => {
               sessionUpload = fileData;
               if (activeAnchor) cachedUploadsRef.current[activeCharacter.id] = fileData;
@@ -435,7 +459,7 @@ function useVoiceSynthesisActions(ctx) {
         return done;
       },
     });
-  }, [segments, selectedIds, useTranslation, activeCharacter, activeAnchor, anchorTag, lockedSeeds, segmentClipsRef, cachedUploadsRef, synthesizeSpeech, runVoiceJob, setGeneratingSegmentId, setBatchProgress, storeClip, onStatus, onNotify]);
+  }, [segments, selectedIds, useTranslation, activeCharacter, activeAnchor, anchorTag, lockedSeeds, terminology, pronunciationSignature, speechLanguage, segmentClipsRef, cachedUploadsRef, synthesizeSpeech, runVoiceJob, setGeneratingSegmentId, setBatchProgress, storeClip, onStatus, onNotify]);
 
   return { generateSegmentVoice, generateSelectedVoices, cancelVoiceGeneration };
 }
@@ -595,6 +619,9 @@ export function useSubtitleVoiceover({
   mediaDuration = 0,
   totalDuration = 0,
   transcriptEpoch = 0,
+  terminology = null,
+  pronunciationSignature = '',
+  speechLanguage = '',
   onStatus,
   onNotify,
   onUnlockSound,
@@ -735,9 +762,14 @@ export function useSubtitleVoiceover({
     const clip = segmentClips[segment?.id];
     if (!clip) return false;
     const text = resolveSubtitleSpeechText(segment, useTranslation);
-    const expected = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag });
+    const expected = buildSubtitleSpeechSignature({
+      text,
+      characterId: activeCharacter.id,
+      anchorTag,
+      pronunciationTag: pronunciationSignature,
+    });
     return clip.signature !== expected;
-  }, [segmentClips, useTranslation, activeCharacter.id, anchorTag]);
+  }, [segmentClips, useTranslation, activeCharacter.id, anchorTag, pronunciationSignature]);
 
   const allDurationMismatches = useMemo(() => detectDurationMismatches({
     segments,
@@ -771,6 +803,7 @@ export function useSubtitleVoiceover({
   const synthesis = useVoiceSynthesisActions({
     synthesizeSpeech, logger, segments, selectedIds, useTranslation, activeCharacter, activeAnchor,
     anchorTag, lockedSeeds, segmentClipsRef, cachedUploadsRef, abortRef,
+    terminology, pronunciationSignature, speechLanguage,
     setBusy: setVoiceBusy, setGeneratingSegmentId, setBatchProgress, storeClip,
     onStatus, onNotify, onUnlockSound, onEngineFailure,
   });

@@ -56,6 +56,12 @@
  */
 
 /**
+ * @typedef {object} TerminologyRepositoryPort
+ * @property {() => Promise<Array<object>>} loadTerms
+ * @property {(terms: Array<object>) => Promise<{ terms: Array<object>, localOnly: boolean }>} [saveTerms]
+ */
+
+/**
  * @typedef {object} AudioDecoderPort
  * @property {(blob: Blob) => Promise<number[]>} decodePeaks
  * @property {(blob: Blob) => Promise<{ peaks: number[], duration: number }>} [decodeAudioSummary]

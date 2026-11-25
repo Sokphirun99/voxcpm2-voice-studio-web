@@ -11,6 +11,8 @@ import {
   SUBTITLE_STYLE_DEFAULTS,
   adjustCuePause,
   adjustSubtitleSegmentTiming,
+  applySpellingTermsToSegments,
+  applyTranslationTermsToSegments,
   buildBoundedTtsHandoff,
   buildDialogueText,
   buildSrt,
@@ -38,6 +40,12 @@ import {
 import { ValidationError } from '../../domain/errors.js';
 import { assertFeatureOfflineReady } from '../../domain/offlineReadiness.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
+import {
+  TERM_CATEGORIES,
+  createEmptyProjectTerminology,
+  inspectSegmentTerminology,
+  normalizeProjectTerminology,
+} from '../../domain/terminology.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { useProjectAutosave } from './useProjectAutosave.js';
 import { useProjectRecovery } from './useProjectRecovery.js';
@@ -390,7 +398,29 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
   };
 }
 
-function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
+function toMediaTerminologyPayload(effectiveTerms) {
+  if (!Array.isArray(effectiveTerms) || effectiveTerms.length === 0) return null;
+  const filtered = effectiveTerms
+    .filter(item => item && item.category !== TERM_CATEGORIES.PRONUNCIATION && item.status === 'approved' && item.enabled !== false && !item.isDisabledInProject)
+    .map(item => ({
+      id: item.id,
+      category: item.category,
+      status: item.status,
+      enabled: true,
+      term: item.term,
+      variants: Array.isArray(item.variants) ? [...item.variants] : [],
+      translation: item.translation || '',
+      preserveInTranslation: Boolean(item.preserveInTranslation),
+      sourceLanguage: item.sourceLanguage || '',
+      targetLanguage: item.targetLanguage || '',
+      caseSensitive: Boolean(item.caseSensitive),
+      scope: item.scope || 'global',
+      isDisabledInProject: false,
+    }));
+  return filtered.length > 0 ? filtered : null;
+}
+
+function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, effectiveTermsRef, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
   const cancel = useCallback(() => {
     abortRef.current?.abort();
   }, [abortRef]);
@@ -431,6 +461,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
           doubleCheck: relinkingProject ? false : Boolean(state.options.doubleCheckKhmer),
           translateTo: relinkingProject ? '' : shouldTranslate ? targetLanguage : '',
           translateToKhmer: !relinkingProject && shouldTranslate && targetLanguage === 'khm_Khmr',
+          terminology: relinkingProject ? null : toMediaTerminologyPayload(effectiveTermsRef?.current),
           signal,
         });
         assertNotAborted(signal);
@@ -481,6 +512,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
           segments: state.segments,
           sourceLanguage: sourceLang === 'auto' ? 'en' : sourceLang,
           targetLanguage,
+          terminology: toMediaTerminologyPayload(effectiveTermsRef?.current),
           signal,
         });
         assertNotAborted(signal);
@@ -710,7 +742,9 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
  * @param {{ onStateChange?: Function, onNotify?: Function, onUnlockSound?: Function }} [config] - Hook callbacks.
  * @returns {object} Subtitle workspace controller bundle.
  */
-export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidden = false } = {}) {
+export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidden = false, effectiveTermsRef = null } = {}) {
+  const internalTermsRef = useRef([]);
+  const activeEffectiveTermsRef = effectiveTermsRef || internalTermsRef;
   const services = useStudioServices();
   const gateway = useMemo(() => resolveSubtitleGateway(services), [services]);
   const [health, refreshHealth, markOnline] = useMediaHealthState(gateway);
@@ -736,6 +770,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     hasTranslation: false,
     translatedLanguage: '',
     speakerNames: {},
+    terminology: createEmptyProjectTerminology(),
     projectId: '',
     projectTitle: '',
     revision: 1,
@@ -912,6 +947,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       hasTranslation: false,
       translatedLanguage: '',
       speakerNames: {},
+      terminology: createEmptyProjectTerminology(),
       projectId: '',
       projectTitle: '',
       busyAction: '',
@@ -1067,6 +1103,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       hasTranslation: Boolean(payload.hasTranslation),
       translatedLanguage: payload.translatedLanguage || '',
       speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : {},
+      terminology: normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology),
       options: {
         ...prev.options,
         ...(typeof payload.subtitleOptions === 'object' && payload.subtitleOptions ? payload.subtitleOptions : {}),
@@ -1111,6 +1148,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     detectedLanguage: state.detectedLanguage,
     translatedLanguage: state.translatedLanguage,
     hasTranslation: state.hasTranslation,
+    terminology: state.terminology,
   }), [
     state.projectId,
     state.projectTitle,
@@ -1122,6 +1160,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     state.detectedLanguage,
     state.translatedLanguage,
     state.hasTranslation,
+    state.terminology,
   ]);
 
   const buildSnapshot = useCallback(() => {
@@ -1144,6 +1183,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       state.projectTitle,
       state.detectedLanguage,
       state.translatedLanguage,
+      state.terminology,
     ],
     hidden,
     projectRepository,
@@ -1180,13 +1220,15 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     sourceAssetId: state.sourceAssetId || null,
     sourceAsset: state.sourceAsset || null,
     segments: state.segments,
+    terminology: state.terminology,
     payload: {
       segments: state.segments,
       videoFileName: state.videoFileName,
       speakerNames: state.speakerNames,
       subtitleOptions: state.options,
+      terminology: state.terminology,
     },
-  }), [state.projectId, state.projectTitle, state.revision, state.sourceAssetId, state.sourceAsset, state.segments, state.videoFileName, state.speakerNames, state.options]);
+  }), [state.projectId, state.projectTitle, state.revision, state.sourceAssetId, state.sourceAsset, state.segments, state.videoFileName, state.speakerNames, state.options, state.terminology]);
 
   const recovery = useProjectRecovery({
     projectId: state.projectId,
@@ -1219,8 +1261,76 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     mediaDuration,
     onNotify,
   });
+  const setProjectTerminology = useCallback(nextTerminology => {
+    setState(prev => ({
+      ...prev,
+      terminology: normalizeProjectTerminology(nextTerminology),
+    }));
+  }, []);
+
+  const applySpellingTerminology = useCallback((segmentId = '') => {
+    const current = stateRef.current;
+    const terms = activeEffectiveTermsRef.current || [];
+    const sourceLang = resolveSubtitleSourceLanguage(current);
+    const result = applySpellingTermsToSegments(current.segments, terms, { sourceLanguage: sourceLang, segmentId });
+    if (!result.updatedCount) {
+      setState(prev => ({ ...prev, status: { message: 'All checked cue spellings already match approved terminology.', error: false } }));
+      return 0;
+    }
+    const msg = `Applied approved spelling to ${result.updatedCount} ${result.updatedCount === 1 ? 'cue' : 'cues'}.`;
+    setState(prev => ({ ...prev, segments: result.segments, status: { message: msg, error: false } }));
+    onNotify?.({ kind: 'success', title: 'Spelling terminology applied', message: msg });
+    return result.updatedCount;
+  }, [activeEffectiveTermsRef, stateRef, onNotify]);
+
+  const applyTranslationTerminology = useCallback(async (segmentId = '') => {
+    const terms = activeEffectiveTermsRef.current || [];
+    const current = stateRef.current;
+    const sourceLang = resolveSubtitleSourceLanguage(current);
+    const targetLang = current.translatedLanguage || normalizeTargetLanguageCode(current.options.targetLanguage);
+    const origById = new Map(current.segments.map(seg => [seg.id, seg.translatedText || '']));
+    const localResult = applyTranslationTermsToSegments(current.segments, terms, { sourceLanguage: sourceLang, targetLanguage: targetLang, segmentId });
+    const updatesById = collectTranslatedUpdates(current.segments, localResult.segments);
+    const unresolved = localResult.segments.filter(seg => (
+      (!segmentId || seg.id === segmentId) &&
+      inspectSegmentTerminology(seg, terms, { sourceLanguage: sourceLang, targetLanguage: targetLang }).translationGaps.length > 0
+    ));
+    let mtError = null;
+    const mediaTerms = unresolved.length > 0 ? toMediaTerminologyPayload(terms) : null;
+    if (unresolved.length > 0 && mediaTerms && gateway?.translateSegments && !current.busyAction) {
+      try {
+        const res = await gateway.translateSegments({
+          segments: unresolved,
+          sourceLanguage: (!sourceLang || sourceLang === 'auto') ? 'en' : sourceLang,
+          targetLanguage: targetLang,
+          terminology: mediaTerms,
+        });
+        for (const item of (res?.segments || [])) {
+          if (item?.id && typeof item.translatedText === 'string') updatesById.set(item.id, item.translatedText);
+        }
+      } catch (err) {
+        mtError = err;
+        services?.logger?.warn?.('useVideoSubtitles.applyTranslationTerminology', err?.message || 'Retranslation failed');
+      }
+    }
+    const changedIds = [...updatesById.keys()].filter(id => updatesById.get(id) !== (origById.get(id) || ''));
+    const unresolvedCount = localResult.segments.filter(seg => {
+      if (segmentId && seg.id !== segmentId) return false;
+      const candidate = updatesById.has(seg.id) ? { ...seg, translatedText: updatesById.get(seg.id) } : seg;
+      return inspectSegmentTerminology(candidate, terms, { sourceLanguage: sourceLang, targetLanguage: targetLang }).translationGaps.length > 0;
+    }).length;
+    const outcome = buildTranslationTermOutcome({ changedCount: changedIds.length, mtError, unresolvedCount });
+    setState(prev => ({
+      ...prev,
+      segments: changedIds.length > 0 ? mergeTranslationUpdates(prev.segments, updatesById, origById) : prev.segments,
+      status: outcome.status,
+    }));
+    if (outcome.notify) onNotify?.(outcome.notify);
+    return changedIds.length;
+  }, [activeEffectiveTermsRef, stateRef, gateway, services, onNotify]);
+
   const asyncActions = useSubtitleAsyncActions({
-    state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
+    state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, effectiveTermsRef: activeEffectiveTermsRef, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
   });
 
   return {
@@ -1241,6 +1351,9 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     recovery,
     flushProjectSave: persistCurrentProject,
     loadProjectFromSnapshot,
+    setProjectTerminology,
+    applySpellingTerminology,
+    applyTranslationTerminology,
     projectRepository,
     speakers,
     effectiveIncludeSpeaker,
@@ -1268,5 +1381,67 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     getTtsHandoff,
     ...editActions,
     ...asyncActions,
+  };
+}
+
+function resolveSubtitleSourceLanguage(current) {
+  const detected = current?.detectedLanguage;
+  if (detected && detected !== 'auto') return detected;
+  return current?.options?.sourceLanguage || '';
+}
+
+function collectTranslatedUpdates(prevSegments, nextSegments) {
+  const updates = new Map();
+  for (let i = 0; i < prevSegments.length; i += 1) {
+    const prev = prevSegments[i];
+    const next = nextSegments[i];
+    if (prev && next && next.translatedText !== prev.translatedText) {
+      updates.set(prev.id, next.translatedText);
+    }
+  }
+  return updates;
+}
+
+function mergeTranslationUpdates(prevSegments, updatesById, origById) {
+  let changed = false;
+  const segments = prevSegments.map(seg => {
+    if (!updatesById.has(seg.id)) return seg;
+    const nextText = updatesById.get(seg.id);
+    if (nextText === (seg.translatedText || '')) return seg;
+    if ((seg.translatedText || '') !== (origById.get(seg.id) || '')) return seg;
+    changed = true;
+    return { ...seg, translatedText: nextText };
+  });
+  return changed ? segments : prevSegments;
+}
+
+function buildTranslationTermOutcome({ changedCount, mtError, unresolvedCount }) {
+  if (mtError) {
+    const detail = mtError?.message || 'Failed to apply approved translation terms via local translator.';
+    return {
+      status: { message: detail, error: true },
+      notify: { kind: 'error', title: 'Translation terminology failed', message: detail },
+    };
+  }
+  if (changedCount > 0) {
+    const suffix = changedCount === 1 ? 'cue' : 'cues';
+    const message = unresolvedCount > 0
+      ? `Applied approved translation terminology to ${changedCount} ${suffix}; ${unresolvedCount} still need manual review.`
+      : `Applied approved translation terminology to ${changedCount} ${suffix}.`;
+    return {
+      status: { message, error: false },
+      notify: { kind: 'success', title: 'Translation terminology applied', message },
+    };
+  }
+  if (unresolvedCount > 0) {
+    const message = 'Some cues still need approved translation terms; retry when subtitle processing is idle or translate again.';
+    return {
+      status: { message, error: true },
+      notify: { kind: 'warning', title: 'Translation terminology incomplete', message },
+    };
+  }
+  return {
+    status: { message: 'All checked cue translations already follow approved terminology.', error: false },
+    notify: null,
   };
 }

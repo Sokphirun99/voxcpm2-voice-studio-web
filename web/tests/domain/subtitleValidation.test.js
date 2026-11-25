@@ -363,3 +363,31 @@ test('validateSubtitleSegments reports speech_exceeds_interval errors, rejects c
   assert.equal(approved.isValid, true);
   assert.equal(approved.totalIssues, 0);
 });
+
+test('validateSubtitleSegments flags terminology spelling and translation gaps without flagging TTS pronunciation', () => {
+  const terminology = [
+    { id: 't-spell', category: 'spelling', status: 'approved', enabled: true, term: 'Phnom Penh', variants: ['Pnom Penh'] },
+    { id: 't-tr', category: 'translation', status: 'approved', enabled: true, term: 'AI', translation: 'បញ្ញាសិប្បនិម្មិត', sourceLanguage: 'en', targetLanguage: 'khm_Khmr' },
+    { id: 't-draft', category: 'spelling', status: 'draft', enabled: true, term: 'DraftWord', variants: ['draftword'] },
+    { id: 't-pron', category: 'pronunciation', status: 'approved', enabled: true, term: 'Phnom Penh', pronunciation: 'ភ្នំ-ពេញ' },
+  ];
+
+  const report = validateSubtitleSegments({
+    segments: [
+      { id: 'c1', start: 0.0, end: 2.0, text: 'Visit Pnom Penh for AI draftword.', translatedText: 'ទៅទស្សនាទីក្រុង' },
+      { id: 'c2', start: 2.1, end: 4.0, text: 'Phnom Penh AI hub.', translatedText: 'ភ្នំពេញ បញ្ញាសិប្បនិម្មិត' },
+    ],
+    useTranslation: true,
+    sourceLanguage: 'en',
+    targetLanguage: 'khm_Khmr',
+    terminology,
+  });
+
+  const c1Issues = report.issuesBySegmentId.c1;
+  assert.equal(c1Issues.length, 2);
+  assert.equal(c1Issues[0].type, SUBTITLE_ISSUE_TYPES.TERMINOLOGY_SPELLING);
+  assert.equal(c1Issues[0].remedyAction, REMEDY_ACTIONS.APPLY_TERMINOLOGY_SPELLING);
+  assert.equal(c1Issues[1].type, SUBTITLE_ISSUE_TYPES.TERMINOLOGY_TRANSLATION);
+  assert.equal(c1Issues[1].remedyAction, REMEDY_ACTIONS.APPLY_TERMINOLOGY_TRANSLATION);
+  assert.equal(report.issuesBySegmentId.c2, undefined);
+});

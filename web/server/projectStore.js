@@ -7,6 +7,7 @@ import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/pro
 import path from 'node:path';
 import { ConflictError, StorageError, ValidationError } from '../src/domain/errors.js';
 import { upgradeProjectSchema } from '../src/domain/projects.js';
+import { normalizeProjectTerminology } from '../src/domain/terminology.js';
 
 export const PROJECT_FILE_EXT = '.json';
 export const PROJECT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -179,8 +180,9 @@ function resolveRevision(existing, fallbackRevision) {
 }
 
 function resolveProjectPayload(input, type) {
+  const terminology = normalizeProjectTerminology(input.terminology ?? input.payload?.terminology ?? input.settings?.terminology);
   if (input.payload !== undefined) {
-    return assertProjectPayload(input.payload);
+    return { ...assertProjectPayload(input.payload), terminology };
   }
   return {
     videoFileName: input.settings?.videoFileName ?? null,
@@ -190,6 +192,7 @@ function resolveProjectPayload(input, type) {
     detectedLanguage: input.sourceLanguage || '',
     translatedLanguage: input.targetLanguage || '',
     hasTranslation: Boolean(input.settings?.hasTranslation),
+    terminology,
     ...(type === 'tts' ? { script: input.settings?.script || '', voiceId: input.settings?.voiceId || '' } : {}),
   };
 }
@@ -231,6 +234,7 @@ function resolveProjectSettings(input, payload, type) {
 
 function assembleProjectDetails(spec, meta, timestamps) {
   const { input, payload, settings } = spec;
+  const terminology = normalizeProjectTerminology(input.terminology ?? payload.terminology ?? settings.terminology);
   return {
     ...meta,
     sourceLanguage: input.sourceLanguage || payload.detectedLanguage || '',
@@ -238,6 +242,7 @@ function assembleProjectDetails(spec, meta, timestamps) {
     sourceAssetId: input.sourceAssetId || null,
     segments: Array.isArray(input.segments) ? input.segments : (payload.segments || []),
     settings,
+    terminology,
     payload,
     createdAt: timestamps.createdAt,
     updatedAt: timestamps.updatedAt,

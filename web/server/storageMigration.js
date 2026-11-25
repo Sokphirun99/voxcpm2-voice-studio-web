@@ -9,6 +9,7 @@ import { ALLOWED_AUDIO_MIME_TYPES, hasValidAudioMagicBytes } from '../src/domain
 import { StorageError, ValidationError } from '../src/domain/errors.js';
 import { upgradeProjectSchema } from '../src/domain/projects.js';
 import { normalizeGlossaryRules } from '../src/domain/pronunciationRules.js';
+import { normalizeTerminologyList } from '../src/domain/terminology.js';
 import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
 
 export const STORAGE_BACKUP_DIR = '.backup';
@@ -19,6 +20,7 @@ export const DEFAULT_AUDIO_MIME = 'audio/wav';
 export const OCTET_STREAM_MIME = 'application/octet-stream';
 export const CATALOG_FILE_NAME = 'catalog.json';
 export const GLOSSARY_FILE_NAME = 'glossary.json';
+export const TERMINOLOGY_FILE_NAME = 'terminology.json';
 export const PROJECTS_DIR_NAME = 'projects';
 export const ANCHORS_DIR_NAME = 'anchors';
 export const MANIFEST_FILE_NAME = 'manifest.json';
@@ -130,7 +132,7 @@ async function verifyBackupFiles(backupPath, files) {
 
 async function copyRootConfigFiles(rootDir, backupPath) {
   const files = [];
-  for (const name of [CATALOG_FILE_NAME, GLOSSARY_FILE_NAME]) {
+  for (const name of [CATALOG_FILE_NAME, GLOSSARY_FILE_NAME, TERMINOLOGY_FILE_NAME]) {
     const src = path.join(rootDir, name);
     if (await checkPathExists(src)) {
       files.push(await copyBackupEntry(src, path.join(backupPath, name), name));
@@ -578,6 +580,21 @@ async function verifyCatalogIntegrity(rootDir, issues) {
   }
 }
 
+async function verifyTerminologyIntegrity(rootDir, issues) {
+  const terminologyPath = path.join(rootDir, TERMINOLOGY_FILE_NAME);
+  if (!(await checkPathExists(terminologyPath))) return;
+  try {
+    const terminology = await safeReadJson(terminologyPath);
+    if (!terminology || typeof terminology !== 'object' || Array.isArray(terminology) || !Array.isArray(terminology.terms)) {
+      issues.push('Terminology corruption: terms property must be an array.');
+      return;
+    }
+    normalizeTerminologyList(terminology.terms);
+  } catch (error) {
+    issues.push(`Terminology corruption: ${error.message}`);
+  }
+}
+
 async function verifyGlossaryIntegrity(rootDir, issues) {
   const glossaryPath = path.join(rootDir, GLOSSARY_FILE_NAME);
   try {
@@ -625,6 +642,7 @@ export async function verifyStorageIntegrity({ dataDir }) {
   const issues = [];
   await verifyCatalogIntegrity(rootDir, issues);
   await verifyGlossaryIntegrity(rootDir, issues);
+  await verifyTerminologyIntegrity(rootDir, issues);
   await verifyProjectsIntegrity(rootDir, issues);
   return { valid: issues.length === 0, issues };
 }

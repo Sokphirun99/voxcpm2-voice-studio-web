@@ -4,6 +4,7 @@
 
 import { ConflictError, ValidationError } from '../domain/errors.js';
 import { normalizeProjectRecord, toProjectSummary } from '../domain/projects.js';
+import { normalizeProjectTerminology } from '../domain/terminology.js';
 import {
   StorageUnavailableError,
   buildStorageApiUrl,
@@ -214,10 +215,12 @@ async function getProjectFromRepo(ctx, id) {
 function buildNormalizedProject(project, localMap, id) {
   const now = new Date().toISOString();
   const kind = project.kind || (project.type === 'tts' ? 'tts' : 'subtitle');
-  const payload = project.payload && typeof project.payload === 'object' && !Array.isArray(project.payload)
+  const rawPayload = project.payload && typeof project.payload === 'object' && !Array.isArray(project.payload)
     ? project.payload
     : (project.settings || {});
-  return normalizeProjectRecord({
+  const terminology = normalizeProjectTerminology(project.terminology ?? rawPayload.terminology ?? project.settings?.terminology);
+  const payload = { ...rawPayload, terminology };
+  const normalized = normalizeProjectRecord({
     ...project,
     kind,
     payload,
@@ -226,6 +229,7 @@ function buildNormalizedProject(project, localMap, id) {
     updatedAt: now,
     deletedAt: null,
   });
+  return { ...normalized, terminology };
 }
 
 function saveProjectOfflineFallback(ctx, normalized, isCreated) {

@@ -6,6 +6,7 @@ import { ValidationError } from './errors.js';
 import { expandKhmerNumbers, normalizeKhmerUnicode } from './khmerText.js';
 import { preservePauseMarkers, stripPauseMarkers } from './pauseMarkers.js';
 import { applyPronunciationRules } from './pronunciationRules.js';
+import { applyTtsPronunciationTerms } from './terminology.js';
 
 export const MAX_SCRIPT_LENGTH = 2000;
 export const MAX_DESCRIPTION_LENGTH = 300;
@@ -196,29 +197,34 @@ function resolveExactCloneOptions({ hasLockedAudio, exactClone, promptText }) {
 }
 
 /**
- * Applies pronunciation overrides to normalized script text and re-tidies spacing only when text changed.
+ * Applies Stage 3 pronunciation overrides to normalized script text and re-tidies spacing only when text changed.
  * @param {string} normalized - Unicode-normalized script.
- * @param {Array<object>|undefined} pronunciationRules - Glossary rules (disabled rules are ignored).
+ * @param {Array<object>|undefined} pronunciationRules - Glossary or Stage 3 pronunciation rules.
+ * @param {{ terminology?: Array<object>, sourceLanguage?: string }} [terminologyContext] - Optional resolved terminology and language filter.
  * @returns {string} Script spoken by the engine.
  */
-function applyScriptPronunciation(normalized, pronunciationRules) {
-  const rewritten = preservePauseMarkers(normalized, masked => applyPronunciationRules(masked, pronunciationRules));
+function applyScriptPronunciation(normalized, pronunciationRules, { terminology, sourceLanguage = '' } = {}) {
+  const hasTerminology = Array.isArray(terminology) && terminology.length > 0;
+  const hasCaseInsensitiveRule = Array.isArray(pronunciationRules) && pronunciationRules.some(r => r?.caseSensitive === false);
+  const rewritten = hasTerminology || hasCaseInsensitiveRule
+    ? applyTtsPronunciationTerms(normalized, terminology || [], { sourceLanguage, glossaryRules: pronunciationRules || [] })
+    : preservePauseMarkers(normalized, masked => applyPronunciationRules(masked, pronunciationRules));
   return rewritten === normalized ? normalized : normalizeKhmerUnicode(rewritten);
 }
 
 /**
- * Validates script text against non-empty and grapheme length bounds, applying pronunciation rules
+ * Validates script text against non-empty and grapheme length bounds, applying Stage 3 pronunciation rules
  * and optionally expanding Khmer numbers/time. The user's visible script is never mutated.
  * @param {unknown} rawScript - Raw script input.
- * @param {{ autoFormatKhmer?: boolean, pronunciationRules?: Array<object> }} [options] - Normalization flags and glossary.
+ * @param {{ autoFormatKhmer?: boolean, pronunciationRules?: Array<object>, terminology?: Array<object>, sourceLanguage?: string }} [options] - Normalization flags, terminology, and glossary.
  * @returns {string} Normalized script text.
  */
-function validateScriptText(rawScript, { autoFormatKhmer = false, pronunciationRules } = {}) {
+function validateScriptText(rawScript, { autoFormatKhmer = false, pronunciationRules, terminology, sourceLanguage = '' } = {}) {
   const normalized = normalizeKhmerUnicode(rawScript);
   if (!normalized || !stripPauseMarkers(normalized)) {
     throw new ValidationError('Enter text to generate speech.', 'script', 'EMPTY_SCRIPT');
   }
-  const spoken = applyScriptPronunciation(normalized, pronunciationRules);
+  const spoken = applyScriptPronunciation(normalized, pronunciationRules, { terminology, sourceLanguage });
   if (!spoken || !stripPauseMarkers(spoken)) {
     throw new ValidationError('Pronunciation rules removed the entire script. Adjust a rule or the script.', 'script', 'EMPTY_SCRIPT');
   }
@@ -231,7 +237,7 @@ function validateScriptText(rawScript, { autoFormatKhmer = false, pronunciationR
 
 /**
  * Validates and normalizes generation inputs into a clean command object.
- * Inputs: raw generation options (optionally `pronunciationRules`) and optional `seedGenerator`.
+ * Inputs: raw generation options (optionally `pronunciationRules`, `terminology`, `sourceLanguage`) and optional `seedGenerator`.
  * Outputs: `{ text, instruction, usePromptText, promptText, guidance, steps, seed }`.
  * Side effects: none.
  * Failure modes: throws ValidationError when any field violates domain rules.
@@ -240,7 +246,12 @@ function validateScriptText(rawScript, { autoFormatKhmer = false, pronunciationR
  * @returns {{ text: string, instruction: string, usePromptText: boolean, promptText: string, guidance: number, steps: number, seed: number }} Validated payload.
  */
 export function validateGenerationInput(input, seedGenerator = () => crypto.getRandomValues(new Uint32Array(1))[0]) {
-  const text = validateScriptText(input?.script, { autoFormatKhmer: Boolean(input?.autoFormatKhmer), pronunciationRules: input?.pronunciationRules });
+  const text = validateScriptText(input?.script, {
+    autoFormatKhmer: Boolean(input?.autoFormatKhmer),
+    pronunciationRules: input?.pronunciationRules,
+    terminology: input?.terminology,
+    sourceLanguage: typeof input?.sourceLanguage === 'string' ? input.sourceLanguage : '',
+  });
   if (!input?.character?.id) {
     throw new ValidationError('Select a speaking character before generating speech.', 'character', 'MISSING_CHARACTER');
   }

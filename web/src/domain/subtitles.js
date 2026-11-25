@@ -1042,3 +1042,55 @@ export function replaceTextInSegments({ segments = [], findText = '', replaceTex
   });
   return { segments: next, matchCount, segmentCount };
 }
+
+import { applySpellingTerms, applyTranslationTerms } from './terminology.js';
+
+/**
+ * Stage 1 Batch Remedy: applies approved spelling & name variants to cue source `text` only.
+ * Never mutates `translatedText` or reads TTS pronunciation fields.
+ * Inputs: segments list, resolved terminology list, and optional `{ sourceLanguage, segmentId? }`.
+ * Outputs: `{ segments, updatedCount, updatedIds }`.
+ * Side effects: none.
+ * Failure modes: returns original segments when no matches are found.
+ * @param {Array<object>} segments - Subtitle segments.
+ * @param {readonly object[]} effectiveTerms - Resolved project terminology.
+ * @param {{ sourceLanguage?: string, segmentId?: string }} [options] - Language filter and optional single cue ID.
+ * @returns {{ segments: Array<object>, updatedCount: number, updatedIds: string[] }} Updated result.
+ */
+export function applySpellingTermsToSegments(segments, effectiveTerms, { sourceLanguage = '', segmentId = '' } = {}) {
+  if (!Array.isArray(segments) || !segments.length) return { segments: segments || [], updatedCount: 0, updatedIds: [] };
+  const updatedIds = [];
+  const next = segments.map(seg => {
+    if (segmentId && seg.id !== segmentId) return seg;
+    const corrected = applySpellingTerms(seg.text || '', effectiveTerms, { sourceLanguage });
+    if (corrected === (seg.text || '')) return seg;
+    updatedIds.push(seg.id);
+    return { ...seg, text: corrected };
+  });
+  return { segments: updatedIds.length ? next : segments, updatedCount: updatedIds.length, updatedIds };
+}
+
+/**
+ * Stage 2 Batch Remedy: applies approved translation terminology to existing `translatedText` cues only.
+ * Never modifies source `text` or injects TTS pronunciation overrides.
+ * Inputs: segments list, resolved terminology list, and `{ sourceLanguage?, targetLanguage?, segmentId? }`.
+ * Outputs: `{ segments, updatedCount, updatedIds }`.
+ * Side effects: none.
+ * Failure modes: returns unchanged list when no direct source-to-target replacements apply.
+ * @param {Array<object>} segments - Subtitle segments.
+ * @param {readonly object[]} effectiveTerms - Resolved project terminology.
+ * @param {{ sourceLanguage?: string, targetLanguage?: string, segmentId?: string }} [options] - Language pair and optional cue ID.
+ * @returns {{ segments: Array<object>, updatedCount: number, updatedIds: string[] }} Updated result.
+ */
+export function applyTranslationTermsToSegments(segments, effectiveTerms, { sourceLanguage = '', targetLanguage = '', segmentId = '' } = {}) {
+  if (!Array.isArray(segments) || !segments.length) return { segments: segments || [], updatedCount: 0, updatedIds: [] };
+  const updatedIds = [];
+  const next = segments.map(seg => {
+    if ((segmentId && seg.id !== segmentId) || !seg.translatedText) return seg;
+    const updated = applyTranslationTerms(seg.translatedText, effectiveTerms, { sourceLanguage, targetLanguage });
+    if (updated === seg.translatedText) return seg;
+    updatedIds.push(seg.id);
+    return { ...seg, translatedText: updated };
+  });
+  return { segments: updatedIds.length ? next : segments, updatedCount: updatedIds.length, updatedIds };
+}

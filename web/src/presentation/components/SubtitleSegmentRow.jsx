@@ -575,6 +575,8 @@ const REMEDY_ACTION_LABELS = Object.freeze({
   regenerate_clip: 'Regenerate',
   remove_clip: 'Remove voice',
   edit_text: 'Edit text',
+  apply_terminology_spelling: 'Apply spelling',
+  apply_terminology_translation: 'Apply translation term',
 });
 
 function resolveRemedyLabel(issue) {
@@ -648,8 +650,10 @@ function executeMismatchRemedy(action, issue, context) {
 }
 
 function executeRemedyAction(issue, actionOverride, context) {
-  const { segment, prevSegment, nextSegment, onUpdateTiming, activeText, onUpdate, useTranslation, onSplit, textarea, onOpenTiming, onAssignVoice } = context;
+  const { segment, prevSegment, nextSegment, onUpdateTiming, activeText, onUpdate, useTranslation, onSplit, textarea, onOpenTiming, onAssignVoice, onApplyTerminologySpelling, onApplyTerminologyTranslation } = context;
   const action = actionOverride || issue.remedyAction;
+  if (action === 'apply_terminology_spelling') return onApplyTerminologySpelling?.(segment.id);
+  if (action === 'apply_terminology_translation') return onApplyTerminologyTranslation?.(segment.id);
   if (action === 'resolve_overlap') {
     return handleFixOverlapAction(segment, { prevSegment, nextSegment, conflictingId: issue.metadata?.conflictingSegmentId }, onUpdateTiming);
   }
@@ -725,6 +729,8 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   onTogglePlayVoice,
   onDownloadVoice,
   onAssignVoice = null,
+  onApplyTerminologySpelling = null,
+  onApplyTerminologyTranslation = null,
 }) {
   const rowRef = useRef(null);
   const textareaRef = useRef(null);
@@ -768,6 +774,8 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
       textarea: textareaRef.current,
       onOpenTiming: () => setShowTimingEditor(true),
       onAssignVoice,
+      onApplyTerminologySpelling,
+      onApplyTerminologyTranslation,
     });
   };
 

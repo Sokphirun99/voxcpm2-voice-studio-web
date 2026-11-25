@@ -18,6 +18,7 @@ import { createIndexedDbVoiceAnchorRepository } from './data/indexedDbAudioRepos
 import { createLocalVoiceRepository } from './data/localVoiceRepository.js';
 import { createMediaSubtitleGateway } from './data/mediaSubtitleGateway.js';
 import { createHttpGlossaryRepository } from './data/httpGlossaryRepository.js';
+import { createHttpTerminologyRepository } from './data/httpTerminologyRepository.js';
 import { createHttpProjectRepository } from './data/httpProjectRepository.js';
 import { createHttpAssetRepository } from './data/httpAssetRepository.js';
 import { createNotificationSoundPlayer } from './data/notificationSound.js';
@@ -55,6 +56,7 @@ function createStudioServices() {
   const projectRepository = createHttpProjectRepository({ logger });
   const assetRepository = createHttpAssetRepository({ logger });
   const glossaryRepository = createHttpGlossaryRepository({ logger });
+  const terminologyRepository = createHttpTerminologyRepository({ logger });
   const notificationSound = createNotificationSoundPlayer({ logger });
   const diagnosticsGateway = createDiagnosticsGateway({ speechGateway, mediaSubtitleGateway, logger });
 
@@ -65,11 +67,18 @@ function createStudioServices() {
     projectRepository,
     assetRepository,
     glossaryRepository,
+    terminologyRepository,
     notificationSound,
     audioDecoder,
     versionChecker,
     logger,
-    synthesizeSpeech: createSynthesizeSpeechUseCase({ speechGateway, audioMaster, synthesisCache, glossaryRepository }),
+    synthesizeSpeech: createSynthesizeSpeechUseCase({
+      speechGateway,
+      audioMaster,
+      synthesisCache,
+      glossaryRepository,
+      terminologyRepository,
+    }),
     lockReferenceAudio: createLockReferenceAudioUseCase(),
     voiceLibrary: createVoiceLibraryUseCases({ voiceRepository: localVoices, remoteRepository: remoteVoices }),
     voiceAnchors: createVoiceAnchorUseCases({ anchorRepository }),

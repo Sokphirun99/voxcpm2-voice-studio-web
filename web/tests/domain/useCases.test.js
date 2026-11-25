@@ -932,3 +932,79 @@ test('restitchSegments detects multi-speaker script and marks recording accordin
   assert.equal(result.recording.chunks[1].speakerName, CHAR_KIRI.name);
 });
 
+test('createSynthesizeSpeechUseCase applies approved Stage 3 terminology with project overrides without mixing stages', async () => {
+  const spokenCalls = [];
+  const speechGateway = {
+    async uploadReferenceAudio() { return null; },
+    async synthesize(params) {
+      spokenCalls.push(params.text);
+      return { blob: makePcmWavBlob(new Array(4800).fill(123)), duration: 0.1, seed: params.seed ?? 42 };
+    },
+  };
+  const terminologyRepository = {
+    async loadTerms() {
+      return [
+        { id: 'spell-1', category: 'spelling', status: 'approved', enabled: true, term: 'Phnom Penh', variants: ['Pnom Penh'] },
+        { id: 'tr-1', category: 'translation', status: 'approved', enabled: true, term: 'Hello', translation: 'សួស្តី', targetLanguage: 'khm_Khmr' },
+        { id: 'name-1', category: 'name', status: 'approved', enabled: true, term: 'VoxCPM', pronunciation: 'វ៉ុកស៊ីភីអឹម' },
+        { id: 'pron-draft', category: 'pronunciation', status: 'draft', enabled: true, term: 'TTS', pronunciation: 'ថេកស៍ធូស្ពីច' },
+      ];
+    },
+  };
+  const glossaryRepository = {
+    async loadRules() {
+      return [
+        { id: 'leg-1', source: 'VoxCPM', replacement: 'legacy-vox', enabled: true },
+        { id: 'leg-2', source: 'Khmer', replacement: 'ខ្មែរ', enabled: true },
+      ];
+    },
+  };
+
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway,
+    glossaryRepository,
+    terminologyRepository,
+    seedGenerator: () => 42,
+  });
+
+  // Global terminology + legacy fallback: terminology wins on VoxCPM; spelling & translation NEVER fire in TTS; draft ignored
+  await useCase.execute({
+    script: 'Hello Pnom Penh via VoxCPM TTS in Khmer',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 8,
+  });
+  assert.equal(spokenCalls[0], 'Hello Pnom Penh via វ៉ុកស៊ីភីអឹម TTS in ខ្មែរ');
+
+  // Per-project override changes VoxCPM pronunciation exclusively for that call
+  await useCase.execute({
+    script: 'Hello VoxCPM in Khmer',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 8,
+    projectTerminology: {
+      overrides: {
+        'name-1': { pronunciation: 'វ៉ុក-ស្ទូឌីយោ' },
+      },
+      projectTerms: [
+        { id: 'proj-p', category: 'pronunciation', status: 'approved', term: 'TTS', pronunciation: 'ធីធីអេស' },
+      ],
+    },
+  });
+  assert.equal(spokenCalls[1], 'Hello វ៉ុក-ស្ទូឌីយោ in ខ្មែរ');
+  assert.equal(spokenCalls[1].includes('សួស្តី'), false);
+
+  // Disabled global name override restores normal name utterance
+  await useCase.execute({
+    script: 'VoxCPM runs TTS',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 8,
+    projectTerminology: {
+      overrides: { 'name-1': { disabled: true } },
+      projectTerms: [{ id: 'proj-p', category: 'pronunciation', status: 'approved', term: 'TTS', pronunciation: 'ធីធីអេស' }],
+    },
+  });
+  assert.equal(spokenCalls[2], 'VoxCPM runs ធីធីអេស');
+});
+

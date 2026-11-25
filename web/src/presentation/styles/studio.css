@@ -3453,6 +3453,18 @@ a {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .terminology-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .terminology-row {
+    flex-direction: column;
+  }
+
+  .terminology-row-actions {
+    justify-content: flex-start;
+  }
+
   .subtitle-voice-select-wrap select,
   .subtitle-voice-gap-wrap select,
   .subtitle-voice-dub-select-wrap select {
@@ -5124,4 +5136,277 @@ a {
   border: 1px solid rgba(255, 77, 79, 0.35);
   color: #ff6b6b;
   font-variant-numeric: tabular-nums;
+}
+
+
+/* Terminology manager modal & controls */
+.terminology-trigger-wrap {
+  margin-bottom: 6px;
+}
+
+.terminology-dialog {
+  max-width: 860px;
+  width: min(94vw, 860px);
+}
+
+.terminology-head-actions {
+  flex-wrap: wrap;
+}
+
+.terminology-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 16px 4px;
+}
+
+.terminology-search-input {
+  flex: 1 1 220px;
+  min-width: 180px;
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.terminology-toolbar select {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.terminology-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.terminology-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--control);
+}
+
+.terminology-row.is-project-disabled {
+  opacity: 0.62;
+}
+
+.terminology-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.terminology-row-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminology-row-title strong {
+  color: var(--text);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.terminology-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.terminology-cat-pill,
+.terminology-status-pill,
+.terminology-scope-pill,
+.terminology-lang-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--editor);
+  color: var(--muted);
+}
+
+.terminology-status-pill.is-approved {
+  color: var(--online);
+  border-color: color-mix(in srgb, var(--online) 38%, transparent);
+  background: color-mix(in srgb, var(--online) 12%, transparent);
+}
+
+.terminology-status-pill.is-draft {
+  color: var(--offline);
+  border-color: color-mix(in srgb, var(--offline) 38%, transparent);
+  background: color-mix(in srgb, var(--offline) 12%, transparent);
+}
+
+.terminology-scope-pill.is-override,
+.terminology-scope-pill.is-project {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--accent-wash);
+}
+
+.terminology-scope-pill.is-disabled {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 38%, transparent);
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+
+.terminology-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.terminology-stage-line strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.terminology-notes-line {
+  font-style: italic;
+  font-size: 12px;
+}
+
+.terminology-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.terminology-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px 16px;
+  overflow-y: auto;
+  background: var(--inspector);
+}
+
+.terminology-form-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+}
+
+.terminology-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+
+.terminology-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.terminology-field-wide {
+  grid-column: 1 / -1;
+}
+
+.terminology-field input,
+.terminology-field select {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.terminology-field small {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.terminology-stage-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--control);
+}
+
+.terminology-stage-block small {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.terminology-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.terminology-form-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.terminology-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.terminology-error {
+  margin: 0 16px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+  color: var(--error);
+  font-size: 12.5px;
+}
+
+.terminology-form .terminology-error {
+  margin: 0;
+}
+
+.terminology-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 28px 16px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.studio-page .terminology-danger-btn {
+  color: var(--error);
 }

@@ -10,6 +10,7 @@ import { assertPort } from './ports.js';
 import { validateGenerationInput } from './presets.js';
 import { getSegmentActiveTake } from './projectSegments.js';
 import { hasPauseMarkers, segmentScriptWithPauses, stripPauseMarkers } from './scriptSegmentation.js';
+import { resolveEffectiveTerminology } from './terminology.js';
 import { createSavedVoiceEntry } from './voiceLibrary.js';
 import { concatenateWavBlobsWithPauses, replaceChunkAndRestitch, tryReadWavDurationSeconds, trySmoothWavBlob } from './wavCodec.js';
 
@@ -238,17 +239,41 @@ function assertOfflineReadyIfSpecified(featureId, models, isOnline) {
 }
 
 /**
+ * Resolves active Stage 3 pronunciation inputs from explicit overrides, project terminology, and legacy glossary.
+ * @param {object} deps - Injected repositories (`glossaryRepository`, `terminologyRepository`).
+ * @param {object} params - Command params (`pronunciationRules`, `terminology`, `projectTerminology`).
+ * @returns {Promise<{ rules: Array<object>, effectiveTerms: Array<object>|undefined }>} Resolved Stage 3 inputs.
+ */
+async function resolveSpeechStageRules({ glossaryRepository, terminologyRepository }, params) {
+  const { pronunciationRules, terminology, projectTerminology } = params || {};
+  if (pronunciationRules !== undefined && terminology === undefined && projectTerminology === undefined) {
+    return { rules: pronunciationRules, effectiveTerms: undefined };
+  }
+  const hasTerminologySource = terminology !== undefined || projectTerminology !== undefined || Boolean(terminologyRepository);
+  if (!hasTerminologySource) {
+    const rules = pronunciationRules ?? (glossaryRepository ? await glossaryRepository.loadRules() : []);
+    return { rules, effectiveTerms: undefined };
+  }
+  const [globalTerms, legacyRules] = await Promise.all([
+    terminology === undefined && terminologyRepository ? terminologyRepository.loadTerms() : Promise.resolve([]),
+    pronunciationRules === undefined && glossaryRepository ? glossaryRepository.loadRules() : Promise.resolve(pronunciationRules ?? []),
+  ]);
+  const effectiveTerms = terminology !== undefined ? terminology : resolveEffectiveTerminology(globalTerms, projectTerminology);
+  return { rules: legacyRules, effectiveTerms };
+}
+
+/**
  * Executes single-character synthesis validation, cache lookup, chunking, mastering, and voice anchoring.
- * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, seedGenerator?: () => number }} deps - Use-case ports.
+ * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, glossaryRepository?: object|null, terminologyRepository?: object|null, seedGenerator?: () => number }} deps - Use-case ports.
  * @param {object} params - Synthesis command parameters.
  * @returns {Promise<object>} Recording metadata and uploaded FileData cache.
  */
-async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, seedGenerator }, params) {
-  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, pronunciationRules, signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
+async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, terminologyRepository = null, seedGenerator }, params) {
+  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, sourceLanguage = '', signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
   assertOfflineReadyIfSpecified('tts', models, isOnline);
-  const rules = pronunciationRules ?? (glossaryRepository ? await glossaryRepository.loadRules() : []);
+  const { rules, effectiveTerms } = await resolveSpeechStageRules({ glossaryRepository, terminologyRepository }, params);
   const payload = validateGenerationInput(
-    { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed, autoFormatKhmer, styleMode, customStyle, pronunciationRules: rules },
+    { script, character, hasLockedAudio: Boolean(anchor?.blob || cachedUpload), exactClone: Boolean(anchor?.exactClone), promptText: anchor?.promptText || '', guidance, steps, seed, autoFormatKhmer, styleMode, customStyle, pronunciationRules: rules, terminology: effectiveTerms, sourceLanguage },
     seedGenerator
   );
   const startedAt = Date.now();
@@ -518,11 +543,18 @@ async function masterMultiSpeakerTrack(blob, audioMaster, options, signal) {
  * @returns {Promise<object>} Combined recording and per-segment results.
  */
 export async function executeMultiSpeakerSynthesis(deps, params) {
-  const { segments, characters = [], defaultCharacter, anchors = {}, cachedUploads = {}, options = {}, signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
+  const { segments, characters = [], defaultCharacter, anchors = {}, cachedUploads = {}, options = {}, pronunciationRules, terminology, projectTerminology, sourceLanguage, signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
   const activeSegments = validateMultiSpeakerSegments(segments);
-  const defaultPauseMs = typeof options.defaultPauseSeconds === 'number' ? Math.round(options.defaultPauseSeconds * 1000) : SINGLE_VOICE_PAUSE_MS;
+  const resolvedOptions = {
+    ...options,
+    ...(pronunciationRules !== undefined ? { pronunciationRules } : {}),
+    ...(terminology !== undefined ? { terminology } : {}),
+    ...(projectTerminology !== undefined ? { projectTerminology } : {}),
+    ...(sourceLanguage !== undefined ? { sourceLanguage } : {}),
+  };
+  const defaultPauseMs = typeof resolvedOptions.defaultPauseSeconds === 'number' ? Math.round(resolvedOptions.defaultPauseSeconds * 1000) : SINGLE_VOICE_PAUSE_MS;
   const { chunks, segmentResults } = await synthesizeMultiSpeakerSegments(deps, {
-    segments: activeSegments, characters, defaultCharacter, anchors, cachedUploads, options, signal, onProgress, onReferenceUploaded, models, isOnline, defaultPauseMs,
+    segments: activeSegments, characters, defaultCharacter, anchors, cachedUploads, options: resolvedOptions, signal, onProgress, onReferenceUploaded, models, isOnline, defaultPauseMs,
   });
   const stitchedBlob = await concatenateWavBlobsWithPauses(chunks, defaultPauseMs);
   const { blob: combinedBlob, mastered } = await masterMultiSpeakerTrack(stitchedBlob, deps.audioMaster, options, signal);
@@ -537,20 +569,21 @@ export async function executeMultiSpeakerSynthesis(deps, params) {
  * Outputs: `{ execute(command), regenerateChunk(command), synthesizeSegment(command), restitchSegments(command) }` use-case object.
  * Side effects: delegates synthesis, mastering, and caching exclusively to injected ports.
  * Failure modes: throws ValidationError, SynthesisCancelledError, or SynthesisError.
- * When `glossaryRepository` is injected, its enabled pronunciation rules rewrite the spoken text of `execute`
- * (an explicit `pronunciationRules` param overrides it). `regenerateChunk` never re-applies rules because
- * segment text is already the spoken text and a second pass could rewrite a replacement.
- * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, glossaryRepository?: import('./ports.js').GlossaryRepositoryPort|null, seedGenerator?: () => number }} deps - Injected ports.
+ * When `glossaryRepository` or `terminologyRepository` is injected, approved Stage 3 pronunciation rules
+ * rewrite the spoken text of `execute`, `synthesizeSegment`, and `synthesizeMultiSpeaker` without altering saved script text.
+ * `regenerateChunk` never re-applies rules because segment text is already the spoken text.
+ * @param {{ speechGateway: import('./ports.js').SpeechGatewayPort, audioMaster?: object|null, synthesisCache?: object|null, glossaryRepository?: import('./ports.js').GlossaryRepositoryPort|null, terminologyRepository?: import('./ports.js').TerminologyRepositoryPort|null, seedGenerator?: () => number }} deps - Injected ports.
  * @returns {{ execute: (params: object) => Promise<object>, regenerateChunk: (params: object) => Promise<object>, synthesizeSegment: (params: object) => Promise<object>, synthesizeMultiSpeaker: (params: object) => Promise<object>, restitchSegments: (params: object) => Promise<object> }} Synthesis use case.
  */
-export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, seedGenerator }) {
+export function createSynthesizeSpeechUseCase({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, terminologyRepository = null, seedGenerator }) {
   assertPort(speechGateway, 'speechGateway', ['uploadReferenceAudio', 'synthesize']);
   if (glossaryRepository) assertPort(glossaryRepository, 'glossaryRepository', ['loadRules']);
+  if (terminologyRepository) assertPort(terminologyRepository, 'terminologyRepository', ['loadTerms']);
   return {
-    execute: params => executeSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
+    execute: params => executeSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, terminologyRepository, seedGenerator }, params),
     regenerateChunk: params => regenerateSpeechChunk({ speechGateway, audioMaster, seedGenerator }, params),
-    synthesizeSegment: params => executeSegmentSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
-    synthesizeMultiSpeaker: params => executeMultiSpeakerSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, seedGenerator }, params),
+    synthesizeSegment: params => executeSegmentSpeechSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, terminologyRepository, seedGenerator }, params),
+    synthesizeMultiSpeaker: params => executeMultiSpeakerSynthesis({ speechGateway, audioMaster, synthesisCache, glossaryRepository, terminologyRepository, seedGenerator }, params),
     restitchSegments: params => executeRestitchSegments({ audioMaster }, params),
     assembleAudioNarration: params => executeRestitchSegments({ audioMaster }, params),
     assembleNarration: params => executeRestitchSegments({ audioMaster }, params),

@@ -49,11 +49,17 @@ function EditorSegmentAudioActions({ effectiveMode, hasTakesToRestitch, onRestit
 }
 
 function EditorHeadingActions(props) {
-  const { canFormatNumbers, script, onReplaceScript, segmentsCount, effectiveMode, onToggleMode, disabled } = props;
+  const { canFormatNumbers, canApplySpelling, onApplySpelling, script, onReplaceScript, segmentsCount, effectiveMode, onToggleMode, disabled } = props;
   return (
     <div className="editor-heading-actions">
       <EditorViewToggle segmentsCount={segmentsCount} effectiveMode={effectiveMode} onToggleMode={onToggleMode} />
       <EditorSegmentAudioActions {...props} />
+      {canApplySpelling && onApplySpelling && (
+        <button type="button" className="button subtle-button" id="apply-tts-spelling"
+          disabled={disabled} onClick={onApplySpelling}>
+          <Icon name="sparkles" />Apply spelling
+        </button>
+      )}
       {canFormatNumbers && (
         <button type="button" className="button subtle-button" id="format-khmer-numbers"
           onClick={() => onReplaceScript(expandKhmerNumbers(script))}>
@@ -82,6 +88,7 @@ function EditorSegmentView({ props }) {
       onSelectSegmentTake={props.onSelectSegmentTake} onDeleteSegmentTake={props.onDeleteSegmentTake}
       onTogglePlayTake={props.onTogglePlayTake} playingTakeId={props.playingTakeId}
       onCycleSegmentTake={props.onCycleSegmentTake}
+      pronunciationSignature={props.pronunciationSignature}
       voices={props.voices || props.characters} defaultVoiceId={props.defaultVoiceId}
     />
   );
@@ -132,7 +139,9 @@ export function ScriptEditor(props) {
     <section className="editor" aria-labelledby="editor-title">
       <div className="pane-heading">
         <h2 id="editor-title"><label htmlFor="script">Script</label></h2>
-        <EditorHeadingActions canFormatNumbers={canFormatNumbers} script={script}
+        <EditorHeadingActions canFormatNumbers={canFormatNumbers}
+          canApplySpelling={props.canApplySpelling} onApplySpelling={props.onApplySpelling}
+          script={script}
           onReplaceScript={onReplaceScript} segmentsCount={segments.length}
           effectiveMode={effectiveMode} onToggleMode={handleToggle}
           onRestitchSegments={props.onRestitchSegments}

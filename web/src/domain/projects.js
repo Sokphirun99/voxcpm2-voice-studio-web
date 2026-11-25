@@ -3,6 +3,7 @@
  */
 
 import { ValidationError } from './errors.js';
+import { normalizeProjectTerminology } from './terminology.js';
 
 export const PROJECT_SCHEMA_VERSION = 1;
 export const PROJECT_TYPES = Object.freeze(['tts', 'subtitles', 'dubbing']);
@@ -333,8 +334,9 @@ function validateProjectSettings(settings) {
   return Object.freeze({ ...settings });
 }
 
-function buildProjectPayload(type, segments, settings, sourceLang, targetLang, rawPayload = null) {
+function buildProjectPayload(type, segments, settings, sourceLang, targetLang, rawPayload = null, terminology = null) {
   const extra = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload) ? rawPayload : {};
+  const resolvedTerminology = normalizeProjectTerminology(terminology ?? extra.terminology ?? settings.terminology);
   const base = {
     ...extra,
     segments,
@@ -345,6 +347,7 @@ function buildProjectPayload(type, segments, settings, sourceLang, targetLang, r
     detectedLanguage: sourceLang || extra.detectedLanguage || '',
     translatedLanguage: targetLang || extra.translatedLanguage || '',
     hasTranslation: Boolean(settings.hasTranslation || extra.hasTranslation || segments.some(s => s.translatedText)),
+    terminology: resolvedTerminology,
   };
   if (type === 'tts') {
     base.script = settings.script || extra.script || (segments.length ? segments.map(s => s.text).join('\n') : '');
@@ -355,7 +358,8 @@ function buildProjectPayload(type, segments, settings, sourceLang, targetLang, r
 }
 
 function buildProjectEntity(hdr, spec, assetId, segments, settings, now) {
-  const payload = buildProjectPayload(hdr.type, segments, settings, spec.sourceLanguage || '', spec.targetLanguage || '', spec.payload);
+  const terminology = normalizeProjectTerminology(spec.terminology ?? spec.settings?.terminology ?? spec.payload?.terminology);
+  const payload = buildProjectPayload(hdr.type, segments, settings, spec.sourceLanguage || '', spec.targetLanguage || '', spec.payload, terminology);
   return Object.freeze({
     schemaVersion: PROJECT_SCHEMA_VERSION,
     id: hdr.id,
@@ -370,6 +374,7 @@ function buildProjectEntity(hdr, spec, assetId, segments, settings, now) {
     sourceAsset: spec.sourceAsset ? createAssetReference(spec.sourceAsset) : null,
     segments: Object.freeze(segments),
     settings,
+    terminology,
     revision: hdr.revision,
     payload,
     createdAt: typeof spec.createdAt === 'string' && spec.createdAt ? spec.createdAt : now,
@@ -495,6 +500,7 @@ export function upgradeProjectSchema(raw) {
     sourceAssetId: null,
     segments,
     settings,
+    terminology: raw.terminology ?? payload.terminology ?? settings.terminology,
     revision: Number.isInteger(raw.revision) && raw.revision >= 1 ? raw.revision : DEFAULT_REVISION,
     schemaVersion: PROJECT_SCHEMA_VERSION,
     createdAt: raw.createdAt,
@@ -570,12 +576,13 @@ function buildSubtitleSnapshotPayload(spec) {
     detectedLanguage: typeof spec.detectedLanguage === 'string' ? spec.detectedLanguage : '',
     translatedLanguage: typeof spec.translatedLanguage === 'string' ? spec.translatedLanguage : '',
     hasTranslation: Boolean(spec.hasTranslation),
+    terminology: normalizeProjectTerminology(spec.terminology ?? spec.payload?.terminology),
   };
 }
 
 /**
  * Builds a subtitle project snapshot for legacy workflows.
- * Inputs: `{ id, title, videoFileName, segments, speakerNames, subtitleOptions, detectedLanguage, translatedLanguage, hasTranslation, createdAt, updatedAt }`.
+ * Inputs: `{ id, title, videoFileName, segments, speakerNames, subtitleOptions, detectedLanguage, translatedLanguage, hasTranslation, terminology, createdAt, updatedAt }`.
  * Outputs: Legacy subtitle project snapshot.
  * Side effects: none.
  * Failure modes: Throws ValidationError on invalid title.
@@ -584,11 +591,13 @@ function buildSubtitleSnapshotPayload(spec) {
  */
 export function createSubtitleProjectSnapshot(spec = {}) {
   const now = new Date().toISOString();
+  const payload = buildSubtitleSnapshotPayload(spec);
   return {
     id: spec.id || '',
     kind: 'subtitle',
     title: assertProjectTitle(spec.title),
-    payload: buildSubtitleSnapshotPayload(spec),
+    terminology: payload.terminology,
+    payload,
     createdAt: spec.createdAt || now,
     updatedAt: spec.updatedAt || now,
     deletedAt: null,
@@ -599,17 +608,22 @@ function buildTtsSnapshotPayload(spec) {
   const segments = Array.isArray(spec.segments)
     ? spec.segments.map(createProjectSegment)
     : (Array.isArray(spec.payload?.segments) ? spec.payload.segments.map(createProjectSegment) : []);
+  const sourceLanguage = typeof spec.sourceLanguage === 'string'
+    ? spec.sourceLanguage
+    : (typeof spec.payload?.detectedLanguage === 'string' ? spec.payload.detectedLanguage : '');
   return {
     script: typeof spec.script === 'string' ? spec.script : '',
     voiceId: typeof spec.voiceId === 'string' ? spec.voiceId : '',
     ttsOptions: typeof spec.ttsOptions === 'object' && !Array.isArray(spec.ttsOptions) ? spec.ttsOptions : {},
     segments,
+    ...(sourceLanguage ? { detectedLanguage: sourceLanguage } : {}),
+    terminology: normalizeProjectTerminology(spec.terminology ?? spec.payload?.terminology),
   };
 }
 
 /**
- * Builds a TTS project snapshot storing script text, voice id, segments, and synthesis options.
- * Inputs: `{ id, title, script, voiceId, segments, ttsOptions, createdAt, updatedAt }`.
+ * Builds a TTS project snapshot storing script text, voice id, segments, terminology overrides, and synthesis options.
+ * Inputs: `{ id, title, script, voiceId, segments, ttsOptions, sourceLanguage, terminology, createdAt, updatedAt }`.
  * Outputs: Complete TTS project snapshot.
  * Side effects: none.
  * Failure modes: Throws ValidationError on invalid title.
@@ -624,7 +638,9 @@ export function createTtsProjectSnapshot(spec = {}) {
     kind: 'tts',
     type: 'tts',
     title: assertProjectTitle(spec.title),
+    ...(payload.detectedLanguage ? { sourceLanguage: payload.detectedLanguage } : {}),
     segments: payload.segments,
+    terminology: payload.terminology,
     payload,
     createdAt: spec.createdAt || now,
     updatedAt: spec.updatedAt || now,

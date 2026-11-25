@@ -340,8 +340,25 @@ function AdvancedSection({ options, lastSeed, lockedSeed = null, isExactClone = 
  * @param {object} props - Voice inspector props.
  * @returns {React.ReactElement} Voice controls panel.
  */
-export function VoiceControls({ characters, anchors, activeCharacter, activeAnchor, anchorWarning, busy, options, lastSeed, lockedSeed = null, transcriptRef, actions, glossaryRepository = null }) {
+export function VoiceControls({
+  characters,
+  anchors,
+  activeCharacter,
+  activeAnchor,
+  anchorWarning,
+  busy,
+  options,
+  lastSeed,
+  lockedSeed = null,
+  transcriptRef,
+  actions,
+  glossaryRepository = null,
+  onOpenTerminology = null,
+  terminologySummary = null,
+  onGlossarySaved = null,
+}) {
   const isExactClone = Boolean(activeAnchor?.blob && activeAnchor?.exactClone);
+  const termCountLabel = terminologySummary?.approved > 0 ? ` (${terminologySummary.approved})` : '';
   return (
     <div className="voice-body">
       {anchorWarning && <p className="voice-warning" role="alert">{anchorWarning}</p>}
@@ -349,7 +366,16 @@ export function VoiceControls({ characters, anchors, activeCharacter, activeAnch
         onSelectId={actions.onSelectCharacter} onNewCharacter={actions.onOpenNewCharacter} />
       <CharacterIdentityCard character={activeCharacter} anchor={activeAnchor} busy={busy} transcriptRef={transcriptRef}
         onUploadSample={actions.onUploadSample} onResetVoice={actions.onResetVoice} onUpdateAnchor={actions.onUpdateAnchor} />
-      <PronunciationRulesControl glossaryRepository={glossaryRepository} disabled={busy} />
+      {onOpenTerminology && (
+        <div className="advanced terminology-trigger-wrap">
+          <button type="button" className="advanced-button" id="open-tts-terminology" aria-haspopup="dialog"
+            disabled={busy} onClick={onOpenTerminology}>
+            <span>Project terminology{termCountLabel}</span>
+            <Icon name="list_bullet" />
+          </button>
+        </div>
+      )}
+      <PronunciationRulesControl glossaryRepository={glossaryRepository} disabled={busy} onSaved={onGlossarySaved} />
       <AdvancedSection options={options} lastSeed={lastSeed} lockedSeed={lockedSeed}
         isExactClone={isExactClone} onChange={actions.onChangeOption} />
     </div>

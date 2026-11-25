@@ -11,6 +11,7 @@ import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useNotifications } from '../hooks/useNotifications.js';
 import { useOfflineReadiness } from '../hooks/useOfflineReadiness.js';
+import { useGlobalTerminology } from '../hooks/useTerminology.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { Icon } from './Icon.jsx';
@@ -188,6 +189,11 @@ export function Studio() {
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
   const notifications = useNotifications();
   const services = useStudioServices();
+  const globalTerminology = useGlobalTerminology({
+    terminologyRepository: services?.terminologyRepository,
+    glossaryRepository: services?.glossaryRepository,
+    logger: services?.logger,
+  });
   useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace });
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
@@ -231,6 +237,7 @@ export function Studio() {
     onTtsStateChange: handleTtsStateChange,
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
+    globalTerminology,
   };
 
   const subtitleVoiceCatalog = useMemo(() => ({
@@ -255,6 +262,7 @@ export function Studio() {
           onOpenProject={handleOpenProject}
           onNotify={notifications.notify}
           projectRepository={services?.projectRepository}
+          globalTerminology={globalTerminology}
         />
         <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
           externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
@@ -262,6 +270,7 @@ export function Studio() {
           notices={updateBanner}
           hidden={activeWorkspace !== 'subtitles'}
           voiceCatalog={subtitleVoiceCatalog}
+          globalTerminology={globalTerminology}
           actionsRef={subtitlesRef}
           onRefreshEngine={refreshEngine}
           onSendToTts={handleSendToTts}

@@ -861,3 +861,73 @@ def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path
             assert dub_res.headers["content-type"] == "video/mp4"
 
     asyncio.run(exercise_async_dub())
+
+
+def test_transcribe_and_translate_enforce_stage_separated_terminology(tmp_path: Path) -> None:
+    import json
+
+    sample_mp4 = tmp_path / "term_sample.mp4"
+    _make_sample_mp4(sample_mp4)
+
+    class _TermTranscriber:
+        def transcribe(self, audio_wav: Path, language: str = "auto", **kwargs):
+            return {
+                "language": "en",
+                "segments": [
+                    {"start": 0.0, "end": 1.2, "text": "Pnom Penh launches vox cpm with AI today."},
+                ],
+            }
+
+    class _MaskCheckingTranslator:
+        def translate_lines(self, lines: list[str], source_lang: str, target_lang: str = "km") -> list[str]:
+            return [f"[{target_lang}] {line}" for line in lines]
+
+    app = create_app(
+        MediaServices(
+            job_store=MediaJobStore(tmp_path / "jobs"),
+            transcriber=_TermTranscriber(),
+            diarizer=_FakeDiarizer(),
+            translator=_MaskCheckingTranslator(),
+        )
+    )
+    client = TestClient(app)
+
+    terminology = [
+        {"id": "s1", "category": "spelling", "status": "approved", "term": "Phnom Penh", "variants": ["Pnom Penh"]},
+        {"id": "n1", "category": "name", "status": "approved", "term": "VoxCPM", "variants": ["vox cpm"], "preserveInTranslation": True, "pronunciation": "DO_NOT_LEAK_TTS"},
+        {"id": "t1", "category": "translation", "status": "approved", "term": "AI", "translation": "បញ្ញាសិប្បនិម្មិត", "sourceLanguage": "en", "targetLanguage": "khm_Khmr"},
+        {"id": "d1", "category": "spelling", "status": "draft", "term": "NEVER", "variants": ["today"]},
+    ]
+
+    with open(sample_mp4, "rb") as fh:
+        res = client.post(
+            "/transcribe",
+            files={"file": ("term_sample.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "translate_to": "khm_Khmr", "terminology": json.dumps(terminology)},
+        )
+    assert res.status_code == 200
+    seg = res.json()["segments"][0]
+    assert seg["text"] == "Phnom Penh launches VoxCPM with AI today."
+    assert seg["translatedText"] == "[khm_Khmr] Phnom Penh launches VoxCPM with បញ្ញាសិប្បនិម្មិត today."
+    assert "DO_NOT_LEAK_TTS" not in seg["text"]
+    assert "DO_NOT_LEAK_TTS" not in seg["translatedText"]
+
+    with open(sample_mp4, "rb") as fh:
+        bad_json = client.post(
+            "/transcribe",
+            files={"file": ("bad.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "terminology": "{invalid"},
+        )
+    assert bad_json.status_code == 400
+
+    tr_res = client.post(
+        "/translate",
+        json={
+            "segments": [{"id": "seg-1", "start": 0.0, "end": 1.0, "text": "VoxCPM and AI"}],
+            "sourceLanguage": "en",
+            "targetLanguage": "khm_Khmr",
+            "terminology": terminology,
+        },
+    )
+    assert tr_res.status_code == 200
+    assert tr_res.json()["segments"][0]["translatedText"] == "[khm_Khmr] VoxCPM and បញ្ញាសិប្បនិម្មិត"

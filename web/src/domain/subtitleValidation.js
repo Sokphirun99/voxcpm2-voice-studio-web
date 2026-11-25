@@ -5,6 +5,7 @@
 import { MISMATCH_REMEDY_TYPES, detectDurationMismatches } from './durationMismatch.js';
 import { countGraphemes } from './presets.js';
 import { MIN_SPLIT_GAP_SEC, detectCueOverlaps, roundToMs } from './subtitles.js';
+import { inspectSegmentTerminology } from './terminology.js';
 
 export const VALIDATION_MIN_DURATION_SEC = 0.2;
 export const VALIDATION_MAX_DURATION_SEC = 10.0;
@@ -31,6 +32,8 @@ export const SUBTITLE_ISSUE_TYPES = Object.freeze({
   UNTRANSLATED: 'untranslated',
   UNASSIGNED_VOICE: 'unassigned_voice',
   SPEECH_EXCEEDS_INTERVAL: 'speech_exceeds_interval',
+  TERMINOLOGY_SPELLING: 'terminology_spelling',
+  TERMINOLOGY_TRANSLATION: 'terminology_translation',
 });
 
 export const REMEDY_ACTIONS = Object.freeze({
@@ -42,6 +45,8 @@ export const REMEDY_ACTIONS = Object.freeze({
   EXTEND_DURATION: 'extend_duration',
   FOCUS_TRANSLATION: 'focus_translation',
   ASSIGN_VOICE: 'assign_voice',
+  APPLY_TERMINOLOGY_SPELLING: 'apply_terminology_spelling',
+  APPLY_TERMINOLOGY_TRANSLATION: 'apply_terminology_translation',
   EXTEND_CUE_TO_SPEECH: MISMATCH_REMEDY_TYPES.EXTEND_CUE,
   EXTEND_AND_SHIFT_NEXT: MISMATCH_REMEDY_TYPES.EXTEND_AND_SHIFT,
   SHIFT_START_EARLIER: MISMATCH_REMEDY_TYPES.SHIFT_START_EARLIER,
@@ -293,7 +298,57 @@ export function validateSegmentVoice(seg, options = {}) {
 }
 
 /**
- * Runs single-segment validation rules (text, duration, line length, voice).
+ * Runs stage-isolated terminology checks on one cue (spelling variants on source text, translation terms on target text).
+ * Never mixes TTS pronunciation overrides into subtitle cue warnings.
+ * Inputs: segment, options (`terminology`, `sourceLanguage`, `targetLanguage`).
+ * Outputs: array of terminology validation issues.
+ * Side effects: none.
+ * Failure modes: none.
+ * @param {object} seg - Subtitle segment.
+ * @param {object} [options] - Validation options.
+ * @returns {Array<object>} Terminology issues.
+ */
+export function validateSegmentTerminologyIssues(seg, options = {}) {
+  const effectiveTerms = options?.terminology;
+  if (!seg || typeof seg !== 'object' || !Array.isArray(effectiveTerms) || effectiveTerms.length === 0) {
+    return [];
+  }
+  const { spellingMatches, translationGaps } = inspectSegmentTerminology(seg, effectiveTerms, {
+    sourceLanguage: options.sourceLanguage || '',
+    targetLanguage: options.targetLanguage || '',
+  });
+  const issues = [];
+  if (spellingMatches.length > 0) {
+    const first = spellingMatches[0];
+    const extraCount = spellingMatches.length > 1 ? ` (+${spellingMatches.length - 1} more)` : '';
+    issues.push(createIssue({
+      segmentId: seg.id,
+      type: SUBTITLE_ISSUE_TYPES.TERMINOLOGY_SPELLING,
+      severity: SUBTITLE_ISSUE_SEVERITIES.WARNING,
+      message: `Use approved spelling "${first.target}" instead of "${first.matched}"${extraCount}.`,
+      remedyAction: REMEDY_ACTIONS.APPLY_TERMINOLOGY_SPELLING,
+      remedyHint: 'Apply approved project spelling terminology to this cue.',
+      metadata: { matches: spellingMatches.map(m => ({ matched: m.matched, target: m.target })) },
+    }));
+  }
+  if (translationGaps.length > 0) {
+    const first = translationGaps[0];
+    const extraCount = translationGaps.length > 1 ? ` (+${translationGaps.length - 1} more)` : '';
+    issues.push(createIssue({
+      segmentId: seg.id,
+      type: SUBTITLE_ISSUE_TYPES.TERMINOLOGY_TRANSLATION,
+      severity: SUBTITLE_ISSUE_SEVERITIES.WARNING,
+      message: `Translation missing approved term "${first.target}" for "${first.source}"${extraCount}.`,
+      remedyAction: REMEDY_ACTIONS.APPLY_TERMINOLOGY_TRANSLATION,
+      remedyHint: 'Apply approved translation terminology to this cue.',
+      metadata: { gaps: translationGaps.map(g => ({ source: g.source, target: g.target })) },
+    }));
+  }
+  return issues;
+}
+
+/**
+ * Runs single-segment validation rules (text, duration, line length, voice, and terminology compliance).
  * Inputs: segment, options. Outputs: combined array of issues for this segment.
  * Side effects: none. Failure modes: empty array on completely valid segment.
  * @param {object} seg - Subtitle segment.
@@ -307,6 +362,7 @@ export function validateSingleSegment(seg, options = {}) {
     ...validateSegmentDuration(seg, options),
     ...validateSegmentLineLengths(seg, options),
     ...validateSegmentVoice(seg, options),
+    ...validateSegmentTerminologyIssues(seg, options),
   ];
 }
 

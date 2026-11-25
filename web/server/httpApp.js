@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { ConflictError, StorageError, ValidationError } from '../src/domain/errors.js';
 import { MAX_GLOSSARY_RULES } from '../src/domain/pronunciationRules.js';
+import { MAX_TERMINOLOGY_TERMS } from '../src/domain/terminology.js';
 import { assertSafeProjectId } from './storageStore.js';
 import { FfmpegUnavailableError, createAudioMaster } from './audioMaster.js';
 import { createServerLogger } from './logger.js';
@@ -102,12 +103,12 @@ export async function readBoundedBody(req, maxBytes) {
  * @param {import('node:http').IncomingMessage} req - HTTP request.
  * @returns {Promise<object>} Parsed JSON object.
  */
-export async function readJsonPayload(req) {
+export async function readJsonPayload(req, maxBytes = MAX_JSON_BODY_BYTES) {
   const contentType = String(req.headers['content-type'] || '').toLowerCase();
   if (!contentType.includes('application/json')) {
     throw new HttpApiError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Expected application/json request body.');
   }
-  const buffer = await readBoundedBody(req, MAX_JSON_BODY_BYTES);
+  const buffer = await readBoundedBody(req, maxBytes);
   try {
     const parsed = JSON.parse(buffer.toString('utf8') || '{}');
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -385,6 +386,40 @@ function sendGlossary({ res, status, glossary, requestId }) {
   sendJson({ res, status, payload: { data: { rules: glossary.rules }, meta }, requestId });
 }
 
+/**
+ * Dispatches the reusable terminology library endpoint (`GET`, `PUT /api/v1/terminology`).
+ * `PUT` replaces the global terminology list: malformed body shape -> 400, rule violations -> 422, other verbs -> 405.
+ * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
+ * @returns {Promise<boolean>} True if route matched.
+ */
+async function handleTerminologyRoutes({ req, res, url, store, requestId }) {
+  if (url.pathname !== `${API_PREFIX}/terminology`) return false;
+  if (req.method === 'GET') {
+    const terminology = await store.getTerminology();
+    sendTerminology({ res, status: 200, terminology, requestId });
+    return true;
+  }
+  if (req.method === 'PUT') {
+    const body = await readJsonPayload(req, MAX_JSON_BODY_BYTES * 2);
+    const unknownKeys = Object.keys(body).filter(key => key !== 'terms');
+    if (!Array.isArray(body.terms) || unknownKeys.length > 0) {
+      throw new HttpApiError(400, 'INVALID_TERMINOLOGY_PAYLOAD', 'Body must be { "terms": [...] }.');
+    }
+    sendTerminology({ res, status: 200, terminology: await store.replaceTerminology(body.terms), requestId });
+    return true;
+  }
+  throw new HttpApiError(405, 'METHOD_NOT_ALLOWED', 'Use GET or PUT for terminology.');
+}
+
+/**
+ * Writes the `{ data: { terms }, meta }` terminology envelope.
+ * @param {{ res: import('node:http').ServerResponse, status: number, terminology: { terms: Array<object>, updatedAt: string|null }, requestId: string }} spec - Response spec.
+ */
+function sendTerminology({ res, status, terminology, requestId }) {
+  const meta = { count: terminology.terms.length, maxTerms: MAX_TERMINOLOGY_TERMS, updatedAt: terminology.updatedAt ?? null };
+  sendJson({ res, status, payload: { data: { terms: terminology.terms }, meta }, requestId });
+}
+
 async function handleSystemRoutes({ req, res, url, store, audioMaster, requestId }) {
   if (url.pathname === `${API_PREFIX}/health` && req.method === 'GET') {
     const ffmpegAvailable = audioMaster ? await audioMaster.checkAvailability() : false;
@@ -412,6 +447,7 @@ async function routeApiRequest(ctx) {
     || (await handleProjectRoutes(ctx))
     || (await handleAssetRoutes(ctx))
     || (await handleGlossaryRoutes(ctx))
+    || (await handleTerminologyRoutes(ctx))
     || (await handleAudioMasterRoute(ctx))
     || (await handleCacheRoutes(ctx));
   if (!handled) throw new HttpApiError(404, 'NOT_FOUND', 'Endpoint not found.');

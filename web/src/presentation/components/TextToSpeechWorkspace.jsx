@@ -33,6 +33,11 @@ import {
 } from '../../domain/presets.js';
 import { findCharacterById } from '../../domain/voiceLibrary.js';
 import { createTtsProjectSnapshot } from '../../domain/projects.js';
+import {
+  applySpellingTerms,
+  createEmptyProjectTerminology,
+  normalizeProjectTerminology,
+} from '../../domain/terminology.js';
 import { persistTakeAsset, resolveTakeAudioUrl } from '../../data/takeAssetStorage.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { resolveEffectiveSeed } from '../hooks/useCharacterActions.js';
@@ -40,12 +45,14 @@ import { useProjectAutosave } from '../hooks/useProjectAutosave.js';
 import { useProjectRecovery } from '../hooks/useProjectRecovery.js';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis.js';
 import { useSpeechVerification } from '../hooks/useSpeechVerification.js';
+import { useTerminology } from '../hooks/useTerminology.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
 import { ChunkSegmentsPanel } from './ChunkSegmentsPanel.jsx';
 import { DraftRecoveryBanner } from './DraftRecoveryBanner.jsx';
 import { Icon } from './Icon.jsx';
 import { MissingAssetBanner } from './MissingAssetBanner.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
+import { TerminologyManagerModal } from './TerminologyManagerModal.jsx';
 import { Toolbar } from './Toolbar.jsx';
 import { VoiceControls } from './VoiceControls.jsx';
 import { VoiceLibrary } from './VoiceLibrary.jsx';
@@ -133,7 +140,7 @@ function resolveMultiSpeakerContext(spec) {
 }
 
 function buildSubmissionRequest(spec) {
-  const { script, submittedCharacter, submittedAnchor, actions, options, lockedSeeds = {} } = spec;
+  const { script, submittedCharacter, submittedAnchor, actions, options, lockedSeeds = {}, terminology, projectTerminology, sourceLanguage } = spec;
   const lockedSeed = options.lockSeed !== false ? lockedSeeds[submittedCharacter.id] : null;
   const seed = resolveEffectiveSeed({
     rawSeed: options.seed,
@@ -155,6 +162,9 @@ function buildSubmissionRequest(spec) {
     customStyle: options.customStyle || '',
     denoiseReference: options.denoiseReference,
     masterAudio: options.masterAudio !== false,
+    ...(terminology !== undefined ? { terminology } : {}),
+    ...(projectTerminology !== undefined ? { projectTerminology } : {}),
+    ...(sourceLanguage ? { sourceLanguage } : {}),
     ...resolveMultiSpeakerContext(spec),
   };
 }
@@ -205,7 +215,7 @@ async function persistChunkAssets(chunks, meta) {
 }
 
 async function uploadAndAttachProjectTakes(spec) {
-  const { assetRepository, setSegments, result, characterId, anchorRevision, options, projectId, logger } = spec;
+  const { assetRepository, setSegments, result, characterId, anchorRevision, options, projectId, logger, pronunciationSignature } = spec;
   if (!result?.recording || !setSegments) return;
   const fullAssetId = await persistTakeAsset({
     assetRepository, blob: result.recording.blob, segmentId: 'full', seed: result.recording.seed, projectId, logger,
@@ -215,6 +225,7 @@ async function uploadAndAttachProjectTakes(spec) {
   setSegments(prev => attachTakesToSegments(prev, rec, {
     voiceId: characterId, audioAssetId: fullAssetId, anchorVersion: anchorRevision,
     guidance: options.guidance, steps: options.steps, styleMode: options.styleMode, customStyle: options.customStyle,
+    ...(pronunciationSignature ? { pronunciationSignature } : {}),
   }));
 }
 
@@ -227,7 +238,7 @@ async function uploadAndAttachProjectTakes(spec) {
  * @param {object} spec - Upload and attachment parameters.
  */
 async function uploadAndAttachSegmentTake(spec) {
-  const { assetRepository, setSegments, segmentId, result, characterId, anchorRevision, options, projectId, logger } = spec;
+  const { assetRepository, setSegments, segmentId, result, characterId, anchorRevision, options, projectId, logger, pronunciationSignature } = spec;
   if (!result?.recording || !setSegments || !segmentId) return;
   const audioAssetId = await persistTakeAsset({
     assetRepository, blob: result.recording.blob, segmentId, seed: result.recording.seed, projectId, logger,
@@ -235,6 +246,7 @@ async function uploadAndAttachSegmentTake(spec) {
   setSegments(prev => attachTakeToSegment(prev, segmentId, result.recording, {
     voiceId: characterId, audioAssetId, anchorVersion: anchorRevision,
     guidance: options.guidance, steps: options.steps, styleMode: options.styleMode, customStyle: options.customStyle,
+    ...(pronunciationSignature ? { pronunciationSignature } : {}),
   }));
 }
 
@@ -249,6 +261,9 @@ function submitCharacterSpeech(event, ctx) {
     script: ctx.script, submittedCharacter, submittedAnchor,
     actions: ctx.actions, options: ctx.options, lockedSeeds: ctx.lockedSeeds,
     segments: ctx.segments, characters: ctx.charactersRef.current, anchors: ctx.anchorApi.anchors,
+    terminology: ctx.terminologyCtrl?.effectiveTerms,
+    projectTerminology: ctx.projectTerminology,
+    sourceLanguage: ctx.projectSourceLanguage,
   });
   void ctx.synthesis.runGeneration({
     request,
@@ -261,6 +276,7 @@ function submitCharacterSpeech(event, ctx) {
         assetRepository: ctx.assetRepository, setSegments: ctx.setSegments, result,
         characterId: submittedCharacter.id, anchorRevision: submittedRevision || 1,
         options: ctx.options, projectId: ctx.projectId, logger: ctx.logger,
+        pronunciationSignature: ctx.terminologyCtrl?.pronunciationSignature,
       });
       if (request.isMultiSpeaker) return null;
       return finalizeCharacterGeneration({
@@ -303,7 +319,10 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         options: state.options,
         onCompleted: result => {
           if (state.setSegments && result?.recording) {
-            state.setSegments(prev => attachTakesToSegments(prev, result.recording, { voiceId: ctrl.activeCharacter.id }));
+            state.setSegments(prev => attachTakesToSegments(prev, result.recording, {
+              voiceId: ctrl.activeCharacter.id,
+              ...(ctrl.terminologyCtrl?.pronunciationSignature ? { pronunciationSignature: ctrl.terminologyCtrl.pronunciationSignature } : {}),
+            }));
           }
         },
       })}
@@ -343,6 +362,9 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         onRestitchSegments={state.handleRestitchSegments}
         onExportNarration={state.handleExportNarration}
         hasTakesToRestitch={state.hasTakesToRestitch}
+        canApplySpelling={state.canApplySpelling}
+        onApplySpelling={state.handleApplySpelling}
+        pronunciationSignature={ctrl.terminologyCtrl?.pronunciationSignature}
         viewMode={state.viewMode}
         onViewModeChange={state.setViewMode}
         voices={state.library.allVoices}
@@ -360,7 +382,10 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         <VoiceControls characters={state.library.allVoices} anchors={state.anchorApi.anchors} activeCharacter={ctrl.activeCharacter}
           activeAnchor={ctrl.activeAnchor} anchorWarning={state.anchorApi.anchorWarning} busy={ctrl.synthesis.busy}
           options={state.options} lastSeed={ctrl.synthesis.lastSeed} lockedSeed={state.lockedSeeds[ctrl.activeCharacter.id] ?? null}
-          transcriptRef={state.transcriptRef} actions={voiceActions} glossaryRepository={ctrl.glossaryRepository} />
+          transcriptRef={state.transcriptRef} actions={voiceActions} glossaryRepository={ctrl.glossaryRepository}
+          onOpenTerminology={() => state.setTerminologyModalOpen(true)}
+          terminologySummary={ctrl.terminologyCtrl.counts}
+          onGlossarySaved={() => void ctrl.terminologyCtrl.reload?.()} />
       </section>
     </form>
   );
@@ -427,6 +452,8 @@ function applyProjectSnapshotToTts(snapshot, setters) {
   }
   const opts = snapshot.payload?.ttsOptions || snapshot.settings?.ttsOptions;
   if (opts && typeof opts === 'object') setters.setOptions(prev => ({ ...prev, ...opts }));
+  setters.setProjectTerminology?.(normalizeProjectTerminology(snapshot.terminology ?? snapshot.payload?.terminology ?? snapshot.settings?.terminology));
+  setters.setProjectSourceLanguage?.(snapshot.sourceLanguage || snapshot.payload?.detectedLanguage || '');
   const voiceId = snapshot.payload?.voiceId || snapshot.settings?.voiceId;
   if (voiceId && setters.allVoices.some(voice => voice.id === voiceId)) {
     setters.characterActions?.handleSelectCharacter?.(voiceId);
@@ -442,7 +469,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const externalScript = propExternalScript || sharedScript || '';
   const onConsumeExternalScript = propConsume || sharedConsume;
   const services = useStudioServices();
-  const { logger, projectRepository, glossaryRepository = null, assetRepository = null } = services;
+  const { logger, projectRepository, glossaryRepository = null, terminologyRepository = null, assetRepository = null } = services;
   const scriptRef = useRef(null);
   const transcriptRef = useRef(null);
   const prevHiddenRef = useRef(hidden);
@@ -451,6 +478,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const [activeSegmentId, setActiveSegmentId] = useState(null);
   const [viewMode, setViewMode] = useState('script');
   const [options, setOptions] = useState(INITIAL_OPTIONS);
+  const [projectTerminology, setProjectTerminology] = useState(createEmptyProjectTerminology);
+  const [projectSourceLanguage, setProjectSourceLanguage] = useState('');
+  const [terminologyModalOpen, setTerminologyModalOpen] = useState(false);
   const [projectId, setProjectId] = useState('');
   const [projectTitle, setProjectTitle] = useState('');
   const [projectRevision, setProjectRevision] = useState(1);
@@ -596,6 +626,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         if (snapshot.payload?.ttsOptions && typeof snapshot.payload.ttsOptions === 'object') {
           setOptions(prev => ({ ...prev, ...snapshot.payload.ttsOptions }));
         }
+        setProjectTerminology(normalizeProjectTerminology(snapshot.terminology ?? snapshot.payload?.terminology ?? snapshot.settings?.terminology));
+        setProjectSourceLanguage(snapshot.sourceLanguage || snapshot.payload?.detectedLanguage || '');
         const voiceId = snapshot.payload?.voiceId;
         if (voiceId && allVoicesRef.current.some(voice => voice.id === voiceId)) {
           characterActionsRef.current.handleSelectCharacter(voiceId);
@@ -610,6 +642,47 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     return () => { active = false; };
   }, [projectRepository, logger]);
 
+  const terminologyCtrl = useTerminology({
+    globalController: shared?.globalTerminology,
+    terminologyRepository,
+    glossaryRepository,
+    projectTerminology,
+    onChangeProjectTerminology: setProjectTerminology,
+    sourceLanguage: projectSourceLanguage,
+    onNotify: shared.onNotify,
+    logger,
+  });
+
+  const canApplySpelling = useMemo(() => {
+    const opts = { sourceLanguage: projectSourceLanguage };
+    const scriptChanged = Boolean(script.trim() && applySpellingTerms(script, terminologyCtrl.effectiveTerms, opts) !== script);
+    if (scriptChanged) return true;
+    return segments.some(seg => Boolean(seg.text && applySpellingTerms(seg.text, terminologyCtrl.effectiveTerms, opts) !== seg.text));
+  }, [script, segments, terminologyCtrl.effectiveTerms, projectSourceLanguage]);
+
+  const handleApplySpelling = useCallback(() => {
+    const terms = terminologyCtrl.effectiveTerms;
+    const opts = { sourceLanguage: projectSourceLanguage };
+    const nextScript = applySpellingTerms(script, terms, opts);
+    const scriptChanged = nextScript !== script;
+    const segChanged = segments.some(seg => applySpellingTerms(seg.text || '', terms, opts) !== (seg.text || ''));
+    if (scriptChanged) setScript(nextScript);
+    if (scriptChanged || segChanged) {
+      setSegments(prev => {
+        if (!prev || prev.length === 0) return reconcileScriptToSegments([], nextScript, { defaultVoiceId: activeCharacter.id });
+        return prev.map(seg => {
+          const fixed = applySpellingTerms(seg.text || '', terms, opts);
+          return fixed === (seg.text || '') ? seg : updateSegmentContent(seg, { text: fixed });
+        });
+      });
+    }
+    shared?.onNotify?.(
+      (scriptChanged || segChanged)
+        ? { kind: 'success', title: 'Spelling terminology applied', message: 'Updated source script spelling using approved project terminology.' }
+        : { kind: 'info', title: 'Spelling up to date', message: 'No spelling fixes needed.' }
+    );
+  }, [script, segments, terminologyCtrl.effectiveTerms, projectSourceLanguage, activeCharacter.id, shared]);
+
   const buildSnapshot = useCallback(() => {
     if (!projectId && !script.trim()) return null;
     const title = projectTitle || script.split(/\r?\n/, 1)[0].trim().slice(0, 60) || 'Untitled TTS project';
@@ -620,8 +693,10 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       segments,
       voiceId: activeCharacter.id,
       ttsOptions: options,
+      sourceLanguage: projectSourceLanguage,
+      terminology: projectTerminology,
     });
-  }, [projectId, projectTitle, script, segments, activeCharacter.id, options]);
+  }, [projectId, projectTitle, script, segments, activeCharacter.id, options, projectSourceLanguage, projectTerminology]);
 
   const autosave = useProjectAutosave({
     projectId,
@@ -629,7 +704,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     buildSnapshot,
     enabled: projectsReady,
     debounceMs: 1500,
-    deps: [script, segments, projectTitle, activeCharacter.id, options],
+    deps: [script, segments, projectTitle, activeCharacter.id, options, projectSourceLanguage, projectTerminology],
     hidden,
     projectRepository,
     logger,
@@ -684,13 +759,20 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         assetRepository, setSegments, segmentId, result,
         characterId: character.id, anchorRevision: rev,
         options, projectId, logger,
+        pronunciationSignature: terminologyCtrl.pronunciationSignature,
       });
     };
     await synthesis.generateSegment({
       segment: target, character, anchor, cachedUpload,
-      options, onCompleted,
+      options: {
+        ...options,
+        terminology: terminologyCtrl.effectiveTerms,
+        projectTerminology,
+        ...(projectSourceLanguage ? { sourceLanguage: projectSourceLanguage } : {}),
+      },
+      onCompleted,
     });
-  }, [segments, synthesis, activeCharacter, library.allVoices, anchorApi, characterActions, assetRepository, options, projectId, logger]);
+  }, [segments, synthesis, activeCharacter, library.allVoices, anchorApi, characterActions, assetRepository, options, projectId, logger, terminologyCtrl.effectiveTerms, terminologyCtrl.pronunciationSignature, projectTerminology, projectSourceLanguage]);
 
   const handleTogglePlaySegment = useCallback(segmentId => {
     const clearState = () => { setPlayingSegmentId(null); setPlayingTakeId(null); };
@@ -798,6 +880,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       setScript,
       setSegments,
       setOptions,
+      setProjectTerminology,
+      setProjectSourceLanguage,
       allVoices: allVoicesRef.current,
       characterActions: characterActionsRef.current,
     });
@@ -808,9 +892,18 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     id: projectId,
     title: projectTitle,
     revision: projectRevision,
+    ...(projectSourceLanguage ? { sourceLanguage: projectSourceLanguage } : {}),
     segments,
-    payload: { script, segments, ttsOptions: options, voiceId: activeCharacter.id },
-  }), [projectId, projectTitle, projectRevision, script, segments, options, activeCharacter.id]);
+    terminology: projectTerminology,
+    payload: {
+      script,
+      segments,
+      ttsOptions: options,
+      voiceId: activeCharacter.id,
+      ...(projectSourceLanguage ? { detectedLanguage: projectSourceLanguage } : {}),
+      terminology: projectTerminology,
+    },
+  }), [projectId, projectTitle, projectRevision, projectSourceLanguage, script, segments, options, activeCharacter.id, projectTerminology]);
 
   const recovery = useProjectRecovery({
     projectId,
@@ -838,6 +931,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
           setScript,
           setSegments,
           setOptions,
+          setProjectTerminology,
+          setProjectSourceLanguage,
           allVoices: allVoicesRef.current,
           characterActions: characterActionsRef.current,
         });
@@ -862,11 +957,14 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     handleCycleSegmentTake,
     handleStopPreview: () => { stopCurrentPreview(audioPreviewRef); setPlayingSegmentId(null); setPlayingTakeId(null); },
     handleRestitchSegments, handleExportNarration, hasTakesToRestitch,
+    canApplySpelling, handleApplySpelling,
+    projectTerminology, setProjectTerminology, terminologyModalOpen, setTerminologyModalOpen,
     options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi,
     charactersRef, libraryModal, setLibraryModal,
   };
   const ctrl = {
-    logger, glossaryRepository, assetRepository, projectId,
+    logger, glossaryRepository, assetRepository, projectId, projectTitle,
+    terminologyCtrl, projectTerminology, projectSourceLanguage,
     synthesis, activeCharacter, activeAnchor, actions: characterActions,
     count, isOverLimit, generateDisabled, autosave, recovery,
   };
@@ -932,6 +1030,13 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         onDeleteCharacter={id => void ctrl.actions.handleDeleteCharacter(id)}
         onUnpinAnchor={id => void ctrl.actions.handleResetVoice(id)}
         onClose={() => state.setLibraryModal({ open: false, openForm: false })} />
+      <TerminologyManagerModal
+        open={state.terminologyModalOpen}
+        terminologyCtrl={ctrl.terminologyCtrl}
+        canEditProject={true}
+        projectTitle={ctrl.projectTitle || 'Text-to-speech script'}
+        onClose={() => state.setTerminologyModalOpen(false)}
+      />
     </div>
   );
 }

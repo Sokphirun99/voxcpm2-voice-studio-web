@@ -1081,3 +1081,37 @@ test('selectSegmentTake and removeSegmentTake: compute segment status dynamicall
 
 
 
+
+test('isTakeOutdated and computeSegmentStatus detect Stage 3 pronunciationSignature changes without breaking legacy checks', () => {
+  const baseSegment = createEditableSegment({
+    id: 'seg-pron',
+    text: 'Test VoxCPM2 output',
+    voiceId: 'char-nisa',
+  });
+  const withTake = attachTakeToSegment([baseSegment], 'seg-pron', {
+    id: 'take-pron-1',
+    blob: new Blob(['wav']),
+    duration: 1.5,
+  }, {
+    voiceId: 'char-nisa',
+    pronunciationSignature: 'sig-v1',
+  })[0];
+
+  const activeTake = getSegmentActiveTake(withTake);
+  assert.equal(isTakeOutdated(activeTake, withTake, { pronunciationSignature: 'sig-v1' }), false);
+  assert.equal(computeSegmentStatus(withTake, { pronunciationSignature: 'sig-v1' }), 'ready');
+
+  // Pronunciation rule change invalidates the take
+  assert.equal(isTakeOutdated(activeTake, withTake, { pronunciationSignature: 'sig-v2' }), true);
+  assert.equal(computeSegmentStatus(withTake, { pronunciationSignature: 'sig-v2' }), 'outdated');
+
+  // Legacy callers omitting pronunciationSignature remain unaffected
+  assert.equal(isTakeOutdated(activeTake, withTake), false);
+  assert.equal(computeSegmentStatus(withTake), 'ready');
+
+  // Legacy take generated before rules existed becomes outdated once rules apply, stays ready if rules are empty
+  const legacyTake = createSegmentTake({ id: 'take-legacy', settings: { text: 'Test VoxCPM2 output', voiceId: 'char-nisa' }, isSelected: true });
+  const legacySeg = createEditableSegment({ id: 'seg-legacy', text: 'Test VoxCPM2 output', voiceId: 'char-nisa', takes: [legacyTake] });
+  assert.equal(computeSegmentStatus(legacySeg, { pronunciationSignature: '' }), 'ready');
+  assert.equal(computeSegmentStatus(legacySeg, { pronunciationSignature: 'sig-v2' }), 'outdated');
+});

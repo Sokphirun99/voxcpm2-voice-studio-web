@@ -11,10 +11,10 @@ import os
 import shutil
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -41,6 +41,11 @@ from subtitles import (    SPEAKER_ASS_COLORS,
     align_even_dimensions,
     align_segments_with_speakers,
     build_ass,
+)
+from terminology import (
+    apply_spelling_to_segments,
+    parse_terminology_form_field,
+    translate_with_terminology,
 )
 from translator import DEFAULT_NLLB_MODEL_ID, LocalTranslator
 from video_io import (
@@ -103,6 +108,7 @@ class TranslateRequest(BaseModel):
     segments: list[SegmentPayload] = Field(default_factory=list)
     sourceLanguage: str = "en"
     targetLanguage: str = "km"
+    terminology: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class VideoSizePayload(BaseModel):
@@ -142,6 +148,7 @@ class TranscribeFormOptions:
     diarize: bool
     translate_to: str
     double_check: bool = False
+    terminology: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _parse_transcribe_options(
@@ -150,14 +157,20 @@ def _parse_transcribe_options(
     diarize: bool = Form(True),
     translate_to: str = Form(""),
     double_check: bool = Form(False),
+    terminology: str = Form(""),
 ) -> TranscribeFormOptions:
     """Parse multipart form fields into an immutable option object."""
+    try:
+        parsed_terminology = parse_terminology_form_field(terminology)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return TranscribeFormOptions(
         language=(language or "auto").strip(),
         num_speakers=max(0, min(12, int(num_speakers))),
         diarize=bool(diarize),
         translate_to=(translate_to or "").strip(),
         double_check=bool(double_check),
+        terminology=parsed_terminology,
     )
 
 
@@ -283,6 +296,7 @@ def _maybe_translate_aligned(
     aligned: list[SubtitleSegment],
     detected_lang: str,
     translate_to: str,
+    terminology: Sequence[dict[str, Any]] | None = None,
 ) -> list[str] | None:
     """Translate extracted segment texts when `translate_to` target language differs from `detected_lang`."""
     target = (translate_to or "").strip()
@@ -293,7 +307,13 @@ def _maybe_translate_aligned(
         return None
     if is_same_translation_language(detected_lang, target):
         return None
-    return services.translator.translate_lines([s.text for s in aligned], detected_lang, target)
+    return translate_with_terminology(
+        services.translator,
+        [s.text for s in aligned],
+        detected_lang,
+        target,
+        terminology,
+    )
 
 
 def _transcriber_call_kwargs(method: Any, language: str, turns: list, double_check: bool) -> dict[str, Any]:
@@ -378,7 +398,9 @@ def _execute_transcribe_pipeline(
     transcript = _run_transcriber(services.transcriber, job.audio_wav, opts.language, turns, opts.double_check)
     detected_lang = str(transcript.get("language") or opts.language or "en")
     aligned = align_segments_with_speakers(transcript.get("segments") or [], turns)
-    translations = _maybe_translate_aligned(services, aligned, detected_lang, opts.translate_to)
+    if opts.terminology:
+        aligned = apply_spelling_to_segments(aligned, opts.terminology, detected_lang)
+    translations = _maybe_translate_aligned(services, aligned, detected_lang, opts.translate_to, opts.terminology)
     serialized, speakers = _serialize_segments(aligned, translations)
     summary = transcript.get("verificationSummary") or {"checked": 0, "fallbackApplied": 0, "suggestions": 0, "model": ""}
     return {
@@ -591,10 +613,12 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
             resolve_nllb_lang_code(payload.sourceLanguage)
             texts = [seg.text for seg in payload.segments]
             translated = await asyncio.to_thread(
-                active_services.translator.translate_lines,
+                translate_with_terminology,
+                active_services.translator,
                 texts,
                 payload.sourceLanguage,
                 payload.targetLanguage,
+                payload.terminology,
             )
             updated = [seg.model_copy(update={"translatedText": tr}).model_dump() for seg, tr in zip(payload.segments, translated)]
             return {"segments": updated, "targetLanguage": payload.targetLanguage}

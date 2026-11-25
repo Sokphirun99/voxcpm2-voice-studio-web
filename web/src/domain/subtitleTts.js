@@ -117,15 +117,16 @@ export function resolveSubtitleSpeechText(segment, useTranslation = false) {
 
 /**
  * Computes a stable cache/staleness signature for a generated subtitle voice clip.
- * Inputs: `{ text, characterId, anchorTag }`.
+ * Inputs: `{ text, characterId, anchorTag, pronunciationTag }`.
  * Outputs: canonical signature string.
  * Side effects: none.
  * Failure modes: coerces missing fields safely to empty strings.
- * @param {{ text?: string, characterId?: string, anchorTag?: string }} [spec] - Signature inputs.
+ * @param {{ text?: string, characterId?: string, anchorTag?: string, pronunciationTag?: string }} [spec] - Signature inputs.
  * @returns {string} Signature string.
  */
-export function buildSubtitleSpeechSignature({ text = '', characterId = '', anchorTag = '' } = {}) {
-  return `${characterId}\0${anchorTag}\0${String(text).trim()}`;
+export function buildSubtitleSpeechSignature({ text = '', characterId = '', anchorTag = '', pronunciationTag = '' } = {}) {
+  const base = `${characterId}\0${anchorTag}\0${String(text).trim()}`;
+  return pronunciationTag ? `${base}\0${pronunciationTag}` : base;
 }
 
 /**
@@ -147,17 +148,17 @@ export function selectOrderedSegments(segments, selectedIds) {
 
 /**
  * Builds the `synthesizeSpeech.execute` command payload for a subtitle frame.
- * Inputs: `{ text, character, anchor, cachedUpload, seed }`.
+ * Inputs: `{ text, character, anchor, cachedUpload, seed, pronunciationRules, terminology, sourceLanguage }`.
  * Outputs: synthesis command object compatible with `createSynthesizeSpeechUseCase`.
  * Side effects: none.
  * Failure modes: returns a command object with safe defaults; validation occurs in `validateGenerationInput`.
- * @param {{ text: string, character: object, anchor?: object|null, cachedUpload?: object|null, seed?: number|string|null }} params - Synthesis spec.
+ * @param {{ text: string, character: object, anchor?: object|null, cachedUpload?: object|null, seed?: number|string|null, pronunciationRules?: Array<object>, terminology?: Array<object>, sourceLanguage?: string }} params - Synthesis spec.
  * @returns {object} Synthesis command payload.
  */
-export function buildSubtitleSynthesisCommand({ text, character, anchor = null, cachedUpload = null, seed = '' }) {
+export function buildSubtitleSynthesisCommand({ text, character, anchor = null, cachedUpload = null, seed = '', pronunciationRules, terminology, sourceLanguage }) {
   const cleanText = String(text || '').trim();
   const effectiveSeed = seed != null && seed !== '' ? seed : (!anchor && character?.defaultSeed != null ? character.defaultSeed : '');
-  return {
+  const command = {
     script: cleanText,
     character,
     anchor,
@@ -171,6 +172,10 @@ export function buildSubtitleSynthesisCommand({ text, character, anchor = null, 
     denoiseReference: false,
     masterAudio: true,
   };
+  if (Array.isArray(pronunciationRules)) command.pronunciationRules = pronunciationRules;
+  if (Array.isArray(terminology)) command.terminology = terminology;
+  if (sourceLanguage) command.sourceLanguage = sourceLanguage;
+  return command;
 }
 
 /**

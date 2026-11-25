@@ -5,6 +5,7 @@
 import React, { useCallback, useRef } from 'react';
 import {
   MAX_PAUSE_SECONDS,
+  computeSegmentStatus,
   countGraphemeClusters,
   getSegmentActiveTake,
   hasSegmentAudio,
@@ -150,10 +151,14 @@ function SegmentTakeBadges({ isSelected, isOutdated, duration }) {
 }
 
 function SegmentTakeChip(props) {
-  const { take, takeIndex, segment, isPlaying, disabled, onSelect, onTogglePlay, onDelete } = props;
+  const { take, takeIndex, segment, pronunciationSignature, isPlaying, disabled, onSelect, onTogglePlay, onDelete } = props;
   const takeNumber = takeIndex + 1;
   const isSelected = Boolean(take.isSelected);
-  const isOutdated = isTakeOutdated(take, segment);
+  const isOutdated = isTakeOutdated(
+    take,
+    segment,
+    pronunciationSignature !== undefined ? { pronunciationSignature } : undefined
+  );
   const onChipClick = () => { if (!isSelected && onSelect) onSelect(); };
   const chipClasses = `segment-take-chip${isSelected ? ' is-selected' : ''}${isPlaying ? ' is-playing' : ''}${isOutdated ? ' is-outdated' : ''}`;
   const ariaState = `Take ${takeNumber}${isSelected ? ' (active)' : ''}${isPlaying ? ' (playing)' : ''}${isOutdated ? ' (outdated)' : ''}`;
@@ -170,9 +175,10 @@ function SegmentTakeChip(props) {
 }
 
 function renderTakeChip(take, idx, segment, props) {
-  const { disabled, playingTakeId, onSelectTake, onTogglePlayTake, onDeleteTake } = props;
+  const { disabled, playingTakeId, pronunciationSignature, onSelectTake, onTogglePlayTake, onDeleteTake } = props;
   return (
     <SegmentTakeChip key={take.id} take={take} takeIndex={idx} segment={segment}
+      pronunciationSignature={pronunciationSignature}
       isPlaying={playingTakeId === take.id} disabled={disabled}
       onSelect={onSelectTake ? () => onSelectTake(segment.id, take.id) : null}
       onTogglePlay={onTogglePlayTake ? () => onTogglePlayTake(segment.id, take.id) : null}
@@ -581,10 +587,13 @@ function resolveCardAudioState(segment, props) {
 }
 
 function buildCardHeaderProps(props, cardDelete, handleSplitClick, audioState) {
-  const { segment, index, totalCount, isSelected, disabled, voices, defaultVoiceId, onUpdate, onMoveUp, onMoveDown, onMerge, onAdd } = props;
+  const { segment, index, totalCount, isSelected, disabled, voices, defaultVoiceId, pronunciationSignature, onUpdate, onMoveUp, onMoveDown, onMerge, onAdd } = props;
   const count = countGraphemeClusters(segment.text);
+  const status = pronunciationSignature !== undefined
+    ? computeSegmentStatus(segment, { pronunciationSignature })
+    : segment.status;
   return {
-    index, totalCount, status: segment.status, count, canSplit: count >= MIN_SPLIT_GRAPHEMES, isSelected, disabled,
+    index, totalCount, status, count, canSplit: count >= MIN_SPLIT_GRAPHEMES, isSelected, disabled,
     segment, voices, defaultVoiceId, onUpdate, onMoveUp, onMoveDown, onMerge,
     onSplit: handleSplitClick, onDelete: cardDelete, onAdd: onAdd ? () => onAdd(segment.id) : null,
     ...audioState,
@@ -592,21 +601,22 @@ function buildCardHeaderProps(props, cardDelete, handleSplitClick, audioState) {
 }
 
 function SegmentCard(props) {
-  const { segment, index, isSelected, onSelect, onFocusIndex, onUpdate, onMoveUp, onMoveDown, disabled, onScriptKey } = props;
+  const { segment, index, isSelected, onSelect, onFocusIndex, onUpdate, onMoveUp, onMoveDown, disabled, onScriptKey, pronunciationSignature } = props;
   const localTextareaRef = useRef(null);
   const audioState = resolveCardAudioState(segment, props);
   const { cardDelete, onKeyDown, handleSplitClick, handleMountTextarea, cycleTake } = useSegmentCardHandlers(props, localTextareaRef, audioState);
   const headerProps = buildCardHeaderProps(props, cardDelete, handleSplitClick, audioState);
-  const cardClasses = `segment-card status-${segment.status}${isSelected ? ' is-selected' : ''}${audioState.isPlaying ? ' is-playing' : ''}`;
+  const cardClasses = `segment-card status-${headerProps.status}${isSelected ? ' is-selected' : ''}${audioState.isPlaying ? ' is-playing' : ''}`;
   return (
     <div className={cardClasses} data-segment-id={segment.id} onClick={() => onSelect?.(segment.id)}
-      onKeyDown={onKeyDown} tabIndex={0} role="group" aria-label={`Segment ${index + 1}: ${segment.status}`}>
+      onKeyDown={onKeyDown} tabIndex={0} role="group" aria-label={`Segment ${index + 1}: ${headerProps.status}`}>
       <SegmentCardHeader {...headerProps} />
       <SegmentCardBody segment={segment} index={index} totalCount={props.totalCount} textareaRef={handleMountTextarea}
         onFocusIndex={onFocusIndex} onUpdate={onUpdate} onMoveUp={onMoveUp} onMoveDown={onMoveDown}
         onSplit={handleSplitClick} canSplit={headerProps.canSplit} disabled={disabled} onScriptKey={onScriptKey}
         onGenerate={audioState.onGenerate} onTogglePlay={audioState.onTogglePlay} onCycleTake={cycleTake} />
       <SegmentTakesTray segment={segment} index={index} disabled={disabled} playingTakeId={props.playingTakeId}
+        pronunciationSignature={pronunciationSignature}
         onSelectTake={props.onSelectSegmentTake} onTogglePlayTake={props.onTogglePlayTake} onDeleteTake={props.onDeleteSegmentTake} />
     </div>
   );
@@ -646,6 +656,7 @@ function renderSegmentCard(segment, index, props, total) {
       playingSegmentId={props.playingSegmentId} onSelectSegmentTake={props.onSelectSegmentTake}
       onDeleteSegmentTake={props.onDeleteSegmentTake} onTogglePlayTake={props.onTogglePlayTake}
       playingTakeId={props.playingTakeId} onCycleTake={props.onCycleSegmentTake}
+      pronunciationSignature={props.pronunciationSignature}
       voices={props.voices || props.characters || []} defaultVoiceId={props.defaultVoiceId} />
   );
 }

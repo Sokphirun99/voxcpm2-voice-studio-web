@@ -126,16 +126,17 @@ export function assertSegmentStatus(status) {
 }
 
 /**
- * Checks whether a specific take's recorded text or voice differs from current segment state.
- * Inputs: take entity, segment entity.
+ * Checks whether a specific take's recorded text, voice, or Stage 3 pronunciation signature differs from current state.
+ * Inputs: take entity, segment entity, optional `{ pronunciationSignature }`.
  * Outputs: boolean true if take is outdated.
  * Side effects: none.
  * Failure modes: returns false for missing or invalid inputs.
  * @param {object} take - SegmentTake entity.
  * @param {object} segment - ProjectSegment entity.
+ * @param {{ pronunciationSignature?: string }} [options] - Optional Stage 3 pronunciation comparison state.
  * @returns {boolean} Whether take is outdated.
  */
-export function isTakeOutdated(take, segment) {
+export function isTakeOutdated(take, segment, options = {}) {
   if (!take || !segment) return false;
   const takeText = take.text ?? take.settings?.text;
   if (typeof takeText === 'string' && takeText.trim() !== (segment.text || '').trim()) {
@@ -147,26 +148,34 @@ export function isTakeOutdated(take, segment) {
     const normSegVoice = segment.voiceId || null;
     if (normTakeVoice !== normSegVoice) return true;
   }
+  const expectedSig = options?.pronunciationSignature;
+  if (expectedSig !== undefined) {
+    const takeSig = take.settings?.pronunciationSignature;
+    if (takeSig !== undefined ? takeSig !== expectedSig : expectedSig !== '') {
+      return true;
+    }
+  }
   return false;
 }
 
 /**
  * Computes the lifecycle status for a project segment.
- * Inputs: segment object.
+ * Inputs: segment object, optional `{ pronunciationSignature }`.
  * Outputs: 'draft' | 'ready' | 'outdated' | 'error'.
  * Side effects: none.
  * Failure modes: returns 'draft' for null/empty.
  * @param {object} segment - Project segment.
+ * @param {{ pronunciationSignature?: string }} [options] - Optional Stage 3 pronunciation signature.
  * @returns {string} Derived status.
  */
-export function computeSegmentStatus(segment) {
+export function computeSegmentStatus(segment, options = {}) {
   if (!segment) return DEFAULT_SEGMENT_STATUS;
   if (segment.status === 'error') return 'error';
   const takes = Array.isArray(segment.takes) ? segment.takes : [];
   if (takes.length === 0) return DEFAULT_SEGMENT_STATUS;
   const activeTake = takes.find(t => t.isSelected) || takes[takes.length - 1];
   if (!activeTake) return DEFAULT_SEGMENT_STATUS;
-  if (isTakeOutdated(activeTake, segment)) return 'outdated';
+  if (isTakeOutdated(activeTake, segment, options)) return 'outdated';
   const hasRecorded = Boolean(activeTake.text || activeTake.settings?.text || activeTake.voiceId || activeTake.settings?.voiceId);
   return hasRecorded ? 'ready' : (segment.status === 'outdated' ? 'outdated' : 'ready');
 }
@@ -476,6 +485,7 @@ function buildTakeSettings(seg, chunk, context, voiceId) {
     steps: context.steps ?? null,
     styleMode: context.styleMode ?? null,
     customStyle: context.customStyle || '',
+    ...(context.pronunciationSignature !== undefined ? { pronunciationSignature: context.pronunciationSignature } : {}),
     ...(context.settings || {}),
   };
 }

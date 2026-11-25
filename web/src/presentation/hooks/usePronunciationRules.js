@@ -25,9 +25,11 @@ function isBlankRow(row) {
  * Side effects: loads rules once on mount and persists through `glossaryRepository.saveRules`.
  * Failure modes: validation/storage errors surface as `status.error` messages; load never throws.
  * @param {import('../../domain/ports.js').GlossaryRepositoryPort|null} glossaryRepository - Glossary port.
+ * @param {{ onSaved?: Function }} [options] - Optional post-save callback.
  * @returns {object} Editor state and actions.
  */
-export function usePronunciationRules(glossaryRepository) {
+export function usePronunciationRules(glossaryRepository, options = {}) {
+  const { onSaved = null } = options || {};
   const [rows, setRows] = useState([]);
   const [saved, setSaved] = useState([]);
   const [isSaving, setIsSaving] = useState(false);
@@ -69,12 +71,13 @@ export function usePronunciationRules(glossaryRepository) {
       setRows(result.rules);
       setSaved(result.rules);
       setStatus({ message: result.localOnly ? OFFLINE_MESSAGE : SAVED_MESSAGE, error: false });
+      onSaved?.(result.rules);
     } catch (error) {
       setStatus({ message: error?.message || SAVE_FAILURE_MESSAGE, error: true });
     } finally {
       setIsSaving(false);
     }
-  }, [glossaryRepository, isSaving, rows]);
+  }, [glossaryRepository, isSaving, rows, onSaved]);
 
   return {
     rows,

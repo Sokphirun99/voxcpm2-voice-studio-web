@@ -12,6 +12,7 @@ import {
 } from '../src/domain/audioValidation.js';
 import { StorageError, ValidationError } from '../src/domain/errors.js';
 import { normalizeGlossaryRules } from '../src/domain/pronunciationRules.js';
+import { normalizeTerminologyList } from '../src/domain/terminology.js';
 import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
 import { createProjectStore, assertSafeProjectId, resolveSafeProjectPath } from './projectStore.js';
 import { createAssetStore } from './assetStore.js';
@@ -36,6 +37,8 @@ export {
 const CATALOG_VERSION = 1;
 const GLOSSARY_VERSION = 1;
 const GLOSSARY_FILE_NAME = 'glossary.json';
+const TERMINOLOGY_VERSION = 1;
+const TERMINOLOGY_FILE_NAME = 'terminology.json';
 const CATALOG_FILE_NAME = 'catalog.json';
 const ANCHORS_DIR_NAME = 'anchors';
 const CACHE_DIR_NAME = 'cache';
@@ -512,6 +515,47 @@ function replaceGlossaryRecord(ctx, rawRules) {
 }
 
 /**
+ * Reads `terminology.json`, returning an empty list when it has never been saved.
+ * @param {string} terminologyPath - Path to `terminology.json`.
+ * @returns {Promise<{ terms: Array<object>, createdAt: string|null, updatedAt: string|null }>} Stored terminology.
+ */
+async function readTerminologyFile(terminologyPath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(terminologyPath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { terms: [], createdAt: null, updatedAt: null };
+    throw new StorageError('Could not read terminology library from disk.', error);
+  }
+  try {
+    return { terms: normalizeTerminologyList(parsed?.terms), createdAt: parsed?.createdAt ?? null, updatedAt: parsed?.updatedAt ?? null };
+  } catch (error) {
+    throw new StorageError('Stored terminology library is invalid.', error);
+  }
+}
+
+/**
+ * Validates and atomically replaces the reusable global terminology library inside the write queue.
+ * @param {object} ctx - Store internals.
+ * @param {unknown} rawTerms - Candidate term array (validated before any disk write).
+ * @returns {Promise<{ terms: Array<object>, createdAt: string, updatedAt: string }>} Persisted terminology.
+ */
+function replaceTerminologyRecord(ctx, rawTerms) {
+  const terms = normalizeTerminologyList(rawTerms);
+  return ctx.enqueueWrite(async () => {
+    await ctx.init();
+    const existing = await readTerminologyFile(ctx.terminologyPath).catch(error => {
+      if (error instanceof StorageError) return { createdAt: null };
+      throw error;
+    });
+    const nowIso = new Date().toISOString();
+    const row = { version: TERMINOLOGY_VERSION, terms, createdAt: existing.createdAt || nowIso, updatedAt: nowIso };
+    await writeAtomicFile(ctx.terminologyPath, JSON.stringify(row, null, 2));
+    return { terms, createdAt: row.createdAt, updatedAt: row.updatedAt };
+  });
+}
+
+/**
  * Reads cached synthesis audio bytes and returns null if missing or expired on disk.
  * @param {object} ctx - Store internals.
  * @param {string} rawKey - Cache SHA-256 key.
@@ -601,6 +645,7 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
   const projectsDir = path.join(rootDir, PROJECTS_DIR_NAME);
   const assetsDir = path.join(rootDir, ASSETS_DIR_NAME);
   const glossaryPath = path.join(rootDir, GLOSSARY_FILE_NAME);
+  const terminologyPath = path.join(rootDir, TERMINOLOGY_FILE_NAME);
   let writeChain = Promise.resolve();
   const enqueueWrite = task => {
     const run = writeChain.then(task, task);
@@ -628,7 +673,7 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     }
     return initPromise;
   };
-  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, maxCacheEntries, enqueueWrite, init };
+  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, terminologyPath, maxCacheEntries, enqueueWrite, init };
   return {
     init,
     dataDir: rootDir,
@@ -663,6 +708,8 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     purgeDeletedAssets: options => assetStore.purgeDeletedAssets(options),
     getGlossary: () => readGlossaryFile(glossaryPath),
     replaceGlossary: rawRules => replaceGlossaryRecord(ctx, rawRules),
+    getTerminology: () => readTerminologyFile(terminologyPath),
+    replaceTerminology: rawTerms => replaceTerminologyRecord(ctx, rawTerms),
     getCacheEntry: async rawKey => (await readCacheAudioRecord(ctx, rawKey))?.meta || null,
     getCacheAudio: rawKey => readCacheAudioRecord(ctx, rawKey),
     putCacheEntry: input => saveCacheRecord(ctx, input),
