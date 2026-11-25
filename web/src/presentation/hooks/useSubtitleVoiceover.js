@@ -3,6 +3,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  MIN_SPILL_CUE_DURATION_SEC,
+  assertNoUnresolvedDurationMismatches,
+  createSpillApproval,
+  detectDurationMismatches,
+  isSpillApprovalValid,
+  trimClipWavToInterval,
+} from '../../domain/durationMismatch.js';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
 import {
   DEFAULT_DUB_AUDIO_MODE,
@@ -54,19 +62,31 @@ function buildAnchorTag(anchor) {
   return `${sourceKey}:${anchor.exactClone ? '1' : '0'}:${anchor.promptText || ''}`;
 }
 
-function buildClipRecord({ recording, text, character, signature }) {
-  const durationSeconds = Number.isFinite(recording?.audioDurationSeconds) && recording.audioDurationSeconds > 0
-    ? recording.audioDurationSeconds
-    : null;
+async function resolveRecordingDuration(recording) {
+  if (Number.isFinite(recording?.audioDurationSeconds) && recording.audioDurationSeconds > 0) {
+    return recording.audioDurationSeconds;
+  }
+  if (recording?.blob && typeof recording.blob.arrayBuffer === 'function') {
+    const measured = tryReadWavDurationSeconds(await recording.blob.arrayBuffer());
+    return measured > 0 ? measured : null;
+  }
+  return null;
+}
+
+function buildClipRecord({ recording, text, character, signature, durationSeconds = null }) {
+  const effectiveDur = Number.isFinite(durationSeconds) && durationSeconds > 0
+    ? durationSeconds
+    : (Number.isFinite(recording?.audioDurationSeconds) && recording.audioDurationSeconds > 0 ? recording.audioDurationSeconds : null);
   return {
     blob: recording.blob,
     url: createBlobUrl(recording.blob),
     text,
     characterId: character.id,
     characterName: character.name,
-    durationSeconds,
+    durationSeconds: effectiveDur,
     signature,
     seed: recording.seed ?? null,
+    preTrimClip: null,
   };
 }
 
@@ -219,14 +239,16 @@ function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseG
   return { combinedClip, clearCombined: () => replaceCombined(null) };
 }
 
-async function runTrackAlignment({ matched, segmentClips, totalDuration, audioMaster, scope, clips }) {
+async function runTrackAlignment({ segments, matched, segmentClips, totalDuration, audioMaster, scope, clips, spillApprovals, logger }) {
   const targetIds = matched.map(seg => seg.id);
   const res = await assembleTimelineAlignedVoiceover({
-    segments: matched,
+    segments,
     segmentClips,
     totalDuration,
     audioMaster,
     selectedIds: scope === 'selected' ? targetIds : null,
+    spillApprovals,
+    logger,
   });
   if (!res?.blob) return null;
   return {
@@ -235,15 +257,17 @@ async function runTrackAlignment({ matched, segmentClips, totalDuration, audioMa
     scope,
     durationSeconds: res.duration,
     warnings: res.warnings || [],
+    mismatches: res.mismatches || [],
     segmentIds: targetIds,
     characterName: resolveCombinedVoiceLabel(clips),
   };
 }
 
-function useAlignedVoiceoverState({ segments, selectedIds, segmentClips, totalDuration, audioMaster, logger }) {
+function useAlignedVoiceoverState({ segments, selectedIds, segmentClips, totalDuration, audioMaster, spillApprovals, logger }) {
   const [alignedClip, setAlignedClip] = useState(null);
   const urlRef = useRef('');
   const seqRef = useRef(0);
+  const settledSeqRef = useRef(0);
   const replace = useCallback(next => {
     revokeBlobUrl(urlRef.current);
     urlRef.current = next?.url || '';
@@ -253,20 +277,23 @@ function useAlignedVoiceoverState({ segments, selectedIds, segmentClips, totalDu
   useEffect(() => {
     const seq = ++seqRef.current;
     const { scope, matched } = collectCombinedTargetClips(segments, selectedIds, segmentClips);
-    if (!matched.length) { replace(null); return; }
+    if (!matched.length) { settledSeqRef.current = seq; replace(null); return; }
     const clips = matched.map(seg => segmentClips[seg.id]);
-    runTrackAlignment({ matched, segmentClips, totalDuration, audioMaster, scope, clips })
+    runTrackAlignment({ segments, matched, segmentClips, totalDuration, audioMaster, scope, clips, spillApprovals, logger })
       .then(res => {
-        if (seq !== seqRef.current || !res) return;
-        replace({ ...res, url: createBlobUrl(res.blob) });
+        if (seq !== seqRef.current) return;
+        settledSeqRef.current = seq;
+        if (res) replace({ ...res, url: createBlobUrl(res.blob) });
       })
       .catch(err => {
         if (seq !== seqRef.current) return;
+        settledSeqRef.current = seq;
         logger?.warn?.('useSubtitleVoiceover.align', err?.message || 'Could not align WAV');
         replace(null);
       });
-  }, [segments, selectedIds, segmentClips, totalDuration, audioMaster, replace, logger]);
-  return { alignedClip, clearAligned: () => replace(null) };
+  }, [segments, selectedIds, segmentClips, totalDuration, audioMaster, spillApprovals, replace, logger]);
+  const isAlignmentSettled = () => settledSeqRef.current === seqRef.current;
+  return { alignedClip, isAlignmentSettled, clearAligned: () => replace(null) };
 }
 
 function useVoiceSelectionState(segments) {
@@ -348,7 +375,8 @@ function useVoiceSynthesisActions(ctx) {
           onReferenceUploaded: fileData => { cachedUploadsRef.current[activeCharacter.id] = fileData; },
         });
         const signature = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag });
-        storeClip(segment.id, buildClipRecord({ recording: res.recording, text, character: activeCharacter, signature }));
+        const durationSeconds = await resolveRecordingDuration(res.recording);
+        storeClip(segment.id, buildClipRecord({ recording: res.recording, text, character: activeCharacter, signature, durationSeconds }));
         const doneMsg = `Voice ready for frame (${activeCharacter.name}).`;
         onStatus?.({ message: doneMsg, error: false });
         onNotify?.({ kind: 'success', title: 'Subtitle voice ready', message: doneMsg });
@@ -397,7 +425,8 @@ function useVoiceSynthesisActions(ctx) {
             sessionAnchor = { characterId: activeCharacter.id, blob: res.recording.anchorBlob, exactClone: false };
             sessionUpload = res.uploadedFileData || sessionUpload;
           }
-          storeClip(seg.id, buildClipRecord({ recording: res.recording, text, character: activeCharacter, signature }));
+          const durationSeconds = await resolveRecordingDuration(res.recording);
+          storeClip(seg.id, buildClipRecord({ recording: res.recording, text, character: activeCharacter, signature, durationSeconds }));
           done += 1;
         }
         const summary = `Voice ready for ${targets.length} selected ${targets.length === 1 ? 'frame' : 'frames'} (${activeCharacter.name}).`;
@@ -411,14 +440,108 @@ function useVoiceSynthesisActions(ctx) {
   return { generateSegmentVoice, generateSelectedVoices, cancelVoiceGeneration };
 }
 
+function blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify }) {
+  if (!exportMismatchReport?.hasUnresolved) return false;
+  try {
+    assertNoUnresolvedDurationMismatches(exportMismatchReport);
+  } catch (err) {
+    const message = err?.message || 'Resolve speech duration mismatches before exporting.';
+    onStatus?.({ message, error: true });
+    onNotify?.({ kind: 'error', title: 'Resolve duration mismatches', message });
+    return true;
+  }
+  return false;
+}
+
+function useMismatchControls({ segments, segmentClipsRef, setSpillApprovals, mediaDuration, storeClip, onStatus, onNotify, logger }) {
+  const approveSegmentSpill = useCallback(segId => {
+    const idx = (segments || []).findIndex(seg => seg.id === segId);
+    const segment = idx >= 0 ? segments[idx] : null;
+    const clip = segmentClipsRef.current[segId];
+    if (!segment || !clip) return false;
+    const approval = createSpillApproval(segment, clip);
+    const nextSeg = idx < segments.length - 1 ? segments[idx + 1] : null;
+    if (!isSpillApprovalValid(approval, { segment, clip, nextSegment: nextSeg, mediaDuration })) {
+      const cueSpan = (Number(segment.end) || 0) - Math.max(0, Number(segment.start) || 0);
+      const msg = cueSpan < MIN_SPILL_CUE_DURATION_SEC
+        ? `Cannot allow spill: extend Cue #${idx + 1} to at least ${MIN_SPILL_CUE_DURATION_SEC.toFixed(2)}s first.`
+        : 'Cannot allow spill: speech collides with the next cue or video end.';
+      onStatus?.({ message: msg, error: true });
+      onNotify?.({ kind: 'error', title: 'Spill blocked', message: msg });
+      return false;
+    }
+    setSpillApprovals(prev => ({ ...prev, [segId]: approval }));
+    onStatus?.({ message: `Allowed speech spill for Cue #${idx + 1} into trailing pause.`, error: false });
+    return true;
+  }, [segments, segmentClipsRef, setSpillApprovals, mediaDuration, onStatus, onNotify]);
+
+  const revokeSegmentSpill = useCallback(segId => {
+    setSpillApprovals(prev => {
+      if (!(segId in prev)) return prev;
+      const { [segId]: _removed, ...rest } = prev;
+      return rest;
+    });
+  }, [setSpillApprovals]);
+
+  const trimSegmentClipToInterval = useCallback(async (segId, targetDurationSec = null) => {
+    const idx = (segments || []).findIndex(item => item.id === segId);
+    const clip = segmentClipsRef.current[segId];
+    if (idx < 0 || !clip?.blob) return false;
+    const cueDur = resolveSafeTrimSeconds(segments, idx, mediaDuration, targetDurationSec);
+    try {
+      const res = await trimClipWavToInterval(clip.blob, cueDur);
+      const preTrimClip = clip.preTrimClip || { blob: clip.blob, durationSeconds: clip.durationSeconds };
+      storeClip(segId, { ...clip, blob: res.blob, url: createBlobUrl(res.blob), durationSeconds: res.durationSeconds, preTrimClip });
+      const msg = `Trimmed audio clip to ${res.durationSeconds.toFixed(2)}s.`;
+      onStatus?.({ message: msg, error: false });
+      onNotify?.({ kind: 'success', title: 'Audio trimmed to fit', message: msg });
+      return true;
+    } catch (err) {
+      const message = err?.message || 'Could not trim audio clip.';
+      logger?.error?.('useSubtitleVoiceover.trimClip', err, { segId, cueDur });
+      onStatus?.({ message, error: true });
+      onNotify?.({ kind: 'error', title: 'Audio trim failed', message });
+      return false;
+    }
+  }, [segments, segmentClipsRef, mediaDuration, storeClip, onStatus, onNotify, logger]);
+
+  const undoTrimSegmentClip = useCallback(segId => {
+    const clip = segmentClipsRef.current[segId];
+    if (!clip?.preTrimClip?.blob) return false;
+    storeClip(segId, {
+      ...clip,
+      blob: clip.preTrimClip.blob,
+      url: createBlobUrl(clip.preTrimClip.blob),
+      durationSeconds: clip.preTrimClip.durationSeconds,
+      preTrimClip: null,
+    });
+    onStatus?.({ message: 'Restored original untrimmed clip audio.', error: false });
+    return true;
+  }, [segmentClipsRef, storeClip, onStatus]);
+
+  return { approveSegmentSpill, revokeSegmentSpill, trimSegmentClipToInterval, undoTrimSegmentClip };
+}
+
+function resolveSafeTrimSeconds(segments, idx, mediaDuration, targetDurationSec) {
+  if (Number.isFinite(targetDurationSec) && targetDurationSec > 0) return targetDurationSec;
+  const seg = segments[idx];
+  const start = Math.max(0, Number(seg.start) || 0);
+  const cueDur = Math.max(0, (Number(seg.end) || 0) - start);
+  const nextSeg = idx < segments.length - 1 ? segments[idx + 1] : null;
+  const nextCap = nextSeg ? Math.max(0, (Number(nextSeg.start) || 0) - start) : Infinity;
+  const mediaCap = Number.isFinite(mediaDuration) && mediaDuration > 0 ? Math.max(0, mediaDuration - start) : Infinity;
+  return Math.min(cueDur, nextCap, mediaCap);
+}
+
 function useDubExportAction({
-  mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile,
-  segments, selectedIds, segmentClips, dubAudioMode, abortRef,
+  mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration,
+  segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, abortRef,
   dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound,
 }) {
   return useCallback(async () => {
     if (dubBusy || voiceBusy || abortRef.current || !jobId || isAudioOnly || !mediaSubtitleGateway?.exportDubbedVideo) return;
-    const clips = buildDubExportClips(segments, selectedIds, segmentClips);
+    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify })) return;
+    const clips = buildDubExportClips(segments, selectedIds, segmentClips, { spillApprovals, mediaDuration });
     if (!clips.length) return;
     onUnlockSound?.();
     const controller = new AbortController();
@@ -450,7 +573,7 @@ function useDubExportAction({
       if (abortRef.current === controller) abortRef.current = null;
       setDubBusy(false);
     }
-  }, [mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, segments, selectedIds, segmentClips, dubAudioMode, abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound]);
+  }, [mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration, segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound]);
 }
 
 /**
@@ -471,6 +594,7 @@ export function useSubtitleVoiceover({
   voiceCatalog = null,
   mediaDuration = 0,
   totalDuration = 0,
+  transcriptEpoch = 0,
   onStatus,
   onNotify,
   onUnlockSound,
@@ -492,6 +616,7 @@ export function useSubtitleVoiceover({
   const effectiveTotalDuration = totalDuration || mediaDuration || 0;
 
   const [segmentClips, setSegmentClips] = useState({});
+  const [spillApprovals, setSpillApprovals] = useState({});
   const [pauseGapMs, setPauseGapMsState] = useState(SUBTITLE_VOICEOVER_PAUSE_MS);
   const [dubAudioMode, setDubAudioModeState] = useState(DEFAULT_DUB_AUDIO_MODE);
   const [dubBusy, setDubBusy] = useState(false);
@@ -517,11 +642,12 @@ export function useSubtitleVoiceover({
   const { selectedIds, toggleSelectSegment, toggleSelectAll, clearSelection } = useVoiceSelectionState(segments);
   const { togglePlaySegment, stopPlayback } = useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, logger });
   const { combinedClip, clearCombined } = useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseGapMs, logger });
-  const { alignedClip, clearAligned } = useAlignedVoiceoverState({
+  const { alignedClip, isAlignmentSettled, clearAligned } = useAlignedVoiceoverState({
     segments,
     selectedIds,
     segmentClips,
     totalDuration: effectiveTotalDuration,
+    spillApprovals,
     audioMaster,
     logger,
   });
@@ -531,6 +657,11 @@ export function useSubtitleVoiceover({
     if (prevUrl) revokeBlobUrl(prevUrl);
     clipUrlsRef.current.set(segId, clip.url);
     setSegmentClips(prev => ({ ...prev, [segId]: clip }));
+    setSpillApprovals(prev => {
+      if (!(segId in prev)) return prev;
+      const { [segId]: _removed, ...rest } = prev;
+      return rest;
+    });
   }, []);
 
   const removeSegmentClip = useCallback(segId => {
@@ -541,6 +672,11 @@ export function useSubtitleVoiceover({
       clipUrlsRef.current.delete(segId);
     }
     setSegmentClips(prev => {
+      if (!(segId in prev)) return prev;
+      const { [segId]: _removed, ...rest } = prev;
+      return rest;
+    });
+    setSpillApprovals(prev => {
       if (!(segId in prev)) return prev;
       const { [segId]: _removed, ...rest } = prev;
       return rest;
@@ -556,7 +692,15 @@ export function useSubtitleVoiceover({
     for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
     clipUrlsRef.current.clear();
     setSegmentClips({});
+    setSpillApprovals({});
   }, [stopPlayback, clearSelection, clearCombined, clearAligned]);
+
+  const lastEpochRef = useRef(transcriptEpoch);
+  useEffect(() => {
+    if (transcriptEpoch === lastEpochRef.current) return;
+    lastEpochRef.current = transcriptEpoch;
+    resetVoiceover();
+  }, [transcriptEpoch, resetVoiceover]);
 
   useEffect(() => {
     const validIds = new Set((segments || []).map(seg => seg.id));
@@ -574,6 +718,11 @@ export function useSubtitleVoiceover({
       }
       return changed ? next : prev;
     });
+    setSpillApprovals(prev => {
+      const keys = Object.keys(prev);
+      if (!keys.some(id => !validIds.has(id))) return prev;
+      return Object.fromEntries(keys.filter(id => validIds.has(id)).map(id => [id, prev[id]]));
+    });
   }, [segments]);
 
   useEffect(() => () => {
@@ -581,6 +730,43 @@ export function useSubtitleVoiceover({
     for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
     clipUrlsRef.current.clear();
   }, []);
+
+  const isClipStale = useCallback(segment => {
+    const clip = segmentClips[segment?.id];
+    if (!clip) return false;
+    const text = resolveSubtitleSpeechText(segment, useTranslation);
+    const expected = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag });
+    return clip.signature !== expected;
+  }, [segmentClips, useTranslation, activeCharacter.id, anchorTag]);
+
+  const allDurationMismatches = useMemo(() => detectDurationMismatches({
+    segments,
+    segmentClips,
+    mediaDuration: effectiveTotalDuration,
+    spillApprovals,
+    isClipStale,
+  }), [segments, segmentClips, effectiveTotalDuration, spillApprovals, isClipStale]);
+
+  const exportMismatchReport = useMemo(() => detectDurationMismatches({
+    segments,
+    segmentClips,
+    mediaDuration: effectiveTotalDuration,
+    spillApprovals,
+    isClipStale,
+    selectedIds,
+    targetOnly: true,
+  }), [segments, segmentClips, effectiveTotalDuration, spillApprovals, isClipStale, selectedIds]);
+
+  const remedies = useMismatchControls({
+    segments,
+    segmentClipsRef,
+    setSpillApprovals,
+    mediaDuration: effectiveTotalDuration,
+    storeClip,
+    onStatus,
+    onNotify,
+    logger,
+  });
 
   const synthesis = useVoiceSynthesisActions({
     synthesizeSpeech, logger, segments, selectedIds, useTranslation, activeCharacter, activeAnchor,
@@ -590,12 +776,13 @@ export function useSubtitleVoiceover({
   });
 
   const exportDubbedVideo = useDubExportAction({
-    mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile,
-    segments, selectedIds, segmentClips, dubAudioMode, abortRef,
+    mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration: effectiveTotalDuration,
+    segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, abortRef,
     dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound,
   });
 
-  const canExportDub = Boolean(jobId && !isAudioOnly && combinedClip?.count > 0 && mediaSubtitleGateway?.exportDubbedVideo);
+  const canExportAlignedVoice = Boolean(alignedClip?.blob) && !exportMismatchReport.hasUnresolved;
+  const canExportDub = Boolean(jobId && !isAudioOnly && combinedClip?.count > 0 && mediaSubtitleGateway?.exportDubbedVideo) && !exportMismatchReport.hasUnresolved;
 
   const downloadSegmentVoice = useCallback((segment, index) => {
     const clip = segmentClips[segment?.id];
@@ -610,19 +797,27 @@ export function useSubtitleVoiceover({
     triggerFileDownload(combinedClip.blob, buildVoiceoverDownloadFilename(videoFile, suffix));
   }, [combinedClip, videoFile]);
 
-  const downloadAlignedVoice = useCallback(() => {
-    if (!alignedClip?.blob) return;
-    const suffix = alignedClip.scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX;
-    triggerFileDownload(alignedClip.blob, buildTimeAlignedDubDownloadFilename(videoFile, suffix));
-  }, [alignedClip, videoFile]);
-
-  const isClipStale = useCallback(segment => {
-    const clip = segmentClips[segment?.id];
-    if (!clip) return false;
-    const text = resolveSubtitleSpeechText(segment, useTranslation);
-    const expected = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag });
-    return clip.signature !== expected;
-  }, [segmentClips, useTranslation, activeCharacter.id, anchorTag]);
+  const downloadAlignedVoice = useCallback(async () => {
+    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify })) return;
+    if (isAlignmentSettled() && alignedClip?.blob) {
+      const suffix = alignedClip.scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX;
+      triggerFileDownload(alignedClip.blob, buildTimeAlignedDubDownloadFilename(videoFile, suffix));
+      return;
+    }
+    const { scope, matched } = collectCombinedTargetClips(segments, selectedIds, segmentClips);
+    if (!matched.length) return;
+    try {
+      const fresh = await assembleTimelineAlignedVoiceover({
+        segments, segmentClips, totalDuration: effectiveTotalDuration, audioMaster,
+        selectedIds: scope === 'selected' ? matched.map(s => s.id) : null, spillApprovals, strictDurationCheck: true, logger,
+      });
+      if (fresh?.blob) triggerFileDownload(fresh.blob, buildTimeAlignedDubDownloadFilename(videoFile, scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX));
+    } catch (err) {
+      const message = err?.message || 'Could not export time-aligned WAV.';
+      onStatus?.({ message, error: true });
+      onNotify?.({ kind: 'error', title: 'Aligned WAV export failed', message });
+    }
+  }, [alignedClip, isAlignmentSettled, segments, selectedIds, segmentClips, effectiveTotalDuration, audioMaster, spillApprovals, logger, videoFile, exportMismatchReport, onStatus, onNotify]);
 
   return {
     characters,
@@ -634,6 +829,7 @@ export function useSubtitleVoiceover({
     dubAudioMode,
     setDubAudioMode,
     dubBusy,
+    canExportAlignedVoice,
     canExportDub,
     exportDubbedVideo,
     activeCharacter,
@@ -644,6 +840,9 @@ export function useSubtitleVoiceover({
     toggleSelectAll,
     clearSelection,
     segmentClips,
+    spillApprovals,
+    allDurationMismatches,
+    exportDurationMismatches: exportMismatchReport,
     combinedClip,
     alignedClip,
     playingSegmentId,
@@ -658,6 +857,7 @@ export function useSubtitleVoiceover({
     downloadSegmentVoice,
     downloadCombinedVoice,
     downloadAlignedVoice,
+    ...remedies,
     ...synthesis,
   };
 }

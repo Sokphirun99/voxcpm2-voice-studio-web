@@ -685,6 +685,7 @@ def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path
     with open(sample_mp4, "rb") as fh:
         tr = client.post("/transcribe", files={"file": ("news.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
     assert tr.status_code == 200
+    assert tr.json()["duration"] > 1.5
     job_id = tr.json()["jobId"]
 
     wav_a = _make_wav_bytes(0.3)
@@ -761,6 +762,42 @@ def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path
         files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
     )
     assert bad_index.status_code == 400
+
+    bad_allow = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 1.0, "fileIndex": 0, "allowOverflow": "yes"}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert bad_allow.status_code == 400
+
+    wav_spill = _make_wav_bytes(0.6)
+    valid_allow = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 0.2, "fileIndex": 0, "allowOverflow": True}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_spill, "audio/wav"))],
+    )
+    assert valid_allow.status_code == 200
+
+    overflow_past_video = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 1.6, "end": 1.8, "fileIndex": 0, "allowOverflow": True}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", _make_wav_bytes(0.9), "audio/wav"))],
+    )
+    assert overflow_past_video.status_code == 400
+
+    overflow_collides_next = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([
+                {"segmentId": "seg-1", "start": 0.0, "end": 0.2, "fileIndex": 0, "allowOverflow": True},
+                {"segmentId": "seg-2", "start": 0.3, "end": 0.8, "fileIndex": 1},
+            ]),
+            "originalAudioMode": "duck",
+        },
+        files=[("files", ("clip1.wav", wav_spill, "audio/wav")), ("files", ("clip2.wav", wav_a, "audio/wav"))],
+    )
+    assert overflow_collides_next.status_code == 400
 
     bad_wav = client.post(
         "/dub",

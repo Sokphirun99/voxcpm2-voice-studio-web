@@ -327,6 +327,66 @@ export async function smoothAndTrimWavBlob(blob) {
   return new Blob([buildWaveHeader({ ...info, dataLength: pcm.byteLength }), pcm], { type: 'audio/wav' });
 }
 
+function applyTailFadeGains(pcmBytes, info, fadeMs) {
+  const bits = info?.bitsPerSample ?? PCM_BITS_16;
+  if (!pcmBytes?.buffer || !info?.blockAlign || !info?.sampleRate || bits !== PCM_BITS_16) return;
+  const frameCount = Math.floor(pcmBytes.byteLength / info.blockAlign);
+  const fadeFrames = Math.min(Math.round((info.sampleRate * fadeMs) / MS_PER_SECOND), Math.floor(frameCount / 2));
+  if (fadeFrames <= 0) return;
+  const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  for (let i = 0; i < fadeFrames; i++) {
+    const tailGain = (fadeFrames - 1 - i) / fadeFrames;
+    const tailFrame = frameCount - fadeFrames + i;
+    for (let ch = 0; ch < info.numChannels; ch++) {
+      const tailOff = tailFrame * info.blockAlign + ch * 2;
+      view.setInt16(tailOff, Math.round(view.getInt16(tailOff, true) * tailGain), true);
+    }
+  }
+}
+
+function resolveTrimmedPcmSlice(buffer, info, targetFrames, options) {
+  const clean = options.trimSilenceFirst
+    ? prepareCleanPcmSlice(buffer, info)
+    : new Uint8Array(buffer.slice(info.dataOffset, info.dataOffset + Math.floor(info.dataSize / info.blockAlign) * info.blockAlign));
+  const cleanFrames = Math.floor(clean.byteLength / info.blockAlign);
+  if (cleanFrames <= targetFrames) return clean;
+  const sliced = new Uint8Array(clean.slice(0, targetFrames * info.blockAlign));
+  if (!options.trimSilenceFirst) applyBoundaryMicroFades(sliced, info, EDGE_FADE_MS);
+  applyTailFadeGains(sliced, info, options.fadeMs ?? EDGE_FADE_MS);
+  return sliced;
+}
+
+/**
+ * Trims a PCM WAV Blob cleanly to `targetDurationSeconds` with boundary micro-fades.
+ * Inputs: WAV `Blob`, positive target duration in seconds, optional `{ fadeMs, trimSilenceFirst }`.
+ * Outputs: Promise resolving to `{ blob, durationSeconds, originalDurationSeconds, wasTrimmed }`.
+ * Side effects: reads binary bytes from input `Blob`.
+ * Failure modes: throws TypeError on non-Blob input or SynthesisError on invalid duration/WAV headers.
+ * @param {Blob} blob - Source WAV Blob.
+ * @param {number} targetDurationSeconds - Target duration in seconds (> 0).
+ * @param {{ fadeMs?: number, trimSilenceFirst?: boolean }} [options] - Trim options.
+ * @returns {Promise<{ blob: Blob, durationSeconds: number, originalDurationSeconds: number, wasTrimmed: boolean }>} Trimmed WAV descriptor.
+ */
+export async function trimWavBlobToDuration(blob, targetDurationSeconds, options = {}) {
+  const normalized = ensureAudioWavBlob(blob);
+  if (!Number.isFinite(targetDurationSeconds) || targetDurationSeconds <= 0) {
+    throw new SynthesisError('Target trim duration must be a positive number.', { code: 'INVALID_DURATION' });
+  }
+  const buffer = await normalized.arrayBuffer();
+  const info = inspectWavBuffer(buffer);
+  const totalFrames = Math.floor(info.dataSize / info.blockAlign);
+  const targetFrames = Math.min(totalFrames, Math.max(1, Math.floor(targetDurationSeconds * info.sampleRate + 1e-6)));
+  const pcm = resolveTrimmedPcmSlice(buffer, info, targetFrames, options);
+  const finalFrames = Math.floor(pcm.byteLength / info.blockAlign);
+  const trimmedBlob = new Blob([buildWaveHeader({ ...info, dataLength: pcm.byteLength }), pcm], { type: 'audio/wav' });
+  return {
+    blob: trimmedBlob,
+    durationSeconds: Math.round((finalFrames / info.sampleRate) * 1000) / 1000,
+    originalDurationSeconds: Math.round((totalFrames / info.sampleRate) * 1000) / 1000,
+    wasTrimmed: finalFrames < totalFrames,
+  };
+}
+
 /**
  * Safely trims silence and smooths edges on valid 16-bit PCM WAV Blobs while leaving minimal test/non-PCM Blobs intact.
  * Inputs: WAV `Blob`.

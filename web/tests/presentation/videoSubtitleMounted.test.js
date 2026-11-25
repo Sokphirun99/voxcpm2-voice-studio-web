@@ -2532,3 +2532,339 @@ test('mounted subtitle import translates cues and generates per-frame voice with
     dom.restore();
   }
 });
+
+test('mounted VideoSubtitleWorkspace detects R3-05 speech duration mismatches, blocks dub exports, and resolves every mismatch via explicit remedies', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  const origCreateObjectURL = URL.createObjectURL;
+  const origRevokeObjectURL = URL.revokeObjectURL;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+    const dubCalls = [];
+    const downloadedNames = [];
+    const origCreateElement = dom.container.ownerDocument.createElement;
+    dom.container.ownerDocument.createElement = tag => {
+      const el = origCreateElement(tag);
+      if (tag === 'a') {
+        const origClick = el.click.bind(el);
+        el.click = () => {
+          if (el.download) downloadedNames.push(el.download);
+          return origClick();
+        };
+      }
+      return el;
+    };
+
+    const durationsByScript = {
+      'Cue one.': 1600,   // 1.6s > 1.0s cue, fits before Cue #2 at 2.0s
+      'Cue two.': 1500,   // 1.5s > 1.0s cue (2.0-3.0s), collides with Cue #3 at 3.2s
+      'Cue three.': 1400, // 1.4s > 1.0s cue (3.2-4.2s), trailing tail free
+    };
+
+    const services = {
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true }),
+        transcribeVideo: async () => ({
+          jobId: 'r305job123456789',
+          language: 'en',
+          translatedLanguage: '',
+          isAudioOnly: false,
+          speakers: ['speaker-1'],
+          videoSize: { width: 1280, height: 720 },
+          segments: [
+            { id: 'seg-1', start: 0.0, end: 1.0, speakerId: 'speaker-1', text: 'Cue one.', translatedText: '' },
+            { id: 'seg-2', start: 2.0, end: 3.0, speakerId: 'speaker-1', text: 'Cue two.', translatedText: '' },
+            { id: 'seg-3', start: 3.2, end: 4.2, speakerId: 'speaker-1', text: 'Cue three.', translatedText: '' },
+          ],
+        }),
+        exportDubbedVideo: async params => {
+          dubCalls.push(params);
+          return new Blob(['ftypdubmp4'], { type: 'video/mp4' });
+        },
+      },
+      synthesizeSpeech: {
+        execute: async cmd => {
+          const ms = durationsByScript[cmd.script] || 1000;
+          const blob = createValidTestWavBlob(ms);
+          return {
+            recording: {
+              id: `take-${cmd.script}`,
+              characterId: cmd.character.id,
+              characterName: cmd.character.name,
+              transcript: cmd.script,
+              blob,
+              audioDurationSeconds: ms / 1000,
+              seed: 7,
+            },
+            uploadedFileData: null,
+          };
+        },
+      },
+      logger: { debug() {}, warn() {}, error() {} },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(VideoSubtitleWorkspace, { notices: null })));
+      await new Promise(r => setTimeout(r, 0));
+    });
+
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'clip.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 10));
+    });
+
+    // Select all 3 cues and generate voices -> all 3 exceed their 1.0s intervals
+    await act(async () => {
+      const selectAll = dom.container.querySelector('#subtitle-select-all');
+      selectAll.checked = true;
+      selectAll.dispatchEvent({ type: 'click', bubbles: true, target: selectAll });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-generate-voice-btn').click();
+      await new Promise(r => setTimeout(r, 40));
+    });
+
+    // 1. All 3 mismatches are surfaced in validation summary, export banner, and row alerts; dub exports are blocked
+    const banner = dom.container.querySelector('.subtitle-mismatch-export-banner');
+    assert.ok(banner, 'Must display duration mismatch export banner');
+    assert.match(banner.textContent, /Resolve 3 speech duration mismatches before final dub export/);
+
+    const dubBtn = dom.container.querySelector('#subtitle-export-dub-btn');
+    const alignedBtn = dom.container.querySelector('#subtitle-download-aligned-voice-btn');
+    const dockAlignedBtn = dom.container.querySelector('#subtitle-export-aligned-wav-btn');
+    assert.equal(Boolean(dubBtn.disabled || dubBtn.hasAttribute('disabled')), true);
+    assert.equal(Boolean(alignedBtn.disabled || alignedBtn.hasAttribute('disabled')), true);
+    assert.equal(Boolean(dockAlignedBtn.disabled || dockAlignedBtn.hasAttribute('disabled')), true);
+
+    const rows = dom.container.querySelectorAll('.subtitle-segment-row');
+    assert.equal(rows.length, 3);
+    const findRemedyBtn = (row, action) => row.querySelectorAll('.subtitle-validation-fix-btn')
+      .find(btn => btn.getAttribute('data-remedy-action') === action);
+
+    // 2. Cue #1: Allow spill into empty pause [1.0, 2.0], test Undo spill, then re-approve spill
+    const row1SpillBtn = findRemedyBtn(rows[0], 'allow_spill');
+    assert.ok(row1SpillBtn, 'Cue #1 must offer Allow spill remedy');
+    await act(async () => { row1SpillBtn.click(); });
+    assert.ok(rows[0].querySelector('.subtitle-cue-spill-badge'));
+    const undoSpillBtn = rows[0].querySelector('.subtitle-cue-undo-spill-btn');
+    assert.ok(undoSpillBtn);
+    await act(async () => { undoSpillBtn.click(); });
+    assert.equal(rows[0].querySelector('.subtitle-cue-spill-badge'), null);
+    await act(async () => { findRemedyBtn(rows[0], 'allow_spill').click(); });
+    assert.match(dom.container.querySelector('.subtitle-mismatch-export-banner').textContent, /Resolve 2 speech duration mismatches/);
+
+    // 3. Cue #2: Collides with Cue #3 -> resolve via Extend & shift
+    const row2ShiftBtn = findRemedyBtn(rows[1], 'extend_and_shift');
+    assert.ok(row2ShiftBtn, 'Colliding Cue #2 must offer Extend & shift remedy');
+    await act(async () => { row2ShiftBtn.click(); });
+    assert.match(dom.container.querySelector('.subtitle-mismatch-export-banner').textContent, /Resolve 1 speech duration mismatch/);
+
+    // 4. Cue #3: Test explicit Trim audio + reversible Undo trim, then resolve via Extend cue
+    const row3TrimBtn = findRemedyBtn(rows[2], 'trim_clip');
+    assert.ok(row3TrimBtn, 'Cue #3 must offer explicit Trim audio remedy');
+    await act(async () => {
+      row3TrimBtn.click();
+      await new Promise(r => setTimeout(r, 30));
+    });
+    assert.equal(dom.container.querySelector('.subtitle-mismatch-export-banner'), null, 'Trimming resolves last mismatch');
+    const undoTrimBtn = rows[2].querySelector('.subtitle-cue-undo-trim-btn');
+    assert.ok(undoTrimBtn, 'Trimmed clip must offer Undo trim');
+    await act(async () => {
+      undoTrimBtn.click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.ok(dom.container.querySelector('.subtitle-mismatch-export-banner'), 'Undoing trim restores mismatch');
+
+    const row3ExtendBtn = findRemedyBtn(rows[2], 'extend_cue');
+    assert.ok(row3ExtendBtn, 'Cue #3 must offer Extend cue remedy');
+    await act(async () => {
+      row3ExtendBtn.click();
+      await new Promise(r => setTimeout(r, 30));
+    });
+
+    // 5. All mismatches resolved -> validation badge is clean Valid, banner gone, both exports enabled and succeed!
+    assert.equal(dom.container.querySelector('.subtitle-mismatch-export-banner'), null);
+    assert.ok(dom.container.querySelector('.is-clean'));
+
+    const readyDubBtn = dom.container.querySelector('#subtitle-export-dub-btn');
+    const readyDockAlignedBtn = dom.container.querySelector('#subtitle-export-aligned-wav-btn');
+    assert.equal(Boolean(readyDubBtn.disabled || readyDubBtn.hasAttribute('disabled')), false);
+    assert.equal(Boolean(readyDockAlignedBtn.disabled || readyDockAlignedBtn.hasAttribute('disabled')), false);
+
+    await act(async () => {
+      readyDockAlignedBtn.click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(downloadedNames.includes('clip-selected-aligned-dub.wav'), true);
+
+    await act(async () => {
+      readyDubBtn.click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(dubCalls.length, 1);
+    assert.equal(dubCalls[0].clips[0].segmentId, 'seg-1');
+    assert.equal(dubCalls[0].clips[0].allowOverflow, true, 'Spill-approved Cue #1 must pass allowOverflow: true to /dub');
+    assert.equal(dubCalls[0].clips[1].allowOverflow, undefined);
+    assert.equal(dubCalls[0].clips[2].allowOverflow, undefined);
+    assert.equal(downloadedNames.includes('clip-dubbed.mp4'), true);
+  } finally {
+    URL.createObjectURL = origCreateObjectURL;
+    URL.revokeObjectURL = origRevokeObjectURL;
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace enforces transcribe duration bounds, revokes spill on neighbor timing edit, supports Remove voice on wedged tail cues, and clears clips on re-extract', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  let extractCount = 0;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    const services = {
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true }),
+        transcribeVideo: async () => {
+          extractCount += 1;
+          return {
+            jobId: `job-${extractCount}`,
+            duration: 3.5, // Probed backend media duration without <video onLoadedMetadata>
+            language: 'en',
+            translatedLanguage: '',
+            isAudioOnly: false,
+            speakers: ['speaker-1'],
+            videoSize: { width: 1280, height: 720 },
+            segments: [
+              { id: 'seg-1', start: 0.0, end: 1.0, speakerId: 'speaker-1', text: 'Spill line.', translatedText: '' },
+              { id: 'seg-2', start: 2.0, end: 3.35, speakerId: 'speaker-1', text: 'Middle line.', translatedText: '' },
+              { id: 'seg-3', start: 3.35, end: 3.5, speakerId: 'speaker-1', text: 'Tail.', translatedText: '' },
+            ],
+          };
+        },
+        exportDubbedVideo: async () => new Blob(['mp4'], { type: 'video/mp4' }),
+      },
+      synthesizeSpeech: {
+        execute: async cmd => {
+          const ms = cmd.script === 'Spill line.' ? 1600 : cmd.script === 'Middle line.' ? 1350 : 600;
+          return {
+            recording: {
+              id: `take-${cmd.script}`,
+              characterId: cmd.character.id,
+              characterName: cmd.character.name,
+              transcript: cmd.script,
+              blob: createValidTestWavBlob(ms),
+              audioDurationSeconds: ms / 1000,
+              seed: 11,
+            },
+            uploadedFileData: null,
+          };
+        },
+      },
+      logger: { debug() {}, warn() {}, error() {} },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(VideoSubtitleWorkspace, { notices: null })));
+      await new Promise(r => setTimeout(r, 0));
+    });
+
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mkv'], 'clip.mkv', { type: 'video/x-matroska' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+
+    await act(async () => {
+      const selectAll = dom.container.querySelector('#subtitle-select-all');
+      selectAll.checked = true;
+      selectAll.dispatchEvent({ type: 'click', bubbles: true, target: selectAll });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-generate-voice-btn').click();
+      await new Promise(r => setTimeout(r, 40));
+    });
+
+    const rows = dom.container.querySelectorAll('.subtitle-segment-row');
+    const findRemedyBtn = (row, action) => row.querySelectorAll('.subtitle-validation-fix-btn')
+      .find(btn => btn.getAttribute('data-remedy-action') === action);
+
+    // 1. Tail Cue #3 [3.35, 3.50] exceeds 3.50s transcribe mediaDuration -> cannot Extend or Allow spill, offers Remove voice
+    assert.equal(findRemedyBtn(rows[2], 'extend_cue'), undefined, 'Must block Extend cue past transcribe duration');
+    assert.equal(findRemedyBtn(rows[2], 'allow_spill'), undefined, 'Must block Allow spill past transcribe duration');
+    const removeBtn = findRemedyBtn(rows[2], 'remove_clip');
+    assert.ok(removeBtn, 'Wedged tail cue must offer explicit Remove voice remedy');
+    await act(async () => { removeBtn.click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 3, 'Remove voice must keep subtitle cue intact');
+
+    // 2. Approve spill on Cue #1 [0.0, 1.0] (1.6s clip before Cue #2 at 2.0s) -> clean!
+    await act(async () => {
+      findRemedyBtn(rows[0], 'allow_spill').click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(dom.container.querySelector('.subtitle-mismatch-export-banner'), null);
+
+    // 3. Edit Cue #2's start timestamp into 1.4s via TimingInlineEditor -> revokes Cue #1's spill approval and re-blocks export!
+    const row2TimeToggle = rows[1].querySelectorAll('.subtitle-cue-btn')
+      .find(btn => btn.textContent.includes('Time'));
+    await act(async () => { row2TimeToggle.click(); });
+    const [startInput] = rows[1].querySelectorAll('.subtitle-timing-input');
+    await act(async () => {
+      startInput.focus();
+      startInput._value = '00:01.4';
+      startInput.dispatchEvent({ type: 'input', bubbles: true, target: startInput });
+    });
+    await act(async () => {
+      startInput.blur();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(rows[0].querySelector('.subtitle-cue-spill-badge'), null, 'Colliding neighbor edit must immediately revoke spill badge');
+    assert.ok(dom.container.querySelector('.subtitle-mismatch-export-banner'), 'Revoked spill must re-block export');
+
+    // 4. Re-extracting subtitles clears old segmentClips and spillApprovals cleanly
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(dom.container.querySelector('#subtitle-voice-output'), null, 'Fresh re-extract must reset prior voiceover clips');
+    assert.equal(dom.container.querySelector('.subtitle-mismatch-export-banner'), null);
+  } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});

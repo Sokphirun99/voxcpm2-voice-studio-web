@@ -20,6 +20,19 @@ export {
   resolveTargetLanguageMeta,
 } from './subtitleLanguages.js';
 export {
+  DURATION_MISMATCH_TOLERANCE_SEC,
+  MISMATCH_REMEDY_TYPES,
+  assertNoUnresolvedDurationMismatches,
+  createSpillApproval,
+  detectDurationMismatches,
+  extendAllSafeMismatches,
+  extendCueAndShiftLater,
+  extendCueToSpeech,
+  isSpillApprovalValid,
+  shiftCueStartEarlier,
+  trimClipWavToInterval,
+} from './durationMismatch.js';
+export {
   MAX_CHARS_PER_LINE,
   MAX_LINE_BREAKS,
   MAX_READING_SPEED_CPS,
@@ -33,6 +46,7 @@ export {
   filterSegmentsWithIssues,
   findNextSegmentWithIssue,
   findPreviousSegmentWithIssue,
+  validateDurationMismatches,
   validateSegmentDuration,
   validateSegmentLineLengths,
   validateSegmentText,

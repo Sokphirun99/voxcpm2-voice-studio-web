@@ -309,3 +309,57 @@ test('autoBreakLongLine preserves Khmer Unicode grapheme clusters and avoids inf
   assert.equal(autoBreakLongLine('No break', 0), 'No break');
   assert.equal(autoBreakLongLine('No break', -5), 'No break');
 });
+
+test('validateSubtitleSegments reports speech_exceeds_interval errors, rejects colliding spill, and clears on valid spill approval', () => {
+  const collidingSegments = [
+    { id: 'c1', start: 0.0, end: 1.5, text: 'Short cue' },
+    { id: 'c2', start: 2.0, end: 4.0, text: 'Neighbor at 2.0s' },
+  ];
+  const collidingClips = {
+    c1: { durationSeconds: 2.2, signature: 'sig-1', blob: new Blob(['x']) },
+    c2: { durationSeconds: 1.5, signature: 'sig-2', blob: new Blob(['y']) },
+  };
+
+  const summary = validateSubtitleSegments({ segments: collidingSegments, segmentClips: collidingClips, mediaDuration: 6.0 });
+  assert.equal(summary.isValid, false);
+  assert.equal(summary.hasErrors, true);
+  const issue = summary.issuesBySegmentId.c1.find(i => i.type === SUBTITLE_ISSUE_TYPES.SPEECH_EXCEEDS_INTERVAL);
+  assert.ok(issue, 'Must attach SPEECH_EXCEEDS_INTERVAL issue to c1');
+  assert.equal(issue.severity, SUBTITLE_ISSUE_SEVERITIES.ERROR);
+  assert.equal(issue.remedyAction, REMEDY_ACTIONS.EXTEND_AND_SHIFT_NEXT);
+  assert.ok(issue.metadata.availableRemedies.length >= 3, 'Must surface multiple explicit remedies');
+  assert.equal(summary.issuesBySegmentId.c2, undefined);
+
+  // Colliding spill approval (2.2s > 2.0s start of c2) must NOT clear the validation error
+  const invalidSpill = validateSubtitleSegments({
+    segments: collidingSegments,
+    segmentClips: collidingClips,
+    mediaDuration: 6.0,
+    spillApprovals: { c1: { segmentId: 'c1', clipSignature: 'sig-1', clipDuration: 2.2, cueStart: 0.0, cueEnd: 1.5 } },
+  });
+  assert.equal(invalidSpill.isValid, false);
+
+  // Valid spill into empty pause [1.5s, 3.0s] clears validation error cleanly
+  const safeSegments = [
+    { id: 'c1', start: 0.0, end: 1.5, text: 'Hello world' },
+    { id: 'c2', start: 3.0, end: 4.5, text: 'Next line' },
+  ];
+  const safeClips = {
+    c1: { durationSeconds: 2.1, signature: 'char-1\0\0Hello world', blob: new Blob(['a']) },
+    c2: { durationSeconds: 1.2, signature: 'char-1\0\0Next line', blob: new Blob(['b']) },
+  };
+  const flagged = validateSubtitleSegments({ segments: safeSegments, segmentClips: safeClips, mediaDuration: 5.0 });
+  assert.equal(flagged.isValid, false);
+  assert.equal(flagged.issuesBySegmentId.c1[0].remedyAction, REMEDY_ACTIONS.EXTEND_CUE_TO_SPEECH);
+
+  const approved = validateSubtitleSegments({
+    segments: safeSegments,
+    segmentClips: safeClips,
+    mediaDuration: 5.0,
+    spillApprovals: {
+      c1: { segmentId: 'c1', clipSignature: 'char-1\0\0Hello world', clipDuration: 2.1, cueStart: 0.0, cueEnd: 1.5 },
+    },
+  });
+  assert.equal(approved.isValid, true);
+  assert.equal(approved.totalIssues, 0);
+});

@@ -27,17 +27,24 @@ function ExportFormatButtons({ hasSegments, busy, onExportFile, onCopyDialogue }
   );
 }
 
-function ExportAlignedDubButton({ hasAlignedVoice, busy, onExportAlignedVoice }) {
+function resolveAlignedExportTitle({ hasAlignedVoice, canExportAlignedVoice, unresolvedMismatchCount }) {
+  if (!hasAlignedVoice) return 'Generate subtitle voice clips before exporting time-aligned WAV';
+  if (!canExportAlignedVoice && unresolvedMismatchCount > 0) {
+    const word = unresolvedMismatchCount === 1 ? 'mismatch' : 'mismatches';
+    return `Resolve ${unresolvedMismatchCount} speech duration ${word} before exporting time-aligned WAV`;
+  }
+  return 'Export synchronized time-aligned voiceover WAV for video editing';
+}
+
+function ExportAlignedDubButton({ hasAlignedVoice, canExportAlignedVoice = hasAlignedVoice, unresolvedMismatchCount = 0, busy, onExportAlignedVoice }) {
   if (!onExportAlignedVoice) return null;
-  const title = !hasAlignedVoice
-    ? 'Generate subtitle voice clips before exporting time-aligned WAV'
-    : 'Export synchronized time-aligned voiceover WAV for video editing';
+  const title = resolveAlignedExportTitle({ hasAlignedVoice, canExportAlignedVoice, unresolvedMismatchCount });
   return (
     <button
       type="button"
       id="subtitle-export-aligned-wav-btn"
       className="button button-secondary"
-      disabled={!hasAlignedVoice || busy}
+      disabled={!hasAlignedVoice || !canExportAlignedVoice || busy}
       title={title}
       onClick={onExportAlignedVoice}
     >
@@ -49,10 +56,10 @@ function ExportAlignedDubButton({ hasAlignedVoice, busy, onExportAlignedVoice })
 
 /**
  * Renders the Subtitle workspace footer with live status, export buttons, optional speaker TTS filter, and burn-in action.
- * Inputs: `{ hasSegments, hasSubtitleText, selectedCount, canBurn, hasVideoJob, isAudioOnly, speakers, speakerNames, ttsSpeakerId, onChangeTtsSpeakerId, busy, busyAction, busyMeta, status, hasAlignedVoice, onExportAlignedVoice, onExportFile, onCopyDialogue, onBurnVideo, onSendToTts }`.
+ * Inputs: `{ hasSegments, hasSubtitleText, selectedCount, canBurn, hasVideoJob, isAudioOnly, speakers, speakerNames, ttsSpeakerId, onChangeTtsSpeakerId, busy, busyAction, busyMeta, status, hasAlignedVoice, canExportAlignedVoice, unresolvedMismatchCount, onExportAlignedVoice, onExportFile, onCopyDialogue, onBurnVideo, onSendToTts }`.
  * Outputs: `<section className="playback subtitle-dock">`.
  * Side effects: triggers file download, clipboard copy, MP4 burn-in, or TTS transfer.
- * Failure modes: disables invalid export buttons cleanly until extraction completes or when audio-only.
+ * Failure modes: disables invalid export buttons cleanly until extraction completes, when audio-only, or when duration mismatches remain.
  * @param {object} props - Export dock props.
  * @returns {React.ReactElement} Subtitle export dock.
  */
@@ -72,6 +79,8 @@ export function SubtitleExportDock({
   busyMeta = null,
   status,
   hasAlignedVoice = false,
+  canExportAlignedVoice = hasAlignedVoice,
+  unresolvedMismatchCount = 0,
   onExportAlignedVoice = null,
   onExportFile,
   onCopyDialogue,
@@ -98,6 +107,8 @@ export function SubtitleExportDock({
           </button>
           <ExportAlignedDubButton
             hasAlignedVoice={hasAlignedVoice}
+            canExportAlignedVoice={canExportAlignedVoice}
+            unresolvedMismatchCount={unresolvedMismatchCount}
             busy={busy}
             onExportAlignedVoice={onExportAlignedVoice}
           />

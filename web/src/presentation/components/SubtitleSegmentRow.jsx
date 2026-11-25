@@ -226,7 +226,8 @@ function fixOverlapWithNext(segment, nextSegment, onUpdateTiming) {
   onUpdateTiming(segment.id, { start: minStart, end: maxEnd });
 }
 
-function handleFixOverlapAction(segment, prevSegment, nextSegment, onUpdateTiming, conflictingId = null) {
+function handleFixOverlapAction(segment, neighbors, onUpdateTiming) {
+  const { prevSegment = null, nextSegment = null, conflictingId = null } = neighbors || {};
   if (conflictingId && nextSegment?.id === conflictingId) return fixOverlapWithNext(segment, nextSegment, onUpdateTiming);
   if (conflictingId && prevSegment?.id === conflictingId) return fixOverlapWithPrev(segment, prevSegment, onUpdateTiming);
   if (prevSegment && roundToMs(prevSegment.end) > roundToMs(segment.start)) {
@@ -332,7 +333,7 @@ export function TimingInlineEditor({
         canPause={Boolean(onUpdatePause)} onBlur={onBlur} onKeyDown={onKeyDown} />
       <TimingNudgeButtons busy={busy} onNudge={delta => handleNudgeTiming(segment, delta, onUpdateTiming)} />
       <TimingFeedback error={drafts.error} overlapNotice={overlapNotice}
-        onFixOverlap={() => handleFixOverlapAction(segment, prevSegment, nextSegment, onUpdateTiming)} />
+        onFixOverlap={() => handleFixOverlapAction(segment, { prevSegment, nextSegment }, onUpdateTiming)} />
     </div>
   );
 }
@@ -419,9 +420,43 @@ function computeSplitRatio(textareaEl, textLength) {
   return pos / textLength;
 }
 
+function CueClipStatusBadges({ voiceClip, mismatch, isVoiceStale, disabled, onRevokeSpill, onUndoTrimVoice }) {
+  return (
+    <>
+      {isVoiceStale ? <span className="subtitle-cue-stale-badge" title="Text or voice changed since generation">Edited</span> : null}
+      {mismatch && !mismatch.isResolved ? (
+        <span className="subtitle-cue-mismatch-badge" title={mismatch.message}>
+          +{mismatch.excessDuration.toFixed(2)}s over {mismatch.allocatedDuration.toFixed(2)}s
+        </span>
+      ) : null}
+      {mismatch?.isSpillApproved ? (
+        <>
+          <span className="subtitle-cue-spill-badge" title="Speech approved to finish into trailing pause">
+            Spill +{mismatch.intervalExcess.toFixed(2)}s
+          </span>
+          {onRevokeSpill && (
+            <button type="button" className="button subtle-button subtitle-cue-btn subtitle-cue-undo-spill-btn"
+              disabled={disabled} onClick={onRevokeSpill}>Undo spill</button>
+          )}
+        </>
+      ) : null}
+      {voiceClip?.preTrimClip ? (
+        <>
+          <span className="subtitle-cue-trimmed-badge" title="Audio clip explicitly trimmed to fit interval">Trimmed</span>
+          {onUndoTrimVoice && (
+            <button type="button" className="button subtle-button subtitle-cue-btn subtitle-cue-undo-trim-btn"
+              disabled={disabled} onClick={onUndoTrimVoice}>Undo trim</button>
+          )}
+        </>
+      ) : null}
+    </>
+  );
+}
+
 function SegmentVoiceBar({
   hasText,
   voiceClip,
+  mismatch = null,
   isVoiceStale,
   isGeneratingVoice,
   isPlayingVoice,
@@ -429,6 +464,9 @@ function SegmentVoiceBar({
   onGenerateVoice,
   onTogglePlayVoice,
   onDownloadVoice,
+  onRemoveVoice = null,
+  onRevokeSpill = null,
+  onUndoTrimVoice = null,
 }) {
   if (!onGenerateVoice) return null;
   const generateLabel = isGeneratingVoice ? 'Generating…' : voiceClip ? 'Regenerate' : 'Generate voice';
@@ -460,7 +498,14 @@ function SegmentVoiceBar({
             <span>{isPlayingVoice ? 'Pause' : 'Play'}</span>
           </button>
           {clipMeta ? <span className="subtitle-cue-voice-meta">{clipMeta}</span> : null}
-          {isVoiceStale ? <span className="subtitle-cue-stale-badge" title="Text or voice changed since generation">Edited</span> : null}
+          <CueClipStatusBadges
+            voiceClip={voiceClip}
+            mismatch={mismatch}
+            isVoiceStale={isVoiceStale}
+            disabled={disabled}
+            onRevokeSpill={onRevokeSpill}
+            onUndoTrimVoice={onUndoTrimVoice}
+          />
           <button
             type="button"
             className="button subtle-button subtitle-cue-btn"
@@ -470,6 +515,18 @@ function SegmentVoiceBar({
           >
             <Icon name="arrow_down_to_line" />
           </button>
+          {onRemoveVoice && (
+            <button
+              type="button"
+              className="button subtle-button subtitle-cue-btn subtitle-cue-remove-voice-btn"
+              aria-label="Remove frame voice"
+              title="Remove generated voice clip from this cue"
+              disabled={disabled}
+              onClick={onRemoveVoice}
+            >
+              <Icon name="trash" />
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -501,35 +558,66 @@ function SegmentVerificationBanner({ segment, busy, onApply, onDismiss }) {
   );
 }
 
+const REMEDY_ACTION_LABELS = Object.freeze({
+  resolve_overlap: 'Fix overlap',
+  split_line: 'Wrap line',
+  split_segment: 'Split cue',
+  focus_text: 'Type text',
+  focus_translation: 'Type text',
+  adjust_timing: 'Adjust timing',
+  extend_duration: 'Adjust timing',
+  assign_voice: 'Assign voice',
+  extend_cue: 'Extend cue',
+  extend_and_shift: 'Extend & shift',
+  shift_start_earlier: 'Start earlier',
+  allow_spill: 'Allow spill',
+  trim_clip: 'Trim audio',
+  regenerate_clip: 'Regenerate',
+  remove_clip: 'Remove voice',
+  edit_text: 'Edit text',
+});
+
 function resolveRemedyLabel(issue) {
-  if (issue.remedyAction === 'resolve_overlap') return 'Fix overlap';
-  if (issue.remedyAction === 'split_line') return 'Wrap line';
-  if (issue.remedyAction === 'split_segment') return 'Split cue';
-  if (issue.remedyAction === 'focus_text' || issue.remedyAction === 'focus_translation') return 'Type text';
-  if (issue.remedyAction === 'adjust_timing' || issue.remedyAction === 'extend_duration') return 'Adjust timing';
-  if (issue.remedyAction === 'assign_voice') return 'Assign voice';
-  return 'Fix';
+  return REMEDY_ACTION_LABELS[issue.remedyAction] || 'Fix';
+}
+
+function MismatchRemedyButtons({ issue, remedies, busy, onTriggerRemedy }) {
+  return (
+    <div className="subtitle-validation-remedies" role="group" aria-label="Duration mismatch remedies">
+      {remedies.map(rem => (
+        <button
+          key={rem.action}
+          type="button"
+          data-remedy-action={rem.action}
+          className="button subtle-button subtitle-validation-fix-btn"
+          title={rem.title}
+          disabled={busy}
+          onClick={() => onTriggerRemedy(issue, rem.action)}
+        >
+          {rem.label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 function ValidationAlertPill({ issue, onTriggerRemedy, busy }) {
   const isError = issue.severity === 'error';
-  const pillClass = `subtitle-validation-pill is-${isError ? 'error' : 'warning'}`;
+  const multiRemedies = issue.type === 'speech_exceeds_interval' && Array.isArray(issue.metadata?.availableRemedies) && issue.metadata.availableRemedies.length > 0
+    ? issue.metadata.availableRemedies : null;
+  const pillClass = `subtitle-validation-pill is-${isError ? 'error' : 'warning'}${multiRemedies ? ' has-multi-remedies' : ''}`;
   const iconName = isError ? 'alert_circle' : 'warning';
-  const remedyLabel = resolveRemedyLabel(issue);
   return (
     <div className={pillClass} role={isError ? 'alert' : 'status'} title={issue.remedyHint || issue.message}>
       <Icon name={iconName} className="subtitle-validation-icon" />
       <span className="subtitle-validation-msg">{issue.message}</span>
-      {onTriggerRemedy && (
-        <button
-          type="button"
-          className="button subtle-button subtitle-validation-fix-btn"
-          disabled={busy}
-          onClick={() => onTriggerRemedy(issue)}
-        >
-          {remedyLabel}
+      {onTriggerRemedy && multiRemedies ? (
+        <MismatchRemedyButtons issue={issue} remedies={multiRemedies} busy={busy} onTriggerRemedy={onTriggerRemedy} />
+      ) : onTriggerRemedy ? (
+        <button type="button" className="button subtle-button subtitle-validation-fix-btn" disabled={busy} onClick={() => onTriggerRemedy(issue)}>
+          {resolveRemedyLabel(issue)}
         </button>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -545,11 +633,25 @@ function SegmentValidationAlerts({ issues = [], onTriggerRemedy, busy = false })
   );
 }
 
-function executeRemedyAction(issue, context) {
+function executeMismatchRemedy(action, issue, context) {
+  const { segment, voiceClip, onExtendToSpeech, onExtendAndShift, onShiftStartEarlier, onAllowSpill, onTrimVoice, onRemoveVoice, onGenerateVoice, textarea } = context;
+  const clipDur = issue.metadata?.clipDuration ?? voiceClip?.durationSeconds ?? 0;
+  if (action === 'extend_cue') return onExtendToSpeech?.(segment.id, clipDur);
+  if (action === 'extend_and_shift') return onExtendAndShift?.(segment.id, clipDur);
+  if (action === 'shift_start_earlier') return onShiftStartEarlier?.(segment.id, clipDur);
+  if (action === 'allow_spill') return onAllowSpill?.(segment.id);
+  if (action === 'trim_clip') return onTrimVoice?.(segment.id, issue.metadata?.remedies?.trimTargetDuration);
+  if (action === 'regenerate_clip') return onGenerateVoice?.(segment);
+  if (action === 'remove_clip') return onRemoveVoice?.(segment.id);
+  if (action === 'edit_text') return textarea?.focus();
+  return undefined;
+}
+
+function executeRemedyAction(issue, actionOverride, context) {
   const { segment, prevSegment, nextSegment, onUpdateTiming, activeText, onUpdate, useTranslation, onSplit, textarea, onOpenTiming, onAssignVoice } = context;
-  const action = issue.remedyAction;
+  const action = actionOverride || issue.remedyAction;
   if (action === 'resolve_overlap') {
-    return handleFixOverlapAction(segment, prevSegment, nextSegment, onUpdateTiming, issue.metadata?.conflictingSegmentId);
+    return handleFixOverlapAction(segment, { prevSegment, nextSegment, conflictingId: issue.metadata?.conflictingSegmentId }, onUpdateTiming);
   }
   if (action === 'split_line') {
     const wrapped = autoBreakLongLine(activeText);
@@ -559,6 +661,7 @@ function executeRemedyAction(issue, context) {
   if (action === 'focus_text' || action === 'focus_translation') return textarea?.focus();
   if (action === 'adjust_timing' || action === 'extend_duration') return onOpenTiming();
   if (action === 'assign_voice') return onAssignVoice?.(segment.id);
+  return executeMismatchRemedy(action, issue, context);
 }
 
 function resolveRowClass(isActive, isSelected, validationIssues) {
@@ -593,6 +696,7 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   isSelected = false,
   canMergeNext = false,
   validationIssues = [],
+  mismatch = null,
   busy = false,
   voiceClip = null,
   isVoiceStale = false,
@@ -604,6 +708,14 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   onUpdate,
   onUpdateTiming,
   onUpdatePause = null,
+  onExtendToSpeech = null,
+  onExtendAndShift = null,
+  onShiftStartEarlier = null,
+  onAllowSpill = null,
+  onRevokeSpill = null,
+  onTrimVoice = null,
+  onUndoTrimVoice = null,
+  onRemoveVoice = null,
   onSplit,
   onMergeNext,
   onDelete,
@@ -634,13 +746,21 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   const isKhmerDisplay = useTranslation ? (targetLangMeta ? Boolean(targetLangMeta.isKhmer) : true) : sourceLanguage === 'km';
   const activeLang = useTranslation ? (targetLangMeta?.bcp47 || 'km') : (sourceLanguage && sourceLanguage !== 'auto' ? sourceLanguage : undefined);
 
-  const handleTriggerRemedy = (issue) => {
+  const handleTriggerRemedy = (issue, actionOverride = '') => {
     if (!issue) return;
-    executeRemedyAction(issue, {
+    executeRemedyAction(issue, actionOverride, {
       segment,
       prevSegment,
       nextSegment,
+      voiceClip,
       onUpdateTiming,
+      onExtendToSpeech,
+      onExtendAndShift,
+      onShiftStartEarlier,
+      onAllowSpill,
+      onTrimVoice,
+      onRemoveVoice,
+      onGenerateVoice,
       activeText,
       onUpdate,
       useTranslation,
@@ -715,6 +835,7 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
       <SegmentVoiceBar
         hasText={Boolean(activeText.trim())}
         voiceClip={voiceClip}
+        mismatch={mismatch}
         isVoiceStale={isVoiceStale}
         isGeneratingVoice={isGeneratingVoice}
         isPlayingVoice={isPlayingVoice}
@@ -722,6 +843,9 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
         onGenerateVoice={onGenerateVoice ? () => onGenerateVoice(segment) : null}
         onTogglePlayVoice={onTogglePlayVoice ? () => onTogglePlayVoice(segment.id) : null}
         onDownloadVoice={onDownloadVoice ? () => onDownloadVoice(segment) : null}
+        onRemoveVoice={onRemoveVoice ? () => onRemoveVoice(segment.id) : null}
+        onRevokeSpill={onRevokeSpill ? () => onRevokeSpill(segment.id) : null}
+        onUndoTrimVoice={onUndoTrimVoice ? () => onUndoTrimVoice(segment.id) : null}
       />
     </article>
   );

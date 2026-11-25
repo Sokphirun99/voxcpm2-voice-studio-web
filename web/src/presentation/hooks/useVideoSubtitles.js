@@ -18,6 +18,9 @@ import {
   collectUniqueSpeakers,
   countTextMatchesInSegments,
   deleteSubtitleSegment,
+  extendAllSafeMismatches,
+  extendCueAndShiftLater,
+  extendCueToSpeech,
   findActiveSegmentId,
   isAudioOnlyFile,
   isSameSubtitleLanguage,
@@ -29,6 +32,7 @@ import {
   replaceTextInSegments,
   resolveCueOverlaps,
   resolveTargetLanguageMeta,
+  shiftCueStartEarlier,
   splitSubtitleSegment,
 } from '../../domain/subtitles.js';
 import { ValidationError } from '../../domain/errors.js';
@@ -386,7 +390,7 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
   };
 }
 
-function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
+function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
   const cancel = useCallback(() => {
     abortRef.current?.abort();
   }, [abortRef]);
@@ -434,6 +438,8 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         const elapsed = elapsedSecs();
         const segs = Array.isArray(res.segments) ? res.segments : [];
         const spkCount = Array.isArray(res.speakers) ? res.speakers.length : collectUniqueSpeakers(segs).length;
+        const probedDur = Number(res.duration);
+        if (Number.isFinite(probedDur) && probedDur > 0) setMediaDuration?.(probedDur);
         setActiveSegmentId('');
         if (relinkingProject) {
           setState(prev => ({
@@ -448,11 +454,12 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
           onNotify?.({ kind: 'success', title: 'Video linked', message: 'Saved subtitle edits are ready for MP4 burn-in.' });
           return;
         }
+        bumpTranscriptEpoch?.();
         setState(prev => applyExtractedSubtitleResult(prev, res, shouldTranslate ? targetLanguage : '', elapsed));
         onNotify?.({ kind: 'success', title: 'Subtitles ready', message: buildExtractSummary(segs.length, spkCount, elapsed, res.verificationSummary) });
       },
     });
-  }, [state.videoFile, state.options, state.hasTranslation, state.translatedLanguage, stateRef, gateway, abortRef, setState, setBusyMeta, setActiveSegmentId, refreshHealth, markOnline, onNotify, onUnlockSound]);
+  }, [state.videoFile, state.options, state.hasTranslation, state.translatedLanguage, stateRef, gateway, abortRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
   const translateNow = useCallback(async () => {
     if (!state.segments.length) return;
@@ -538,7 +545,20 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
   return { cancel, extractSubtitles, translateNow, burnVideo };
 }
 
-function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useTranslation }) {
+function runTimingTransform({ stateRef, setState, onNotify, transform, successMessage }) {
+  try {
+    const nextSegments = transform(stateRef.current.segments);
+    setState(prev => ({ ...prev, segments: nextSegments, status: { message: successMessage, error: false } }));
+    return true;
+  } catch (err) {
+    const message = err?.message || 'Could not update cue timing.';
+    setState(prev => ({ ...prev, status: { message, error: true } }));
+    onNotify?.({ kind: 'error', title: 'Timing adjustment unavailable', message });
+    return false;
+  }
+}
+
+function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegmentId, useTranslation, mediaDuration, onNotify }) {
   const updateSegment = useCallback((segId, patch) => {
     setState(prev => ({
       ...prev,
@@ -590,6 +610,39 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     }));
   }, [setState]);
 
+  const extendSegmentToSpeech = useCallback((segId, clipDuration) => (
+    runTimingTransform({
+      stateRef, setState, onNotify,
+      transform: list => extendCueToSpeech(list, segId, clipDuration, { mediaDuration }),
+      successMessage: 'Extended subtitle cue interval to match speech duration.',
+    })
+  ), [stateRef, setState, mediaDuration, onNotify]);
+
+  const extendSegmentAndShift = useCallback((segId, clipDuration) => (
+    runTimingTransform({
+      stateRef, setState, onNotify,
+      transform: list => extendCueAndShiftLater(list, segId, clipDuration, { mediaDuration }),
+      successMessage: 'Extended cue and shifted later subtitles to resolve overlap.',
+    })
+  ), [stateRef, setState, mediaDuration, onNotify]);
+
+  const shiftSegmentEarlier = useCallback((segId, clipDuration, segmentClips = null) => (
+    runTimingTransform({
+      stateRef, setState, onNotify,
+      transform: list => shiftCueStartEarlier(list, segId, clipDuration, { mediaDuration, segmentClips }),
+      successMessage: 'Moved cue start earlier to fit speech duration.',
+    })
+  ), [stateRef, setState, mediaDuration, onNotify]);
+
+  const extendSafeMismatchSegments = useCallback(mismatches => {
+    const result = extendAllSafeMismatches(stateRef.current.segments, mismatches, { mediaDuration });
+    if (!result.fixedCount) return 0;
+    const msg = `Extended ${result.fixedCount} ${result.fixedCount === 1 ? 'cue' : 'cues'} to fit speech.`;
+    setState(prev => ({ ...prev, segments: result.segments, status: { message: msg, error: false } }));
+    onNotify?.({ kind: 'success', title: 'Cues updated', message: msg });
+    return result.fixedCount;
+  }, [stateRef, setState, mediaDuration, onNotify]);
+
   const applySegmentSuggestion = useCallback(segId => {
     setState(prev => ({
       ...prev,
@@ -637,6 +690,10 @@ function useSegmentEditingActions({ segments, setState, setActiveSegmentId, useT
     updateSegmentTiming,
     updateSegmentPause,
     resolveOverlaps,
+    extendSegmentToSpeech,
+    extendSegmentAndShift,
+    shiftSegmentEarlier,
+    extendSafeMismatchSegments,
     applySegmentSuggestion,
     dismissSegmentSuggestion,
     countMatches,
@@ -665,6 +722,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
   const [ttsSpeakerId, setTtsSpeakerId] = useState('');
   const [currentTime, setCurrentTime] = useState(0);
   const [mediaDuration, setMediaDuration] = useState(0);
+  const [transcriptEpoch, setTranscriptEpoch] = useState(0);
+  const bumpTranscriptEpoch = useCallback(() => setTranscriptEpoch(n => n + 1), []);
   const [state, setState] = useState({
     videoFile: null,
     videoFileName: null,
@@ -758,6 +817,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setTtsSpeakerId('');
     setCurrentTime(0);
     setMediaDuration(0);
+    const cur = stateRef.current;
+    if (cur.videoFile || !cur.projectId || !cur.videoFileName) bumpTranscriptEpoch();
     setState(prev => ({
       ...prev,
       videoFile: file,
@@ -781,7 +842,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       },
       status: { message: `Loaded ${file.name}. Ready to extract subtitles.`, error: false },
     }));
-  }, [onNotify]);
+  }, [onNotify, bumpTranscriptEpoch]);
 
   const importSubtitleFile = useCallback(async file => {
     try {
@@ -799,6 +860,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       });
       setActiveSegmentId('');
       setTtsSpeakerId('');
+      bumpTranscriptEpoch();
       setState(prev => ({
         ...prev,
         isAudioOnly: prev.videoFile ? prev.isAudioOnly : false,
@@ -825,7 +887,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       onNotify?.({ kind: 'error', title: 'Subtitle import failed', message });
       return false;
     }
-  }, [onNotify, services]);
+  }, [onNotify, services, bumpTranscriptEpoch]);
 
   const clearWorkspace = useCallback(() => {
     const controller = abortRef.current;
@@ -836,6 +898,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setTtsSpeakerId('');
     setCurrentTime(0);
     setMediaDuration(0);
+    bumpTranscriptEpoch();
     setState(prev => ({
       ...prev,
       videoFile: null,
@@ -854,7 +917,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       busyAction: '',
       status: { message: '', error: false },
     }));
-  }, []);
+  }, [bumpTranscriptEpoch]);
 
   const updateOption = useCallback((key, value) => {
     setState(prev => {
@@ -984,6 +1047,11 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     if (!isSubtitleType) return;
     const payload = snapshot.payload || {};
     const title = snapshot.title || snapshot.name || 'Untitled project';
+    const snapshotDuration = Number(payload.mediaDuration);
+    setActiveSegmentId('');
+    setCurrentTime(0);
+    setMediaDuration(Number.isFinite(snapshotDuration) && snapshotDuration > 0 ? snapshotDuration : 0);
+    bumpTranscriptEpoch();
     setState(prev => ({
       ...prev,
       projectId: snapshot.id || '',
@@ -1005,7 +1073,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       },
       status: { message: `Project loaded: ${title}`, error: false },
     }));
-  }, []);
+  }, [bumpTranscriptEpoch]);
 
   useEffect(() => {
     if (!projectRepository) {
@@ -1142,9 +1210,17 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     return buildBoundedTtsHandoff({ segments: scopedSegments, useTranslation, speakerId });
   }, [state.segments, useTranslation, ttsSpeakerId]);
 
-  const editActions = useSegmentEditingActions({ segments: state.segments, setState, setActiveSegmentId, useTranslation });
+  const editActions = useSegmentEditingActions({
+    segments: state.segments,
+    stateRef,
+    setState,
+    setActiveSegmentId,
+    useTranslation,
+    mediaDuration,
+    onNotify,
+  });
   const asyncActions = useSubtitleAsyncActions({
-    state, stateRef, setState, setBusyMeta, setActiveSegmentId, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
+    state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
   });
 
   return {
@@ -1156,6 +1232,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     activeSegmentId,
     currentTime,
     mediaDuration,
+    transcriptEpoch,
     ttsSpeakerId,
     setTtsSpeakerId,
     projectId: state.projectId,

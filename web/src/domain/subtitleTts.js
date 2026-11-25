@@ -4,6 +4,12 @@
 
 import { SynthesisError } from './errors.js';
 import { assertMatchingWaveFormats, assertPcmFormat } from './audioAssembly.js';
+import {
+  DURATION_MISMATCH_TOLERANCE_SEC,
+  assertNoUnresolvedDurationMismatches,
+  detectDurationMismatches,
+  isSpillApprovalValid,
+} from './durationMismatch.js';
 import { DEFAULT_STEPS, STYLE_MODES } from './presets.js';
 import { pickSegmentText } from './subtitles.js';
 import {
@@ -198,25 +204,44 @@ export function buildVoiceoverDownloadFilename(videoFile, suffix = '-voiceover')
   return `${stem}${suffix}.wav`;
 }
 
+function resolveDubSpillConfig(spillOrOptions) {
+  if (!spillOrOptions || typeof spillOrOptions !== 'object') return { spillApprovals: {}, mediaDuration: 0 };
+  if ('spillApprovals' in spillOrOptions || 'mediaDuration' in spillOrOptions) {
+    return {
+      spillApprovals: spillOrOptions.spillApprovals || {},
+      mediaDuration: Number(spillOrOptions.mediaDuration) || 0,
+    };
+  }
+  return { spillApprovals: spillOrOptions, mediaDuration: 0 };
+}
+
 /**
  * Collects time-aligned WAV clips for dubbed MP4 export, respecting selected frames when any selected frame has audio.
- * Inputs: ordered `segments`, `selectedIds`, and `segmentClips` map.
- * Outputs: ordered array of `{ segmentId, start, end, blob }`.
+ * Inputs: ordered `segments`, `selectedIds`, `segmentClips` map, and optional `spillOrOptions` (`spillApprovals` or `{ spillApprovals, mediaDuration }`).
+ * Outputs: ordered array of `{ segmentId, start, end, blob, allowOverflow? }`.
  * Side effects: none.
  * Failure modes: returns `[]` when no matching segments have generated audio blobs.
  * @param {Array<{ id: string, start?: number, end?: number }>} segments - Timeline subtitle segments.
  * @param {Iterable<string>|null|undefined} selectedIds - Active selection IDs.
  * @param {Record<string, { blob?: Blob }>} segmentClips - Generated clip records keyed by segment ID.
- * @returns {Array<{ segmentId: string, start: number, end: number, blob: Blob }>} Ordered dub clips.
+ * @param {Record<string, object>|{ spillApprovals?: Record<string, object>, mediaDuration?: number }} [spillOrOptions] - Spill approvals or options.
+ * @returns {Array<{ segmentId: string, start: number, end: number, blob: Blob, allowOverflow?: boolean }>} Ordered dub clips.
  */
-export function buildDubExportClips(segments, selectedIds, segmentClips) {
+export function buildDubExportClips(segments, selectedIds, segmentClips, spillOrOptions = {}) {
   if (!Array.isArray(segments) || !segments.length || !segmentClips) return [];
+  const { spillApprovals, mediaDuration } = resolveDubSpillConfig(spillOrOptions);
   const selected = selectOrderedSegments(segments, selectedIds).filter(seg => Boolean(segmentClips[seg.id]?.blob));
   const matched = selected.length > 0 ? selected : segments.filter(seg => Boolean(segmentClips[seg.id]?.blob));
+  const indexById = new Map(segments.map((seg, i) => [seg.id, i]));
   return matched.map(seg => {
     const start = Number.isFinite(Number(seg.start)) ? Math.max(0, Number(seg.start)) : 0;
     const rawEnd = Number.isFinite(Number(seg.end)) ? Number(seg.end) : start;
-    return { segmentId: seg.id, start, end: Math.max(start, rawEnd), blob: segmentClips[seg.id].blob };
+    const idx = indexById.get(seg.id) ?? -1;
+    const nextSeg = idx >= 0 && idx < segments.length - 1 ? segments[idx + 1] : null;
+    const allowOverflow = isSpillApprovalValid(spillApprovals?.[seg.id], {
+      segment: seg, clip: segmentClips[seg.id], nextSegment: nextSeg, mediaDuration,
+    });
+    return { segmentId: seg.id, start, end: Math.max(start, rawEnd), blob: segmentClips[seg.id].blob, ...(allowOverflow ? { allowOverflow: true } : {}) };
   });
 }
 
@@ -332,7 +357,10 @@ function assembleAlignedTrackFrames(decoded, totalDuration, baseInfo) {
     }
     const boundary = resolveNextBoundaryFrame(i, decoded, totalDuration, sampleRate);
     const res = placeClipWithinWindow({ clipPcm: item.pcm, targetStartFrame: startFrame, boundaryFrame: boundary, baseInfo });
-    if (res.clamped) warnings.push(createClampedWarning(item, res.requestedFrames, res.placedFrames, sampleRate));
+    const clampedSec = (res.requestedFrames - res.placedFrames) / sampleRate;
+    if (res.clamped && clampedSec > DURATION_MISMATCH_TOLERANCE_SEC) {
+      warnings.push(createClampedWarning(item, res.requestedFrames, res.placedFrames, sampleRate));
+    }
     parts.push(res.pcm);
     currentFrame += res.placedFrames;
   }
@@ -353,36 +381,66 @@ function createTrackWavBlob(baseInfo, parts) {
   return new Blob([header, ...parts], { type: 'audio/wav' });
 }
 
-async function applyTrackMastering(blob, audioMaster, signal) {
+async function applyTrackMastering(blob, audioMaster, signal, logger = null) {
   if (!audioMaster?.masterWav) return { blob, mastered: false };
   try {
     const res = await audioMaster.masterWav(blob, { signal });
     return { blob: res.blob || blob, mastered: res.mastered ?? true };
-  } catch (_err) {
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.name === 'SynthesisCancelledError') throw err;
+    logger?.warn?.('assembleTimelineAlignedVoiceover.masterWav', err?.message || 'Mastering degraded to unmastered WAV');
     return { blob, mastered: false };
   }
 }
 
+function buildDecodedClipDurations(decoded, segmentClips) {
+  const map = { ...(segmentClips || {}) };
+  for (const item of decoded) {
+    const existing = segmentClips?.[item.id];
+    const wavDuration = item.info.byteRate > 0 ? item.info.dataSize / item.info.byteRate : 0;
+    const durationSeconds = Number.isFinite(existing?.durationSeconds) && existing.durationSeconds > 0
+      ? existing.durationSeconds
+      : wavDuration;
+    map[item.id] = { ...(existing || {}), blob: item.blob, durationSeconds };
+  }
+  return map;
+}
+
 /**
  * Assembles generated subtitle clips into a single time-aligned PCM WAV track.
- * Inputs: { segments, segmentClips, totalDuration, sampleRate, audioMaster, signal, selectedIds }.
- * Outputs: Promise resolving to { blob, duration, clipCount, warnings, sampleRate, mastered }.
+ * Inputs: `{ segments, segmentClips, totalDuration, sampleRate, audioMaster, signal, selectedIds, strictDurationCheck, spillApprovals }`.
+ * Outputs: Promise resolving to `{ blob, duration, clipCount, warnings, mismatches, sampleRate, mastered }`.
  * Side effects: reads ArrayBuffer from clips, applies optional audio mastering.
- * Failure modes: returns empty descriptor on missing clips; throws SynthesisError on WAV format mismatch.
+ * Failure modes: returns empty descriptor on missing clips; throws SynthesisError on WAV format mismatch or ValidationError when `strictDurationCheck` detects unresolved mismatches.
  * @param {object} params - Assembly spec.
- * @returns {Promise<{ blob: Blob|null, duration: number, clipCount: number, warnings: Array<object>, sampleRate: number, mastered: boolean }>} Aligned WAV result.
+ * @returns {Promise<{ blob: Blob|null, duration: number, clipCount: number, warnings: Array<object>, mismatches: Array<object>, sampleRate: number, mastered: boolean }>} Aligned WAV result.
  */
 export async function assembleTimelineAlignedVoiceover(spec = {}) {
-  const { segments = [], segmentClips = {}, totalDuration = 0, sampleRate = null, audioMaster = null, signal = null, selectedIds = null } = spec;
+  const {
+    segments = [], segmentClips = {}, totalDuration = 0, sampleRate = null, audioMaster = null,
+    signal = null, selectedIds = null, strictDurationCheck = false, spillApprovals = {}, logger = null,
+  } = spec;
   const targets = filterAndOrderTargetClips(segments, selectedIds, segmentClips);
   if (!targets.length) {
-    return { blob: null, duration: 0, clipCount: 0, warnings: [], sampleRate: sampleRate || 0, mastered: false };
+    return { blob: null, duration: 0, clipCount: 0, warnings: [], mismatches: [], sampleRate: sampleRate || 0, mastered: false };
   }
   const decoded = await decodeTargetClips(targets, sampleRate);
   const baseInfo = decoded[0].info;
+  const mismatchReport = detectDurationMismatches({
+    segments,
+    segmentClips: buildDecodedClipDurations(decoded, segmentClips),
+    mediaDuration: totalDuration,
+    spillApprovals,
+    selectedIds,
+    targetOnly: true,
+  });
+  if (strictDurationCheck) assertNoUnresolvedDurationMismatches(mismatchReport);
   const { parts, currentFrame, warnings } = assembleAlignedTrackFrames(decoded, totalDuration, baseInfo);
   const finalFrame = appendTrailingSilence(parts, totalDuration, currentFrame, baseInfo);
   const rawBlob = createTrackWavBlob(baseInfo, parts);
-  const { blob, mastered } = await applyTrackMastering(rawBlob, audioMaster, signal);
-  return { blob, duration: finalFrame / baseInfo.sampleRate, clipCount: targets.length, warnings, sampleRate: baseInfo.sampleRate, mastered };
+  const { blob, mastered } = await applyTrackMastering(rawBlob, audioMaster, signal, logger);
+  return {
+    blob, duration: finalFrame / baseInfo.sampleRate, clipCount: targets.length,
+    warnings, mismatches: mismatchReport.unresolved, sampleRate: baseInfo.sampleRate, mastered,
+  };
 }

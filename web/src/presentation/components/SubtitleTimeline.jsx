@@ -32,6 +32,13 @@ function CueVoiceTimingPill({ interval }) {
       </span>
     );
   }
+  if (interval.isSpillApproved) {
+    return (
+      <span className="subtitle-timeline-voice-timing is-spill-approved" title="Approved speech spill into trailing pause">
+        Speech: {interval.clipDuration.toFixed(2)}s (+{interval.overflowDuration.toFixed(2)}s spill)
+      </span>
+    );
+  }
   const silence = interval.trailingSilenceDuration > 0 ? ` · Silence: ${interval.trailingSilenceDuration.toFixed(2)}s` : '';
   return (
     <span className="subtitle-timeline-voice-timing">
@@ -100,6 +107,8 @@ function buildCueTitle(interval) {
   if (interval.hasVoiceClip) {
     if (interval.isClipOverflowing) {
       voice = ` · Voice: ${interval.clipDuration.toFixed(2)}s (+${interval.overflowDuration.toFixed(2)}s overflow)`;
+    } else if (interval.isSpillApproved) {
+      voice = ` · Voice: ${interval.clipDuration.toFixed(2)}s (+${interval.overflowDuration.toFixed(2)}s spill approved)`;
     } else if (interval.trailingSilenceDuration > 0) {
       voice = ` · Voice: ${interval.clipDuration.toFixed(2)}s · Silence: ${interval.trailingSilenceDuration.toFixed(2)}s`;
     } else {
@@ -117,6 +126,7 @@ function TimelineIntervalCue({ interval, onClick }) {
     interval.isActive ? 'is-active' : '',
     interval.hasVoiceClip ? 'has-voice' : '',
     interval.isClipOverflowing ? 'is-speech-overflow' : '',
+    interval.isSpillApproved ? 'is-spill-approved' : '',
     interval.hasOverlap ? 'has-overlap' : '',
     interval.hasError ? 'has-error' : '',
     interval.hasWarning ? 'has-warning' : '',
@@ -159,6 +169,7 @@ export const SubtitleTimeline = memo(function SubtitleTimeline({
   segments = [],
   activeSegmentId = '',
   segmentClips = {},
+  spillApprovals = {},
   playingSegmentId = '',
   validationBySegmentId = {},
   busy = false,
@@ -172,8 +183,16 @@ export const SubtitleTimeline = memo(function SubtitleTimeline({
     [segments, mediaDuration]
   );
   const intervals = useMemo(
-    () => computeTimelineIntervals({ segments, totalDuration, activeSegmentId, segmentClips, validationBySegmentId }),
-    [segments, totalDuration, activeSegmentId, segmentClips, validationBySegmentId]
+    () => computeTimelineIntervals({
+      segments,
+      totalDuration,
+      mediaDuration,
+      activeSegmentId,
+      segmentClips,
+      spillApprovals,
+      validationBySegmentId,
+    }),
+    [segments, totalDuration, mediaDuration, activeSegmentId, segmentClips, spillApprovals, validationBySegmentId]
   );
   const activeInterval = useMemo(
     () => intervals.find(item => item.id === activeSegmentId) || null,

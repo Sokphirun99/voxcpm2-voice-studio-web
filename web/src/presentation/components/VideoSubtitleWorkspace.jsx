@@ -551,7 +551,7 @@ function FindReplaceBar({ busy, countMatches, onReplace }) {
   );
 }
 
-function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverlaps, showOnlyIssues, onToggleShowOnlyIssues }) {
+function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverlaps, hasSafeDurations, onFixSafeDurations, showOnlyIssues, onToggleShowOnlyIssues }) {
   return (
     <>
       <div className="subtitle-validation-nav-group">
@@ -585,6 +585,17 @@ function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverla
           <span>Fix overlaps</span>
         </button>
       )}
+      {hasSafeDurations && onFixSafeDurations && (
+        <button
+          type="button"
+          className="button subtle-button subtitle-cue-btn subtitle-fix-all-btn subtitle-fix-durations-btn"
+          title="Extend all non-colliding cues to match speech duration"
+          onClick={onFixSafeDurations}
+        >
+          <Icon name="clock" />
+          <span>Extend cues</span>
+        </button>
+      )}
       <button
         type="button"
         className={`button subtle-button subtitle-cue-btn subtitle-filter-issues-btn ${showOnlyIssues ? 'is-active' : ''}`}
@@ -599,7 +610,7 @@ function ValidationNavActions({ onJumpNext, onJumpPrev, hasOverlaps, onFixOverla
   );
 }
 
-function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOverlaps, showOnlyIssues, onToggleShowOnlyIssues }) {
+function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOverlaps, onFixSafeDurations, showOnlyIssues, onToggleShowOnlyIssues }) {
   if (!validation) return null;
   const { isValid, totalIssues, errorCount, warningCount } = validation;
   if (isValid) {
@@ -613,6 +624,7 @@ function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOv
   const badgeClass = `subtitle-validation-badge has-issues is-${errorCount > 0 ? 'error' : 'warning'}`;
   const title = `${errorCount} error(s), ${warningCount} warning(s). Click to jump to next issue.`;
   const hasOverlaps = validation.issues?.some(i => i.type === 'overlap');
+  const hasSafeDurations = validation.issues?.some(i => i.type === 'speech_exceeds_interval' && i.metadata?.remedies?.canExtendCue);
   return (
     <div className="subtitle-validation-summary-bar" role="toolbar" aria-label="Subtitle validation">
       <button
@@ -630,6 +642,8 @@ function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOv
         onJumpPrev={onJumpPrev}
         hasOverlaps={hasOverlaps}
         onFixOverlaps={onFixOverlaps}
+        hasSafeDurations={hasSafeDurations}
+        onFixSafeDurations={onFixSafeDurations}
         showOnlyIssues={showOnlyIssues}
         onToggleShowOnlyIssues={onToggleShowOnlyIssues}
       />
@@ -654,15 +668,16 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
     );
   }
   const hasMultiSpeakers = ctrl.speakers.length > 1;
+  const displayedSegments = showOnlyIssues ? filterSegmentsWithIssues(segments, validation?.issuesBySegmentId) : segments;
   const jumpToSegmentIssue = (targetId) => {
     if (!targetId) return;
     const target = segments.find(s => s.id === targetId);
-    if (target) {
-      ctrl.seekToSegment(target.start, targetId);
-      const el = typeof document !== 'undefined' ? document.querySelector(`[data-segment-id="${targetId}"]`) : null;
-      el?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
-      el?.querySelector?.('textarea')?.focus?.();
-    }
+    if (!target) return;
+    if (showOnlyIssues && !displayedSegments.some(s => s.id === targetId)) setShowOnlyIssues(false);
+    ctrl.seekToSegment(target.start, targetId);
+    const el = typeof document !== 'undefined' ? document.querySelector(`[data-segment-id="${targetId}"]`) : null;
+    el?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    el?.querySelector?.('textarea')?.focus?.();
   };
   const handleAssignVoice = (segmentId) => {
     const targetSeg = segments.find(s => s.id === segmentId);
@@ -670,7 +685,6 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
     if (!voice.selectedIds.includes(segmentId)) voice.toggleSelectSegment?.(segmentId);
     if (typeof document !== 'undefined') document.getElementById('subtitle-tts-voice')?.focus?.();
   };
-  const displayedSegments = showOnlyIssues ? filterSegmentsWithIssues(segments, validation?.issuesBySegmentId) : segments;
   return (
     <div className="subtitle-cue-list">
       <div className="subtitle-cue-meta">
@@ -683,6 +697,12 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
           onJumpNext={() => jumpToSegmentIssue(findNextSegmentWithIssue(segments, validation?.issuesBySegmentId, ctrl.activeSegmentId))}
           onJumpPrev={() => jumpToSegmentIssue(findPreviousSegmentWithIssue(segments, validation?.issuesBySegmentId, ctrl.activeSegmentId))}
           onFixOverlaps={() => ctrl.resolveOverlaps?.()}
+          onFixSafeDurations={() => {
+            const safeList = voice.allDurationMismatches?.unresolved
+              || validation?.issues?.filter(i => i.type === 'speech_exceeds_interval').map(i => i.metadata).filter(Boolean)
+              || [];
+            ctrl.extendSafeMismatchSegments?.(safeList);
+          }}
           showOnlyIssues={showOnlyIssues}
           onToggleShowOnlyIssues={() => setShowOnlyIssues(v => !v)}
         />
@@ -739,6 +759,7 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
               isSelected={selectedSet.has(seg.id)}
               canMergeNext={Boolean(nextSeg)}
               validationIssues={validation?.issuesBySegmentId?.[seg.id] || []}
+              mismatch={voice.allDurationMismatches?.bySegmentId?.[seg.id] || null}
               busy={busy}
               voiceClip={voice.segmentClips[seg.id] || null}
               isVoiceStale={voice.isClipStale(seg)}
@@ -750,6 +771,14 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
               onUpdate={ctrl.updateSegment}
               onUpdateTiming={ctrl.updateSegmentTiming}
               onUpdatePause={ctrl.updateSegmentPause}
+              onExtendToSpeech={ctrl.extendSegmentToSpeech}
+              onExtendAndShift={ctrl.extendSegmentAndShift}
+              onShiftStartEarlier={(segId, dur) => ctrl.shiftSegmentEarlier?.(segId, dur, voice.segmentClips)}
+              onAllowSpill={voice.approveSegmentSpill}
+              onRevokeSpill={voice.revokeSegmentSpill}
+              onTrimVoice={(segId, targetDur) => void voice.trimSegmentClipToInterval?.(segId, targetDur)}
+              onUndoTrimVoice={voice.undoTrimSegmentClip}
+              onRemoveVoice={voice.removeSegmentClip}
               onSplit={ctrl.splitSegment}
               onMergeNext={ctrl.mergeSegmentWithNext}
               onDelete={onDeleteSegment}
@@ -766,6 +795,8 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
       <SubtitleVoiceOutputCard
         combinedClip={voice.combinedClip}
         alignedClip={voice.alignedClip}
+        durationMismatches={voice.exportDurationMismatches || null}
+        canExportAlignedVoice={voice.canExportAlignedVoice}
         busy={busy || voice.voiceBusy}
         dubAudioMode={voice.dubAudioMode}
         dubBusy={voice.dubBusy}
@@ -773,9 +804,11 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
         isAudioOnly={Boolean(ctrl.state.isAudioOnly)}
         hasJobId={Boolean(ctrl.state.jobId)}
         onDownload={voice.downloadCombinedVoice}
-        onDownloadAligned={voice.downloadAlignedVoice}
+        onDownloadAligned={() => void voice.downloadAlignedVoice?.()}
         onChangeDubAudioMode={voice.setDubAudioMode}
         onExportDub={() => void voice.exportDubbedVideo()}
+        onJumpToMismatch={jumpToSegmentIssue}
+        onFixSafeMismatches={() => ctrl.extendSafeMismatchSegments?.(voice.exportDurationMismatches?.unresolved || [])}
       />
     </div>
   );
@@ -824,6 +857,7 @@ export function VideoSubtitleWorkspace({
     isAudioOnly: state.isAudioOnly,
     voiceCatalog,
     mediaDuration: ctrl.mediaDuration,
+    transcriptEpoch: ctrl.transcriptEpoch,
     onStatus: ctrl.setStatus,
     onNotify,
     onUnlockSound,
@@ -881,7 +915,22 @@ export function VideoSubtitleWorkspace({
     characters: voice.characters,
     selectedVoiceId: voice.selectedVoiceId,
     mediaDuration: ctrl.mediaDuration,
-  }), [state.segments, ctrl.useTranslation, state.options.targetLanguage, state.options.sourceLanguage, ctrl.speakers.length, voice.selectedVoiceId, voice.characters, ctrl.mediaDuration]);
+    segmentClips: voice.segmentClips,
+    spillApprovals: voice.spillApprovals,
+    isClipStale: voice.isClipStale,
+  }), [
+    state.segments,
+    ctrl.useTranslation,
+    state.options.targetLanguage,
+    state.options.sourceLanguage,
+    ctrl.speakers.length,
+    voice.selectedVoiceId,
+    voice.characters,
+    ctrl.mediaDuration,
+    voice.segmentClips,
+    voice.spillApprovals,
+    voice.isClipStale,
+  ]);
   return (
     <div className="workspace-panel subtitle-workspace" hidden={hidden}>
       <div className="workspace-notices">
@@ -924,6 +973,7 @@ export function VideoSubtitleWorkspace({
             segments={state.segments}
             activeSegmentId={ctrl.activeSegmentId}
             segmentClips={voice.segmentClips}
+            spillApprovals={voice.spillApprovals}
             playingSegmentId={voice.playingSegmentId}
             validationBySegmentId={validation.issuesBySegmentId}
             busy={busy}
@@ -961,7 +1011,9 @@ export function VideoSubtitleWorkspace({
         busyMeta={ctrl.busyMeta}
         status={state.status}
         hasAlignedVoice={Boolean(voice.alignedClip?.blob)}
-        onExportAlignedVoice={voice.downloadAlignedVoice}
+        canExportAlignedVoice={voice.canExportAlignedVoice}
+        unresolvedMismatchCount={voice.exportDurationMismatches?.unresolvedCount || 0}
+        onExportAlignedVoice={() => void voice.downloadAlignedVoice?.()}
         onExportFile={ctrl.exportFile}
         onCopyDialogue={() => void ctrl.copyDialogue()}
         onBurnVideo={() => void ctrl.burnVideo()}

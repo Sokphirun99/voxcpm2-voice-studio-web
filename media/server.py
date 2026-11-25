@@ -54,6 +54,7 @@ from video_io import (
     mux_dubbed_audio,
     probe_media_duration,
     probe_video_dimensions,
+    probe_wav_duration,
 )
 
 SERVICE_NAME = "voxcpm-media-studio"
@@ -370,6 +371,7 @@ def _execute_transcribe_pipeline(
 ) -> dict[str, Any]:
     """Run FFmpeg extraction, speaker diarization, Whisper ASR, and optional translation."""
     extract_audio_16k_wav(job.source_video, job.audio_wav)
+    duration = probe_wav_duration(job.audio_wav) or probe_media_duration(job.source_video)
     has_video = has_video_stream(job.source_video)
     width, height = probe_video_dimensions(job.source_video) if has_video else (0, 0)
     turns = _run_diarization_safe(services, job.audio_wav, opts.num_speakers, request_id) if opts.diarize else []
@@ -381,6 +383,7 @@ def _execute_transcribe_pipeline(
     summary = transcript.get("verificationSummary") or {"checked": 0, "fallbackApplied": 0, "suggestions": 0, "model": ""}
     return {
         "jobId": job.job_id,
+        "duration": round(duration, 3) if duration > 0 else 0.0,
         "language": detected_lang,
         "translatedLanguage": opts.translate_to if translations is not None else "",
         "speakers": speakers,
@@ -421,7 +424,10 @@ def _parse_dub_metadata_entry(entry: Any, idx: int, file_count: int) -> dict[str
     if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index < 0 or raw_index >= file_count:
         raise HTTPException(status_code=400, detail=f"Dub metadata entry #{idx + 1} has an out-of-range fileIndex.")
     seg_id = str(entry.get("segmentId") or f"seg-{idx + 1}").strip()[:64] or f"seg-{idx + 1}"
-    return {"segmentId": seg_id, "start": start, "end": end, "fileIndex": raw_index}
+    raw_allow = entry.get("allowOverflow", False)
+    if not isinstance(raw_allow, bool):
+        raise HTTPException(status_code=400, detail=f"Dub metadata entry #{idx + 1} allowOverflow must be a boolean.")
+    return {"segmentId": seg_id, "start": start, "end": end, "fileIndex": raw_index, "allowOverflow": raw_allow}
 
 
 def _parse_dub_metadata(raw_metadata: str, file_count: int) -> list[dict[str, Any]]:
@@ -466,6 +472,19 @@ async def _save_validated_dub_wavs(files: list[UploadFile], work_dir: Path) -> l
             raise HTTPException(status_code=400, detail=f"Uploaded clip #{idx + 1} is not a valid WAV file.")
         saved.append(dest)
     return saved
+
+
+def _validate_dub_overflow_bounds(clips: list[DubClip], source_duration: float) -> None:
+    """Reject `allow_overflow` clips that extend past video end or collide with subsequent dubbed clips."""
+    ordered = sorted(clips, key=lambda c: (c.start_seconds, c.end_seconds))
+    for idx, clip in enumerate(ordered):
+        if not clip.allow_overflow:
+            continue
+        speech_end = clip.start_seconds + probe_wav_duration(clip.wav_path)
+        if source_duration > 0 and speech_end > source_duration + DUB_TIMESTAMP_TOLERANCE_SECONDS:
+            raise HTTPException(status_code=400, detail=f"Approved overflow clip '{clip.segment_id}' exceeds source video duration.")
+        if idx < len(ordered) - 1 and speech_end > ordered[idx + 1].start_seconds + DUB_TIMESTAMP_TOLERANCE_SECONDS:
+            raise HTTPException(status_code=400, detail=f"Approved overflow clip '{clip.segment_id}' collides with the next dubbed clip.")
 
 
 def _execute_dub_pipeline(job: MediaJobPaths, clips: list[DubClip], tmp_mp4: Path, original_audio_mode: str) -> Path:
@@ -654,9 +673,11 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
                     start_seconds=item["start"],
                     end_seconds=item["end"],
                     segment_id=item["segmentId"],
+                    allow_overflow=item["allowOverflow"],
                 )
                 for item in entries
             ]
+            await asyncio.to_thread(_validate_dub_overflow_bounds, dub_clips, source_duration)
             tmp_mp4 = work_dir / "dubbed.mp4"
             out_mp4 = await asyncio.to_thread(_execute_dub_pipeline, job, dub_clips, tmp_mp4, clean_mode)
             return FileResponse(path=out_mp4, media_type="video/mp4", filename=f"{job.job_id}-dubbed.mp4")

@@ -138,9 +138,13 @@ export function SubtitleVoiceToolbar({
   );
 }
 
-function resolveDubDisabledReason({ isAudioOnly, hasJobId }) {
+function resolveDubDisabledReason({ isAudioOnly, hasJobId, unresolvedMismatchCount = 0 }) {
   if (isAudioOnly) return 'Upload a video file to export a dubbed MP4.';
   if (!hasJobId) return 'Extract subtitles from a video first to export a dubbed MP4.';
+  if (unresolvedMismatchCount > 0) {
+    const word = unresolvedMismatchCount === 1 ? 'mismatch' : 'mismatches';
+    return `Resolve ${unresolvedMismatchCount} speech duration ${word} before exporting dubbed MP4.`;
+  }
   return undefined;
 }
 
@@ -211,7 +215,7 @@ function formatVoiceHeaderMeta(activeClip) {
   return [activeClip.characterName, durationLabel, gapLabel].filter(Boolean).join(' · ');
 }
 
-function SubtitleVoiceHeaderCopy({ activeClip }) {
+function SubtitleVoiceHeaderCopy({ activeClip, unresolvedMismatchCount = 0 }) {
   const frameWord = activeClip.count === 1 ? 'frame' : 'frames';
   const scope = activeClip.scope === 'selected' ? 'Selected voiceover' : 'Generated voiceover';
   const scopeLabel = `${scope} · ${activeClip.count} ${frameWord}`;
@@ -221,7 +225,12 @@ function SubtitleVoiceHeaderCopy({ activeClip }) {
     <div className="subtitle-voice-output-copy">
       <strong><Icon name="waveform" /><span>{scopeLabel}</span></strong>
       {metaLabel && <span>{metaLabel}</span>}
-      {activeClip.warnings?.length > 0 && (
+      {unresolvedMismatchCount > 0 && (
+        <span className="subtitle-voice-mismatch-pill">
+          {unresolvedMismatchCount} duration {unresolvedMismatchCount === 1 ? 'mismatch' : 'mismatches'}
+        </span>
+      )}
+      {unresolvedMismatchCount === 0 && activeClip.warnings?.length > 0 && (
         <span className="subtitle-voice-warn-pill" title={warnTitle}>
           {activeClip.warnings.length} clamped to fit
         </span>
@@ -230,7 +239,11 @@ function SubtitleVoiceHeaderCopy({ activeClip }) {
   );
 }
 
-function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAligned, hasAligned }) {
+function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAligned, hasAligned, canExportAligned = hasAligned }) {
+  const alignedDisabled = busy || dubBusy || !canExportAligned;
+  const alignedTitle = !canExportAligned
+    ? 'Resolve speech duration mismatches before exporting time-aligned WAV'
+    : 'Export synchronized time-aligned WAV ready for video editors';
   return (
     <div className="subtitle-voice-download-group">
       <button
@@ -248,8 +261,8 @@ function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAli
           type="button"
           id="subtitle-download-aligned-voice-btn"
           className="button button-primary subtitle-voice-btn"
-          disabled={busy || dubBusy}
-          title="Export synchronized time-aligned WAV ready for video editors"
+          disabled={alignedDisabled}
+          title={alignedTitle}
           onClick={onDownloadAligned}
         >
           <Icon name="waveform" />
@@ -260,28 +273,60 @@ function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAli
   );
 }
 
-function SubtitleVoiceCardHeader({ activeClip, hasAligned, mode, onChangeMode, actionsProps }) {
+function SubtitleVoiceCardHeader({ activeClip, hasAligned, mode, onChangeMode, actionsProps, unresolvedMismatchCount = 0 }) {
   return (
     <div className="subtitle-voice-output-head">
-      <SubtitleVoiceHeaderCopy activeClip={activeClip} />
+      <SubtitleVoiceHeaderCopy activeClip={activeClip} unresolvedMismatchCount={unresolvedMismatchCount} />
       {hasAligned && <SubtitleVoiceModeToggle mode={mode} onChangeMode={onChangeMode} />}
       <SubtitleVoiceDownloadActions {...actionsProps} hasAligned={hasAligned} />
     </div>
   );
 }
 
+function DurationMismatchExportBanner({ durationMismatches, busy, onJumpToMismatch, onFixSafeMismatches }) {
+  if (!durationMismatches?.hasUnresolved) return null;
+  const { unresolved, unresolvedCount } = durationMismatches;
+  const hasSafeExtend = unresolved.some(item => item.remedies?.canExtendCue);
+  const word = unresolvedCount === 1 ? 'mismatch' : 'mismatches';
+  return (
+    <div className="subtitle-mismatch-export-banner" role="alert">
+      <div className="subtitle-mismatch-banner-head">
+        <Icon name="alert_circle" className="subtitle-validation-icon" />
+        <div className="subtitle-mismatch-banner-copy">
+          <strong>Resolve {unresolvedCount} speech duration {word} before final dub export</strong>
+          <span>Speech exceeds allocated subtitle intervals — choose an explicit remedy on each cue rather than silent trimming.</span>
+        </div>
+        {hasSafeExtend && onFixSafeMismatches && (
+          <button type="button" id="subtitle-fix-safe-mismatches-btn" className="button subtle-button subtitle-validation-fix-btn"
+            disabled={busy} onClick={onFixSafeMismatches}>Extend safe cues</button>
+        )}
+      </div>
+      <div className="subtitle-mismatch-chip-list">
+        {unresolved.map(item => (
+          <button key={item.segmentId} type="button" className="button subtle-button subtitle-mismatch-jump-chip"
+            title={item.message} onClick={() => onJumpToMismatch?.(item.segmentId)}>
+            Cue #{item.cueNumber} (+{item.excessDuration.toFixed(2)}s)
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /**
  * Renders the combined generated voiceover audio player, WAV download bar, and dubbed MP4 export controls directly below the subtitle list.
- * Inputs: `{ combinedClip, alignedClip, busy, dubAudioMode, dubBusy, canExportDub, isAudioOnly, hasJobId, onDownload, onDownloadAligned, onChangeDubAudioMode, onExportDub }`.
+ * Inputs: `{ combinedClip, alignedClip, durationMismatches, canExportAlignedVoice, busy, dubAudioMode, dubBusy, canExportDub, isAudioOnly, hasJobId, onDownload, onDownloadAligned, onChangeDubAudioMode, onExportDub, onJumpToMismatch, onFixSafeMismatches }`.
  * Outputs: `<section id="subtitle-voice-output">` or null when no voice clips exist yet.
  * Side effects: plays audio via native HTML5 `<audio>`, downloads `.wav`, or exports time-aligned dubbed `.mp4`.
- * Failure modes: returns null cleanly before any frame voice is generated; disables dubbing for audio-only or missing `jobId`.
+ * Failure modes: returns null cleanly before any frame voice is generated; disables dubbing for audio-only, missing `jobId`, or unresolved duration mismatches.
  * @param {object} props - Output card props.
  * @returns {React.ReactElement|null} Combined voiceover output card or null.
  */
 export function SubtitleVoiceOutputCard({
   combinedClip,
   alignedClip = null,
+  durationMismatches = null,
+  canExportAlignedVoice,
   busy = false,
   dubAudioMode = DEFAULT_DUB_AUDIO_MODE,
   dubBusy = false,
@@ -292,6 +337,8 @@ export function SubtitleVoiceOutputCard({
   onDownloadAligned,
   onChangeDubAudioMode,
   onExportDub,
+  onJumpToMismatch = null,
+  onFixSafeMismatches = null,
 }) {
   const [mode, setMode] = useState('sequential');
   const hasCombined = Boolean(combinedClip?.url);
@@ -299,8 +346,10 @@ export function SubtitleVoiceOutputCard({
   const effectiveMode = (mode === 'aligned' && hasAligned) || (!hasCombined && hasAligned) ? 'aligned' : 'sequential';
   const activeClip = effectiveMode === 'aligned' ? alignedClip : combinedClip;
   if (!activeClip?.url) return null;
-  const dubDisabled = busy || dubBusy || !canExportDub;
-  const dubDisabledReason = !canExportDub ? resolveDubDisabledReason({ isAudioOnly, hasJobId }) : undefined;
+  const unresolvedMismatchCount = durationMismatches?.unresolvedCount || 0;
+  const canExportAligned = canExportAlignedVoice ?? (hasAligned && unresolvedMismatchCount === 0);
+  const dubDisabled = busy || dubBusy || !canExportDub || unresolvedMismatchCount > 0;
+  const dubDisabledReason = dubDisabled ? resolveDubDisabledReason({ isAudioOnly, hasJobId, unresolvedMismatchCount }) : undefined;
 
   return (
     <section id="subtitle-voice-output" className="subtitle-voice-output" aria-label="Generated subtitle voiceover">
@@ -309,7 +358,14 @@ export function SubtitleVoiceOutputCard({
         hasAligned={hasAligned}
         mode={effectiveMode}
         onChangeMode={setMode}
-        actionsProps={{ busy, dubBusy, onDownload, onDownloadAligned }}
+        unresolvedMismatchCount={unresolvedMismatchCount}
+        actionsProps={{ busy, dubBusy, onDownload, onDownloadAligned, canExportAligned }}
+      />
+      <DurationMismatchExportBanner
+        durationMismatches={durationMismatches}
+        busy={busy || dubBusy}
+        onJumpToMismatch={onJumpToMismatch}
+        onFixSafeMismatches={onFixSafeMismatches}
       />
       <audio key={activeClip.url} controls className="subtitle-voice-audio" src={activeClip.url} preload="metadata" />
       <SubtitleDubExportBar

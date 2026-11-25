@@ -132,6 +132,15 @@ test('mediaSubtitleGateway exportDubbedVideo uploads multipart metadata + WAV cl
   ]);
   assert.equal(form.getAll('files').length, 2);
 
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    clips: [{ segmentId: 'seg-1', start: 0.2, end: 1.0, blob: wav1, allowOverflow: true }],
+  });
+  assert.deepEqual(JSON.parse(calls[1].init.body.get('metadata')), [
+    { segmentId: 'seg-1', start: 0.2, end: 1.0, fileIndex: 0, allowOverflow: true },
+  ]);
+
   const errGw = createMediaSubtitleGateway({
     fetchImpl: async () => new Response(JSON.stringify({ detail: 'Dubbed MP4 export is only supported for video files.' }), { status: 400 }),
   });

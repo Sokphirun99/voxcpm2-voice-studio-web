@@ -10,6 +10,7 @@ import {
   readWavDurationSeconds,
   replaceChunkAndRestitch,
   smoothAndTrimWavBlob,
+  trimWavBlobToDuration,
   tryReadWavDurationSeconds,
   trySmoothWavBlob,
 } from '../../src/domain/wavCodec.js';
@@ -234,4 +235,29 @@ test('concatenateWavBlobsWithPauses surfaces exact format mismatch diagnostics',
       return true;
     }
   );
+});
+
+test('trimWavBlobToDuration trims WAV cleanly with micro-fades and rejects invalid inputs', async () => {
+  const sampleRate = 16000;
+  const clip = makeTestWavBlob({ sampleRate, samples: new Array(sampleRate * 2).fill(12000) }); // 2.0s
+
+  const trimmed = await trimWavBlobToDuration(clip, 1.25, { fadeMs: 15, trimSilenceFirst: true });
+  assert.equal(trimmed.wasTrimmed, true);
+  assert.equal(trimmed.originalDurationSeconds, 2);
+  assert.equal(trimmed.durationSeconds, 1.25);
+  const buf = await trimmed.blob.arrayBuffer();
+  const info = inspectWavBuffer(buf);
+  assert.equal(readWavDurationSeconds(buf), 1.25);
+  const view = new DataView(buf, info.dataOffset, info.dataSize);
+  // Sample at 8ms (frame 128 at 16kHz) must remain full amplitude 12000 (not attenuated by a 15ms head fade)
+  assert.equal(view.getInt16(128 * 2, true), 12000, 'Head consonant onset past 5ms anti-click fade must remain unattenuated');
+  assert.equal(view.getInt16((info.dataSize / 2 - 1) * 2, true), 0, 'Trimmed end must fade cleanly to 0');
+
+  // Target >= original keeps full clip without trimming
+  const noop = await trimWavBlobToDuration(clip, 3.0);
+  assert.equal(noop.wasTrimmed, false);
+  assert.equal(noop.durationSeconds, 2);
+
+  await assert.rejects(() => trimWavBlobToDuration(clip, 0), err => err.code === 'INVALID_DURATION');
+  await assert.rejects(() => trimWavBlobToDuration(new Blob(['bad']), 1.0), err => err.code === 'INVALID_WAV');
 });

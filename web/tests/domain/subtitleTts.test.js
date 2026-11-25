@@ -358,3 +358,148 @@ test('assembleTimelineAlignedVoiceover handles boundary edge cases: 0.0s start, 
     assert.equal(view.getInt16(f * 2, true), 0, `Frame ${f} must be silence between cues`);
   }
 });
+
+test('assembleTimelineAlignedVoiceover strictDurationCheck rejects mismatches unless spill-approved, and buildDubExportClips marks approved spills', async () => {
+  const sampleRate = 16000;
+  const clip1 = createPcmWavBlob(1500, sampleRate); // 1.5s
+  const clip2 = createPcmWavBlob(500, sampleRate);  // 0.5s
+  const segments = [
+    { id: 'cue-1', start: 0.0, end: 1.0, text: 'Line 1' }, // cue 1s, gap until 2s!
+    { id: 'cue-2', start: 2.0, end: 3.0, text: 'Line 2' },
+  ];
+  const segmentClips = {
+    'cue-1': { blob: clip1, signature: 'sig-1', durationSeconds: 1.5 },
+    'cue-2': { blob: clip2, signature: 'sig-2', durationSeconds: 0.5 },
+  };
+
+  // Without spill approval, strictDurationCheck throws DURATION_MISMATCH
+  await assert.rejects(
+    () => assembleTimelineAlignedVoiceover({
+      segments,
+      segmentClips,
+      totalDuration: 3.5,
+      sampleRate,
+      strictDurationCheck: true,
+    }),
+    err => err.code === 'DURATION_MISMATCH' && /Cue #1 \(\+0\.50s\)/.test(err.message)
+  );
+
+  // With valid spill approval (cue-1 fits before cue-2 at 2.0s), strictDurationCheck succeeds without trimming
+  const spillApprovals = {
+    'cue-1': {
+      segmentId: 'cue-1',
+      clipSignature: 'sig-1',
+      clipDuration: 1.5,
+      cueStart: 0.0,
+      cueEnd: 1.0,
+    },
+  };
+  const aligned = await assembleTimelineAlignedVoiceover({
+    segments,
+    segmentClips,
+    totalDuration: 3.5,
+    sampleRate,
+    strictDurationCheck: true,
+    spillApprovals,
+  });
+  assert.ok(aligned.blob);
+  assert.equal(aligned.mismatches.length, 0);
+  assert.equal(aligned.warnings.length, 0);
+
+  const dubClips = buildDubExportClips(segments, [], segmentClips, { spillApprovals, mediaDuration: 3.5 });
+  assert.equal(dubClips[0].allowOverflow, true);
+  assert.equal(dubClips[1].allowOverflow, undefined);
+
+  // If mediaDuration shrinks below clip1 end (1.5s > 1.3s), allowOverflow is automatically revoked
+  const tightDubClips = buildDubExportClips(segments, [], segmentClips, { spillApprovals, mediaDuration: 1.3 });
+  assert.equal(tightDubClips[0].allowOverflow, undefined);
+});
+
+test('assembleTimelineAlignedVoiceover preserves full cue numbering and ungenerated neighbor collision checks', async () => {
+  const sampleRate = 16000;
+  const clip1 = createPcmWavBlob(1500, sampleRate); // 1.5s -> collides with ungenerated cue-2 at 1.2s
+  const clip3 = createPcmWavBlob(1800, sampleRate); // 1.8s -> Cue #3 (2.5-3.5s -> +0.80s)
+  const segments = [
+    { id: 'cue-1', start: 0.0, end: 1.0 },
+    { id: 'cue-2', start: 1.2, end: 2.0 }, // no generated clip yet
+    { id: 'cue-3', start: 2.5, end: 3.5 },
+  ];
+  const segmentClips = {
+    'cue-1': { blob: clip1, signature: 's1' },
+    'cue-3': { blob: clip3, signature: 's3' },
+  };
+
+  // Selecting only cue-3 reports Cue #3 (not Cue #1)
+  await assert.rejects(
+    () => assembleTimelineAlignedVoiceover({
+      segments,
+      segmentClips,
+      selectedIds: ['cue-3'],
+      totalDuration: 5.0,
+      sampleRate,
+      strictDurationCheck: true,
+    }),
+    err => err.code === 'DURATION_MISMATCH' && /Cue #3 \(\+0\.80s\)/.test(err.message)
+  );
+
+  // Spill approval on cue-1 is rejected when ungenerated cue-2 starts at 1.2s (< 1.5s)
+  await assert.rejects(
+    () => assembleTimelineAlignedVoiceover({
+      segments,
+      segmentClips,
+      selectedIds: ['cue-1'],
+      totalDuration: 5.0,
+      sampleRate,
+      strictDurationCheck: true,
+      spillApprovals: {
+        'cue-1': { segmentId: 'cue-1', clipSignature: 's1', clipDuration: 1.5, cueStart: 0.0, cueEnd: 1.0 },
+      },
+    }),
+    err => err.code === 'DURATION_MISMATCH' && /Cue #1/.test(err.message)
+  );
+});
+
+test('assembleTimelineAlignedVoiceover honors spill approvals on real speech WAVs with edge silence and skips clamping warnings within 5ms tolerance', async () => {
+  const sampleRate = 16000;
+  // Build 2.15s WAV with 100ms head silence + 1.80s active speech + 250ms tail silence (prepareCleanPcmSlice trims to ~1.925s)
+  const totalSamples = Math.round(sampleRate * 2.15);
+  const dataSize = totalSamples * 2;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+  const writeTag = (off, tag) => { for (let i = 0; i < 4; i++) view.setUint8(off + i, tag.charCodeAt(i)); };
+  writeTag(0, 'RIFF'); view.setUint32(4, 36 + dataSize, true); writeTag(8, 'WAVE'); writeTag(12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true); writeTag(36, 'data'); view.setUint32(40, dataSize, true);
+  const activeStart = Math.round(sampleRate * 0.1);
+  const activeEnd = Math.round(sampleRate * 1.9);
+  for (let i = activeStart; i < activeEnd; i++) {
+    view.setInt16(44 + i * 2, i % 2 === 0 ? 9000 : -9000, true);
+  }
+  const paddedWav = new Blob([buf], { type: 'audio/wav' });
+  const tolWav = createPcmWavBlob(1003, sampleRate); // 1.003s in 1.000s window (+3ms <= 5ms tolerance)
+
+  const segments = [
+    { id: 'cue-1', start: 0.0, end: 1.5 },
+    { id: 'cue-2', start: 3.0, end: 4.0 },
+  ];
+  const segmentClips = {
+    'cue-1': { blob: paddedWav, signature: 'sig-padded', durationSeconds: 2.15 },
+    'cue-2': { blob: tolWav, signature: 'sig-tol', durationSeconds: 1.003 },
+  };
+  const spillApprovals = {
+    'cue-1': { segmentId: 'cue-1', clipSignature: 'sig-padded', clipDuration: 2.15, cueStart: 0.0, cueEnd: 1.5, allocatedDuration: 1.5 },
+  };
+
+  const aligned = await assembleTimelineAlignedVoiceover({
+    segments,
+    segmentClips,
+    totalDuration: 4.0,
+    sampleRate,
+    strictDurationCheck: true,
+    spillApprovals,
+  });
+  assert.ok(aligned.blob);
+  assert.equal(aligned.mismatches.length, 0, 'Padded WAV must not invalidate spill approval after silence trimming');
+  assert.equal(aligned.warnings.length, 0, '3ms rounding excess must not emit spurious clamping warning');
+});

@@ -2,6 +2,7 @@
  * @fileoverview Pure domain subtitle validation engine flagging missing text, invalid durations, overlaps, abnormal line lengths, reading speed, untranslated segments, and voice assignments.
  */
 
+import { MISMATCH_REMEDY_TYPES, detectDurationMismatches } from './durationMismatch.js';
 import { countGraphemes } from './presets.js';
 import { MIN_SPLIT_GAP_SEC, detectCueOverlaps, roundToMs } from './subtitles.js';
 
@@ -29,6 +30,7 @@ export const SUBTITLE_ISSUE_TYPES = Object.freeze({
   READING_SPEED_FAST: 'reading_speed_fast',
   UNTRANSLATED: 'untranslated',
   UNASSIGNED_VOICE: 'unassigned_voice',
+  SPEECH_EXCEEDS_INTERVAL: 'speech_exceeds_interval',
 });
 
 export const REMEDY_ACTIONS = Object.freeze({
@@ -40,6 +42,14 @@ export const REMEDY_ACTIONS = Object.freeze({
   EXTEND_DURATION: 'extend_duration',
   FOCUS_TRANSLATION: 'focus_translation',
   ASSIGN_VOICE: 'assign_voice',
+  EXTEND_CUE_TO_SPEECH: MISMATCH_REMEDY_TYPES.EXTEND_CUE,
+  EXTEND_AND_SHIFT_NEXT: MISMATCH_REMEDY_TYPES.EXTEND_AND_SHIFT,
+  SHIFT_START_EARLIER: MISMATCH_REMEDY_TYPES.SHIFT_START_EARLIER,
+  ALLOW_SPILL: MISMATCH_REMEDY_TYPES.ALLOW_SPILL,
+  TRIM_SPEECH_CLIP: MISMATCH_REMEDY_TYPES.TRIM_CLIP,
+  REGENERATE_CLIP: MISMATCH_REMEDY_TYPES.REGENERATE_CLIP,
+  REMOVE_SPEECH_CLIP: MISMATCH_REMEDY_TYPES.REMOVE_CLIP,
+  EDIT_TEXT: MISMATCH_REMEDY_TYPES.EDIT_TEXT,
 });
 
 /**
@@ -367,16 +377,43 @@ function aggregateIssuesSummary(allIssues) {
   };
 }
 
+function buildSpeechMismatchIssue(mismatch) {
+  const primary = mismatch.availableRemedies?.[0]?.action || REMEDY_ACTIONS.ADJUST_TIMING;
+  return createIssue({
+    segmentId: mismatch.segmentId,
+    type: SUBTITLE_ISSUE_TYPES.SPEECH_EXCEEDS_INTERVAL,
+    severity: SUBTITLE_ISSUE_SEVERITIES.ERROR,
+    message: mismatch.message,
+    remedyAction: primary,
+    remedyHint: mismatch.remedyHint,
+    metadata: mismatch,
+  });
+}
+
+/**
+ * Validates generated speech clip durations against allocated subtitle intervals and neighbor boundaries.
+ * Inputs: `{ segments, segmentClips, mediaDuration, spillApprovals, isClipStale }`.
+ * Outputs: array of `speech_exceeds_interval` validation issues for unresolved mismatches.
+ * Side effects: none. Failure modes: returns empty array when no clips exceed cue intervals.
+ * @param {object} [params] - Mismatch validation params.
+ * @returns {Array<object>} Duration mismatch issue list.
+ */
+export function validateDurationMismatches(params = {}) {
+  const report = detectDurationMismatches(params);
+  if (!report.hasUnresolved) return [];
+  return report.unresolved.map(buildSpeechMismatchIssue);
+}
+
 /**
  * Validates a list of subtitle segments against all subtitle standards and returns a structured summary.
- * Inputs: validation options `{ segments, useTranslation, targetLanguage, hasVoiceover, requireVoiceAssignment, speakerVoiceMap, characters, mediaDuration, minDuration, maxDuration }`.
+ * Inputs: validation options `{ segments, useTranslation, targetLanguage, hasVoiceover, requireVoiceAssignment, speakerVoiceMap, characters, mediaDuration, minDuration, maxDuration, segmentClips, spillApprovals, isClipStale }`.
  * Outputs: comprehensive validation summary object.
  * Side effects: none. Failure modes: returns empty valid summary on null/empty inputs.
  * @param {object} params - Validation options.
  * @returns {object} Validation summary with issue lookups and metrics.
  */
 export function validateSubtitleSegments(params = {}) {
-  const { segments = [] } = params;
+  const { segments = [], segmentClips = null } = params;
   if (!Array.isArray(segments) || segments.length === 0) {
     return aggregateIssuesSummary([]);
   }
@@ -385,6 +422,9 @@ export function validateSubtitleSegments(params = {}) {
     allIssues.push(...validateSingleSegment(seg, params));
   }
   allIssues.push(...detectValidationOverlaps(segments));
+  if (segmentClips && typeof segmentClips === 'object') {
+    allIssues.push(...validateDurationMismatches(params));
+  }
   return aggregateIssuesSummary(allIssues);
 }
 

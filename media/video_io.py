@@ -74,6 +74,7 @@ class DubClip:
     start_seconds: float
     end_seconds: float
     segment_id: str = ""
+    allow_overflow: bool = False
 
 
 def resolve_ffmpeg_bin() -> str:
@@ -269,7 +270,7 @@ def probe_media_duration(media_path: Path, ffprobe_bin: str | None = None) -> fl
         return 0.0
 
 
-def _probe_wav_duration(wav_path: Path, ffprobe_bin: str | None = None) -> float:
+def probe_wav_duration(wav_path: Path, ffprobe_bin: str | None = None) -> float:
     """Read WAV duration cheaply via stdlib `wave`, falling back to FFprobe for non-PCM headers."""
     try:
         with wave.open(str(wav_path), "rb") as wf:
@@ -280,6 +281,9 @@ def _probe_wav_duration(wav_path: Path, ffprobe_bin: str | None = None) -> float
     except (wave.Error, OSError, EOFError):
         pass
     return probe_media_duration(wav_path, ffprobe_bin)
+
+
+_probe_wav_duration = probe_wav_duration
 
 
 def _compute_clip_atempo(clip_duration: float, slot_seconds: float) -> float | None:
@@ -345,7 +349,7 @@ def _build_dub_filter_complex(
     for idx, clip in enumerate(ordered):
         start_ms = max(0, int(round(clip.start_seconds * 1000)))
         slot_seconds = _resolve_clip_slot_seconds(ordered, idx)
-        atempo = _compute_clip_atempo(clip_durations[idx], slot_seconds)
+        atempo = None if clip.allow_overflow else _compute_clip_atempo(clip_durations[idx], slot_seconds)
         chains.append(_build_dub_clip_filter(idx + 1, idx, start_ms, atempo))
         mix_labels.append(f"[dub{idx}]")
     pad_filter = f"apad=whole_dur={video_duration:.3f}" if video_duration > 0 else "apad"

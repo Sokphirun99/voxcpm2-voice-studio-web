@@ -208,6 +208,24 @@ def test_mux_dubbed_audio_supports_duck_mute_keep_atempo_and_validation(tmp_path
     assert "volume=0.15" in graph
     assert "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0" in graph
 
+    overflow_graph = _build_dub_filter_complex(
+        [DubClip(wav_path=tmp_path / "clip.wav", start_seconds=0.2, end_seconds=1.0, allow_overflow=True)],
+        [1.5],
+        "duck",
+        True,
+        3.0,
+    )
+    assert "atempo=" not in overflow_graph
+
+    overflow_graph = _build_dub_filter_complex(
+        [DubClip(wav_path=tmp_path / "clip.wav", start_seconds=0.2, end_seconds=1.0, allow_overflow=True)],
+        [1.5],
+        "mute",
+        False,
+        3.0,
+    )
+    assert "atempo=" not in overflow_graph
+
     sample_mp4 = tmp_path / "source.mp4"
     subprocess.run([
         ffmpeg_bin, "-y",

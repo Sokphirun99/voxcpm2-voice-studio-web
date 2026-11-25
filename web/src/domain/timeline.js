@@ -2,6 +2,7 @@
  * @fileoverview Pure domain logic for timeline duration, interval layout calculation, clock formatting, and voice clip association.
  */
 
+import { DURATION_MISMATCH_TOLERANCE_SEC, isSpillApprovalValid } from './durationMismatch.js';
 import { getSpeakerColor, roundToMs } from './subtitles.js';
 
 export const DEFAULT_MIN_TIMELINE_DURATION_SEC = 1.0;
@@ -122,28 +123,43 @@ function calculateSpeechRatioPercent(clipDuration, safeCueDur) {
   return Math.min(100, Math.round((clipDuration / safeCueDur) * 1000) / 10);
 }
 
-function resolveClipTimingDetails(clip, cueDuration) {
+function computeClipBoundaryExcess(start, clipDuration, safeCueDur, bounds = {}) {
+  const speechEnd = roundToMs(start + clipDuration);
+  const intervalExcess = Math.max(0, roundToMs(clipDuration - safeCueDur));
+  const nextStart = bounds.nextSeg ? Math.max(0, roundToMs(Number(bounds.nextSeg.start) || 0)) : Infinity;
+  const nextCollision = Number.isFinite(nextStart) && speechEnd > nextStart ? roundToMs(speechEnd - nextStart) : 0;
+  const mediaBound = Number.isFinite(bounds.mediaDuration) && bounds.mediaDuration > 0 ? roundToMs(bounds.mediaDuration) : Infinity;
+  const mediaOverflow = Number.isFinite(mediaBound) && speechEnd > mediaBound ? roundToMs(speechEnd - mediaBound) : 0;
+  return Math.max(intervalExcess, nextCollision, mediaOverflow);
+}
+
+function resolveClipTimingDetails(clip, spec) {
+  const { start, cueDuration, isSpillApproved = false, nextSeg = null, mediaDuration = 0 } = spec;
   const clipDuration = Number.isFinite(clip?.durationSeconds) && clip.durationSeconds > 0
     ? roundToMs(clip.durationSeconds) : 0;
   const hasVoiceClip = Boolean(clip?.url || clip?.blob);
-  const safeCueDur = Math.max(0, cueDuration);
-  const speechPercent = calculateSpeechRatioPercent(clipDuration, safeCueDur);
-  const isClipOverflowing = clipDuration > safeCueDur && safeCueDur > 0;
-  const trailingSilenceDuration = safeCueDur > clipDuration && clipDuration > 0
+  const safeCueDur = roundToMs(Math.max(0, cueDuration));
+  const speechPercent = safeCueDur > 0 ? calculateSpeechRatioPercent(clipDuration, safeCueDur) : (clipDuration > 0 ? 100 : 0);
+  const rawOverflow = clipDuration > 0 ? computeClipBoundaryExcess(start, clipDuration, safeCueDur, { nextSeg, mediaDuration }) : 0;
+  const exceedsBounds = rawOverflow > DURATION_MISMATCH_TOLERANCE_SEC && clipDuration > 0;
+  const isClipOverflowing = exceedsBounds && !isSpillApproved;
+  const trailingSilenceDuration = !exceedsBounds && safeCueDur > clipDuration && clipDuration > 0
     ? roundToMs(safeCueDur - clipDuration) : 0;
-  const overflowDuration = isClipOverflowing ? roundToMs(clipDuration - safeCueDur) : 0;
-  return { clipDuration, hasVoiceClip, speechPercent, trailingSilenceDuration, isClipOverflowing, overflowDuration };
+  const overflowDuration = exceedsBounds ? rawOverflow : 0;
+  return { clipDuration, hasVoiceClip, speechPercent, trailingSilenceDuration, isClipOverflowing, isSpillApproved: exceedsBounds && isSpillApproved, overflowDuration };
 }
 
 function buildTimelineIntervalItem(seg, index, context) {
-  const { segments, safeTotal, activeSegmentId, segmentClips, validationBySegmentId } = context;
+  const { segments, safeTotal, mediaDuration, activeSegmentId, segmentClips, spillApprovals, validationBySegmentId } = context;
   const start = Number.isFinite(seg.start) ? Math.max(0, seg.start) : 0;
   const end = Number.isFinite(seg.end) ? Math.max(start, seg.end) : start;
   const { leftPercent, widthPercent } = computeIntervalGeometry(start, end, safeTotal);
   const { pauseBefore, pauseAfter, hasOverlap } = resolveTimelineGapStatus(start, end, index, segments);
   const { issues, hasError, hasWarning, issueCount } = resolveTimelineValidationStatus(seg.id, validationBySegmentId);
   const clip = segmentClips[seg.id];
-  const timing = resolveClipTimingDetails(clip, end - start);
+  const nextSeg = index < segments.length - 1 ? segments[index + 1] : null;
+  const spillOk = Boolean(clip && isSpillApprovalValid(spillApprovals?.[seg.id], { segment: seg, clip, nextSegment: nextSeg, mediaDuration }));
+  const timing = resolveClipTimingDetails(clip, { start, cueDuration: end - start, isSpillApproved: spillOk, nextSeg, mediaDuration });
   return {
     id: seg.id, index, start, end, duration: roundToMs(end - start),
     leftPercent, widthPercent, speakerId: seg.speakerId || 'speaker-1',
@@ -161,20 +177,25 @@ function buildTimelineIntervalItem(seg, index, context) {
  * @param {object} params - Calculation parameters.
  * @param {Array<object>} params.segments - Timed subtitle segments.
  * @param {number} params.totalDuration - Total timeline duration in seconds.
+ * @param {number} [params.mediaDuration=0] - Actual media duration bound in seconds (0 if unbounded).
  * @param {string} [params.activeSegmentId=''] - Currently selected or active segment ID.
  * @param {Record<string, object>} [params.segmentClips={}] - Voice clips keyed by segment ID.
+ * @param {Record<string, object>} [params.spillApprovals={}] - Approved spill records keyed by segment ID.
  * @param {Record<string, Array<object>>} [params.validationBySegmentId={}] - Validation issues by cue ID.
  * @returns {Array<object>} Interval render descriptors.
  */
 export function computeTimelineIntervals({
   segments,
   totalDuration,
+  mediaDuration = 0,
   activeSegmentId = '',
   segmentClips = {},
+  spillApprovals = {},
   validationBySegmentId = {},
 }) {
   const safeTotal = Math.max(DEFAULT_MIN_TIMELINE_DURATION_SEC, totalDuration || 0);
   if (!Array.isArray(segments)) return [];
-  const context = { segments, safeTotal, activeSegmentId, segmentClips, validationBySegmentId };
+  const safeMedia = Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 0;
+  const context = { segments, safeTotal, mediaDuration: safeMedia, activeSegmentId, segmentClips, spillApprovals, validationBySegmentId };
   return segments.map((seg, index) => buildTimelineIntervalItem(seg, index, context));
 }

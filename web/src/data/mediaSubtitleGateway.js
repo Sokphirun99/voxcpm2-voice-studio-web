@@ -125,6 +125,7 @@ function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck' }
       start: Number(clip.start) || 0,
       end: Number(clip.end) || 0,
       fileIndex,
+      ...(clip.allowOverflow ? { allowOverflow: true } : {}),
     };
   });
   form.append('metadata', JSON.stringify(metadata));

@@ -5012,3 +5012,116 @@ a {
   background: #ff3b30;
   border-radius: 50%;
 }
+
+.subtitle-validation-pill.has-multi-remedies {
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.subtitle-validation-remedies {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding-left: 22px;
+  margin-top: 2px;
+}
+
+.subtitle-cue-mismatch-badge,
+.subtitle-cue-spill-badge,
+.subtitle-cue-trimmed-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
+.subtitle-cue-mismatch-badge {
+  color: #ff6b6b;
+  background: rgba(255, 77, 79, 0.12);
+  border: 1px solid rgba(255, 77, 79, 0.3);
+}
+
+.subtitle-cue-spill-badge {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.subtitle-cue-trimmed-badge {
+  color: var(--muted);
+  background: var(--control);
+  border: 1px solid var(--line);
+}
+
+.subtitle-timeline-cue.is-spill-approved .subtitle-timeline-cue-speech {
+  background: color-mix(in srgb, var(--accent) 36%, transparent);
+  border-right: 2px dotted var(--accent);
+}
+
+.subtitle-timeline-voice-timing.is-spill-approved {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.subtitle-voice-mismatch-pill {
+  font-size: 10px;
+  color: #ff6b6b;
+  background: rgba(255, 77, 79, 0.12);
+  border: 1px solid rgba(255, 77, 79, 0.3);
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.subtitle-mismatch-export-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 77, 79, 0.08);
+  border: 1px solid rgba(255, 77, 79, 0.28);
+  color: #ff6b6b;
+}
+
+.subtitle-mismatch-banner-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.subtitle-mismatch-banner-copy {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.subtitle-mismatch-banner-copy span {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.subtitle-mismatch-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 22px;
+}
+
+.studio-page .subtitle-mismatch-jump-chip {
+  min-height: 22px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  background: rgba(255, 77, 79, 0.14);
+  border: 1px solid rgba(255, 77, 79, 0.35);
+  color: #ff6b6b;
+  font-variant-numeric: tabular-nums;
+}
