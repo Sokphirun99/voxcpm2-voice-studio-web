@@ -900,6 +900,7 @@ export function VideoSubtitleWorkspace({
   onUnlockSound,
   offlineReadiness = null,
   onSelectModels = null,
+  productionJobs = null,
 }) {
   const services = useStudioServices();
   const effectiveTermsRef = useRef([]);
@@ -922,18 +923,11 @@ export function VideoSubtitleWorkspace({
     logger: services?.logger,
   });
   effectiveTermsRef.current = terminologyCtrl.effectiveTerms;
-  if (actionsRef) {
-    actionsRef.current = {
-      loadProject: snapshot => {
-        ctrl.autosave?.resetProject?.(snapshot?.id || '', snapshot?.revision || 1);
-        ctrl.loadProjectFromSnapshot(snapshot);
-        ctrl.recovery?.checkForDraft?.(snapshot);
-        void ctrl.recovery?.verifyAssets?.(snapshot);
-      },
-      autosave: ctrl.autosave,
-    };
-  }
   const { state, health, speakers } = ctrl;
+  const activeProjectId = ctrl.projectId || state.projectId || '';
+  const activeProjectIdRef = useRef(activeProjectId);
+  activeProjectIdRef.current = activeProjectId;
+  const activeProjectTitle = ctrl.projectTitle || state.projectTitle || state.videoFile?.name || '';
   const activeSpeechLanguage = ctrl.useTranslation
     ? (state.translatedLanguage || state.options.targetLanguage)
     : (state.detectedLanguage || state.options.sourceLanguage);
@@ -949,11 +943,41 @@ export function VideoSubtitleWorkspace({
     terminology: terminologyCtrl.effectiveTerms,
     pronunciationSignature: terminologyCtrl.pronunciationSignature,
     speechLanguage: activeSpeechLanguage,
+    projectId: activeProjectId,
+    projectTitle: activeProjectTitle,
+    productionJobs,
     onStatus: ctrl.setStatus,
     onNotify,
     onUnlockSound,
     onEngineFailure: onRefreshEngine,
   });
+  if (actionsRef) {
+    actionsRef.current = {
+      loadProject: snapshot => {
+        activeProjectIdRef.current = snapshot?.id || '';
+        ctrl.autosave?.resetProject?.(snapshot?.id || '', snapshot?.revision || 1);
+        ctrl.loadProjectFromSnapshot(snapshot);
+        ctrl.recovery?.checkForDraft?.(snapshot);
+        void ctrl.recovery?.verifyAssets?.(snapshot);
+      },
+      reloadProjectIfActive: (targetProjectId, updatedProject) => {
+        const currentId = activeProjectIdRef.current || ctrl.autosave?.getProjectId?.() || '';
+        if (!targetProjectId || targetProjectId !== currentId || !updatedProject) return;
+        const hasUnsaved = ctrl.autosave?.hasUnsavedChanges?.() ?? ctrl.autosave?.isDirty;
+        if (!hasUnsaved) {
+          ctrl.autosave?.resetProject?.(updatedProject.id || currentId, updatedProject.revision || 1);
+          ctrl.applyExternalProjectUpdate?.(updatedProject);
+        }
+      },
+      syncVoiceoverJob: job => {
+        if (!job || job.type !== 'subtitle_voiceover') return;
+        const currentId = activeProjectIdRef.current || ctrl.autosave?.getProjectId?.() || '';
+        if (job.projectId && currentId && job.projectId !== currentId) return;
+        return voice.hydrateClipsFromJob?.(job);
+      },
+      autosave: ctrl.autosave,
+    };
+  }
   const mediaBusy = Boolean(state.busyAction);
   const busy = mediaBusy || voice.voiceBusy || voice.dubBusy;
   const modelHints = resolveModelReadinessHints(health.models, state.options);

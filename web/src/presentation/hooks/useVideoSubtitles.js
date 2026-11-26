@@ -1112,6 +1112,28 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     }));
   }, [bumpTranscriptEpoch]);
 
+  const applyExternalProjectUpdate = useCallback(snapshot => {
+    if (!snapshot) return;
+    const isSubtitleType = snapshot.kind === 'subtitle' || snapshot.type === 'subtitles' || snapshot.type === 'dubbing';
+    if (!isSubtitleType) return;
+    const payload = snapshot.payload || {};
+    const nextSegments = Array.isArray(payload.segments)
+      ? payload.segments
+      : (Array.isArray(snapshot.segments) ? snapshot.segments : null);
+    setState(prev => ({
+      ...prev,
+      revision: snapshot.revision || prev.revision,
+      detectedLanguage: payload.detectedLanguage || prev.detectedLanguage,
+      segments: nextSegments ?? prev.segments,
+      hasTranslation: payload.hasTranslation !== undefined ? Boolean(payload.hasTranslation) : prev.hasTranslation,
+      translatedLanguage: payload.translatedLanguage || prev.translatedLanguage,
+      speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : prev.speakerNames,
+      terminology: snapshot.terminology !== undefined || payload.terminology !== undefined
+        ? normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology)
+        : prev.terminology,
+    }));
+  }, []);
+
   useEffect(() => {
     if (!projectRepository) {
       setState(prev => ({ ...prev, projectsReady: true }));
@@ -1351,6 +1373,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     recovery,
     flushProjectSave: persistCurrentProject,
     loadProjectFromSnapshot,
+    applyExternalProjectUpdate,
     setProjectTerminology,
     applySpellingTerminology,
     applyTranslationTerminology,

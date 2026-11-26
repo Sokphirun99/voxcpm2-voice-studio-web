@@ -21,6 +21,7 @@ import { createHttpGlossaryRepository } from './data/httpGlossaryRepository.js';
 import { createHttpTerminologyRepository } from './data/httpTerminologyRepository.js';
 import { createHttpProjectRepository } from './data/httpProjectRepository.js';
 import { createHttpAssetRepository } from './data/httpAssetRepository.js';
+import { createHttpJobRepository } from './data/httpJobRepository.js';
 import { createNotificationSoundPlayer } from './data/notificationSound.js';
 import { createWebAudioDecoder } from './data/webAudioDecoder.js';
 import {
@@ -55,6 +56,7 @@ function createStudioServices() {
   const mediaSubtitleGateway = createMediaSubtitleGateway({ logger });
   const projectRepository = createHttpProjectRepository({ logger });
   const assetRepository = createHttpAssetRepository({ logger });
+  const jobRepository = createHttpJobRepository({ logger });
   const glossaryRepository = createHttpGlossaryRepository({ logger });
   const terminologyRepository = createHttpTerminologyRepository({ logger });
   const notificationSound = createNotificationSoundPlayer({ logger });
@@ -66,6 +68,7 @@ function createStudioServices() {
     diagnosticsGateway,
     projectRepository,
     assetRepository,
+    jobRepository,
     glossaryRepository,
     terminologyRepository,
     notificationSound,

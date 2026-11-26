@@ -4,6 +4,11 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  buildTtsBatchJobItems,
+  buildTtsBatchJobSpec,
+  mergeUpdatedTakesIntoSegments,
+} from '../../domain/productionJobs.js';
+import {
   attachTakesToSegments,
   createEditableSegment,
   deleteSegment,
@@ -361,6 +366,7 @@ function TtsSpeechForm({ state, ctrl, voiceActions, onOpenLibrary }) {
         onCycleSegmentTake={state.handleCycleSegmentTake}
         onRestitchSegments={state.handleRestitchSegments}
         onExportNarration={state.handleExportNarration}
+        onQueueBatchJob={state.handleQueueBatchJob}
         hasTakesToRestitch={state.hasTakesToRestitch}
         canApplySpelling={state.canApplySpelling}
         onApplySpelling={state.handleApplySpelling}
@@ -465,6 +471,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     library, anchorApi, activeCharacter, activeAnchor,
     lockedSeeds, setLockedSeeds, characterActions,
     externalScript: sharedScript, onConsumeExternalScript: sharedConsume, onTtsStateChange,
+    productionJobs = null,
   } = shared;
   const externalScript = propExternalScript || sharedScript || '';
   const onConsumeExternalScript = propConsume || sharedConsume;
@@ -482,6 +489,10 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const [projectSourceLanguage, setProjectSourceLanguage] = useState('');
   const [terminologyModalOpen, setTerminologyModalOpen] = useState(false);
   const [projectId, setProjectId] = useState('');
+  const projectIdRef = useRef(projectId);
+  useEffect(() => {
+    projectIdRef.current = projectId;
+  }, [projectId]);
   const [projectTitle, setProjectTitle] = useState('');
   const [projectRevision, setProjectRevision] = useState(1);
   const [projectsReady, setProjectsReady] = useState(false);
@@ -709,7 +720,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     projectRepository,
     logger,
     onSaveSuccess: saved => {
-      if (saved?.id && !projectId) {
+      if (saved?.id && !projectIdRef.current) {
+        projectIdRef.current = saved.id;
         setProjectId(saved.id);
         setProjectTitle(saved.title || projectTitle);
       }
@@ -847,6 +859,55 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     Array.isArray(segments) && segments.some(s => hasSegmentAudio(s))
   ), [segments]);
 
+  const canQueueBatch = Boolean(productionJobs?.enqueueJob || services?.jobRepository?.enqueueJob);
+
+  const handleQueueBatchJob = useCallback(async () => {
+    if (!canQueueBatch || viewMode !== 'segments' || !Array.isArray(segments) || segments.length === 0) return null;
+    const saveRes = await autosave.saveNow();
+    const saved = saveRes?.project || saveRes;
+    if (saved?.id && !projectIdRef.current) {
+      projectIdRef.current = saved.id;
+      setProjectId(saved.id);
+    }
+    const effectiveSegments = Array.isArray(saved?.segments) ? saved.segments : segments;
+    const items = buildTtsBatchJobItems({
+      segments: effectiveSegments,
+      defaultVoiceId: activeCharacter.id,
+      pronunciationSignature: terminologyCtrl?.pronunciationSignature,
+    });
+    const pendingCount = items.filter(item => item.status === 'pending').length;
+    if (pendingCount === 0) {
+      synthesis.setStatus?.({ message: 'All script segments already have up-to-date takes.', error: false });
+      return null;
+    }
+    const spec = buildTtsBatchJobSpec({
+      projectId: projectIdRef.current || projectId,
+      projectTitle,
+      savedProject: saved,
+      activeCharacter,
+      items,
+      options,
+      terminology: terminologyCtrl?.effectiveTerms,
+      projectTerminology,
+      sourceLanguage: projectSourceLanguage,
+      pronunciationSignature: terminologyCtrl?.pronunciationSignature || '',
+    });
+    let job = null;
+    if (productionJobs?.enqueueJob) {
+      job = await productionJobs.enqueueJob(spec);
+    } else if (services?.jobRepository?.enqueueJob) {
+      try {
+        job = (await services.jobRepository.enqueueJob(spec))?.job ?? null;
+      } catch (err) {
+        logger?.error?.('TextToSpeechWorkspace.handleQueueBatchJob', err);
+        synthesis.setStatus?.({ message: err?.message || 'Could not queue batch job.', error: true });
+        return null;
+      }
+    }
+    if (job) synthesis.setStatus?.({ message: `Queued batch job (${pendingCount} pending segments).`, error: false });
+    return job;
+  }, [canQueueBatch, viewMode, segments, autosave, activeCharacter, options, terminologyCtrl, projectTerminology, projectSourceLanguage, projectId, projectTitle, productionJobs, services, logger, synthesis]);
+
   const handleRestitchSegments = useCallback(async () => {
     const assetFetcher = assetRepository ? id => assetRepository.getAssetBinary(id) : null;
     await synthesis.restitchSegments({
@@ -872,6 +933,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   }, [synthesis.busy, hasScript, libraryModal.open, onTtsStateChange]);
 
   const handleRestoreDraft = useCallback(snapshot => {
+    projectIdRef.current = snapshot?.id || '';
     autosave.resetProject(snapshot?.id || '', snapshot?.revision || 1);
     applyProjectSnapshotToTts(snapshot, {
       setProjectId,
@@ -923,6 +985,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       setStatus: synthesis.setStatus,
       closeLibrary: () => setLibraryModal({ open: false, openForm: false }),
       loadProject: snapshot => {
+        projectIdRef.current = snapshot?.id || '';
         autosave.resetProject(snapshot?.id || '', snapshot?.revision || 1);
         applyProjectSnapshotToTts(snapshot, {
           setProjectId,
@@ -939,6 +1002,22 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         recovery.checkForDraft(snapshot);
         void recovery.verifyAssets(snapshot);
       },
+      reloadProjectIfActive: (targetProjectId, updatedProject) => {
+        const currentId = projectIdRef.current || autosave.getProjectId?.() || '';
+        if (!targetProjectId || targetProjectId !== currentId || !updatedProject) return;
+        const savedSegs = Array.isArray(updatedProject.segments) ? updatedProject.segments : (updatedProject.payload?.segments || []);
+        const normalizedSegs = savedSegs.map(createEditableSegment);
+        const hasUnsaved = autosave.hasUnsavedChanges?.() ?? autosave.isDirty;
+        if (!hasUnsaved) {
+          autosave.resetProject(updatedProject.id || currentId, updatedProject.revision || 1);
+          setProjectRevision(updatedProject.revision || 1);
+          setSegments(normalizedSegs);
+          void recovery.verifyAssets(updatedProject);
+          return;
+        }
+        setProjectRevision(updatedProject.revision || 1);
+        setSegments(prev => mergeUpdatedTakesIntoSegments(prev, normalizedSegs));
+      },
       autosave,
     };
   }
@@ -953,6 +1032,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     handleMoveSegmentUp, handleMoveSegmentDown, handleMergeSegment,
     handleSplitSegment, handleReorderSegments,
     handleGenerateSegment, handleTogglePlaySegment, playingSegmentId,
+    handleQueueBatchJob: canQueueBatch ? handleQueueBatchJob : null,
     handleSelectSegmentTake, handleDeleteSegmentTake, handleTogglePlayTake, playingTakeId,
     handleCycleSegmentTake,
     handleStopPreview: () => { stopCurrentPreview(audioPreviewRef); setPlayingSegmentId(null); setPlayingTakeId(null); },

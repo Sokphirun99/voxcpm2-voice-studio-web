@@ -10,6 +10,7 @@ import { StorageError, ValidationError } from '../src/domain/errors.js';
 import { upgradeProjectSchema } from '../src/domain/projects.js';
 import { normalizeGlossaryRules } from '../src/domain/pronunciationRules.js';
 import { normalizeTerminologyList } from '../src/domain/terminology.js';
+import { normalizeProductionJob } from '../src/domain/productionJobs.js';
 import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
 
 export const STORAGE_BACKUP_DIR = '.backup';
@@ -22,6 +23,7 @@ export const CATALOG_FILE_NAME = 'catalog.json';
 export const GLOSSARY_FILE_NAME = 'glossary.json';
 export const TERMINOLOGY_FILE_NAME = 'terminology.json';
 export const PROJECTS_DIR_NAME = 'projects';
+export const JOBS_DIR_NAME = 'jobs';
 export const ANCHORS_DIR_NAME = 'anchors';
 export const MANIFEST_FILE_NAME = 'manifest.json';
 export const JSON_FILE_EXT = '.json';
@@ -92,21 +94,21 @@ function isProjectUuidFileName(fileName) {
   return PROJECT_ID_PATTERN.test(id);
 }
 
-async function collectProjectBackupFiles(projectsDir, backupProjectsDir) {
+async function collectDirectoryJsonBackupFiles(sourceDir, backupSubDir, relDirName) {
   try {
-    const entries = await readdir(projectsDir);
+    const entries = await readdir(sourceDir);
     const jsonFiles = entries.filter(name => name.endsWith(JSON_FILE_EXT));
     const records = [];
     for (const fileName of jsonFiles) {
-      const src = path.join(projectsDir, fileName);
-      const dst = path.join(backupProjectsDir, fileName);
-      const rel = path.join(PROJECTS_DIR_NAME, fileName);
+      const src = path.join(sourceDir, fileName);
+      const dst = path.join(backupSubDir, fileName);
+      const rel = path.join(relDirName, fileName);
       records.push(await copyBackupEntry(src, dst, rel));
     }
     return records;
   } catch (error) {
     if (error?.code === 'ENOENT') return [];
-    throw new StorageError('Failed to read projects directory for backup.', error);
+    throw new StorageError(`Failed to read ${relDirName} directory for backup.`, error);
   }
 }
 
@@ -156,11 +158,17 @@ export async function createStorageBackup({ dataDir, backupDirName = STORAGE_BAC
   const backupPath = resolveSafeRelPath(rootDir, path.join(backupDirName, backupId));
   await mkdir(backupPath, { recursive: true });
   const rootFiles = await copyRootConfigFiles(rootDir, backupPath);
-  const projFiles = await collectProjectBackupFiles(
+  const projFiles = await collectDirectoryJsonBackupFiles(
     path.join(rootDir, PROJECTS_DIR_NAME),
-    path.join(backupPath, PROJECTS_DIR_NAME)
+    path.join(backupPath, PROJECTS_DIR_NAME),
+    PROJECTS_DIR_NAME
   );
-  const files = [...rootFiles, ...projFiles];
+  const jobFiles = await collectDirectoryJsonBackupFiles(
+    path.join(rootDir, JOBS_DIR_NAME),
+    path.join(backupPath, JOBS_DIR_NAME),
+    JOBS_DIR_NAME
+  );
+  const files = [...rootFiles, ...projFiles, ...jobFiles];
   await verifyBackupFiles(backupPath, files);
   const manifest = { timestamp: new Date().toISOString(), sourceDataDir: rootDir, files };
   await writeAtomicFile(path.join(backupPath, MANIFEST_FILE_NAME), JSON.stringify(manifest, null, 2));
@@ -628,6 +636,27 @@ async function verifyProjectsIntegrity(rootDir, issues) {
   }
 }
 
+async function checkSingleJobIntegrity(jobsDir, fileName, issues) {
+  try {
+    const parsed = await safeReadJson(path.join(jobsDir, fileName));
+    if (parsed) normalizeProductionJob(parsed);
+  } catch (error) {
+    issues.push(`Job file corruption for ${fileName}: ${error.message}`);
+  }
+}
+
+async function verifyJobsIntegrity(rootDir, issues) {
+  const jobsDir = path.join(rootDir, JOBS_DIR_NAME);
+  try {
+    const entries = await readdir(jobsDir);
+    for (const fileName of entries.filter(isProjectUuidFileName)) {
+      await checkSingleJobIntegrity(jobsDir, fileName, issues);
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') issues.push(`Jobs scan error: ${error.message}`);
+  }
+}
+
 /**
  * Verifies storage data preservation and file integrity.
  * Inputs: spec ({ dataDir: string }).
@@ -644,5 +673,6 @@ export async function verifyStorageIntegrity({ dataDir }) {
   await verifyGlossaryIntegrity(rootDir, issues);
   await verifyTerminologyIntegrity(rootDir, issues);
   await verifyProjectsIntegrity(rootDir, issues);
+  await verifyJobsIntegrity(rootDir, issues);
   return { valid: issues.length === 0, issues };
 }

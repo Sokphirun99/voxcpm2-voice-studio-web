@@ -16,6 +16,7 @@ import { normalizeTerminologyList } from '../src/domain/terminology.js';
 import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
 import { createProjectStore, assertSafeProjectId, resolveSafeProjectPath } from './projectStore.js';
 import { createAssetStore } from './assetStore.js';
+import { createJobStore } from './jobStore.js';
 import {
   runStorageMigrations,
   verifyStorageIntegrity,
@@ -52,6 +53,7 @@ const DEFAULT_AUDIO_MIME = 'audio/wav';
 const OCTET_STREAM_MIME = 'application/octet-stream';
 const PROJECTS_DIR_NAME = 'projects';
 const ASSETS_DIR_NAME = 'assets';
+const JOBS_DIR_NAME = 'jobs';
 
 
 /**
@@ -605,10 +607,11 @@ async function readVolumeCapacity(rootDir) {
  * @returns {Promise<object>} Storage usage statistics.
  */
 async function readStoreStats(ctx) {
-  const [catalog, cacheIndex, capacity] = await Promise.all([
+  const [catalog, cacheIndex, capacity, jobsPage] = await Promise.all([
     loadCatalog(ctx.catalogPath),
     loadCacheIndex(ctx.cacheIndexPath),
     readVolumeCapacity(ctx.rootDir),
+    ctx.jobStore.listJobs({ limit: 1, offset: 0 }),
   ]);
   const characters = Object.values(catalog.characters || {}).filter(item => item && !item.deleted_at);
   const anchors = Object.values(catalog.anchors || {}).filter(item => item && !item.deleted_at);
@@ -623,6 +626,8 @@ async function readStoreStats(ctx) {
     maxCacheEntries: ctx.maxCacheEntries,
     cacheBytes,
     usedBytes: anchorBytes + cacheBytes,
+    jobsCount: jobsPage?.summary?.total ?? 0,
+    activeJobsCount: jobsPage?.summary?.active ?? 0,
     ...capacity,
   };
 }
@@ -644,6 +649,7 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
   const cacheIndexPath = path.join(rootDir, CACHE_INDEX_FILE_NAME);
   const projectsDir = path.join(rootDir, PROJECTS_DIR_NAME);
   const assetsDir = path.join(rootDir, ASSETS_DIR_NAME);
+  const jobsDir = path.join(rootDir, JOBS_DIR_NAME);
   const glossaryPath = path.join(rootDir, GLOSSARY_FILE_NAME);
   const terminologyPath = path.join(rootDir, TERMINOLOGY_FILE_NAME);
   let writeChain = Promise.resolve();
@@ -654,6 +660,7 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
   };
   const projectStore = createProjectStore({ projectsDir, enqueueWrite });
   const assetStore = createAssetStore({ assetsDir, dataDir: rootDir, enqueueWrite });
+  const jobStore = createJobStore({ jobsDir, dataDir: rootDir, enqueueWrite });
   let initPromise = null;
   const init = () => {
     if (!initPromise) {
@@ -662,6 +669,7 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
         await mkdir(cacheDir, { recursive: true });
         await projectStore.init();
         await assetStore.init();
+        await jobStore.init();
         if (autoMigrate) {
           await runStorageMigrations({ dataDir: rootDir });
         }
@@ -673,12 +681,13 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     }
     return initPromise;
   };
-  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, terminologyPath, maxCacheEntries, enqueueWrite, init };
+  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, terminologyPath, jobStore, maxCacheEntries, enqueueWrite, init };
   return {
     init,
     dataDir: rootDir,
     projectStore,
     assetStore,
+    jobStore,
     migrate: options => enqueueWrite(() => runStorageMigrations({ dataDir: rootDir, ...options })),
     verifyIntegrity: () => verifyStorageIntegrity({ dataDir: rootDir }),
     detectMigrations: () => detectStorageMigrationsNeeded({ dataDir: rootDir }),
@@ -706,6 +715,16 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     deleteAsset: (rawId, options) => assetStore.deleteAsset(rawId, options),
     listAssets: query => assetStore.listAssets(query),
     purgeDeletedAssets: options => assetStore.purgeDeletedAssets(options),
+    enqueueJob: input => jobStore.enqueueJob(input),
+    getJob: rawId => jobStore.getJob(rawId),
+    listJobs: query => jobStore.listJobs(query),
+    updateJob: (rawId, patch, options) => jobStore.updateJob(rawId, patch, options),
+    cancelJob: (rawId, options) => jobStore.cancelJob(rawId, options),
+    retryJob: (rawId, options) => jobStore.retryJob(rawId, options),
+    interruptJob: (rawId, options) => jobStore.interruptJob(rawId, options),
+    recoverInterruptedJobs: () => jobStore.recoverInterruptedJobs(),
+    deleteJob: (rawId, options) => jobStore.deleteJob(rawId, options),
+    clearHistory: () => jobStore.clearHistory(),
     getGlossary: () => readGlossaryFile(glossaryPath),
     replaceGlossary: rawRules => replaceGlossaryRecord(ctx, rawRules),
     getTerminology: () => readTerminologyFile(terminologyPath),

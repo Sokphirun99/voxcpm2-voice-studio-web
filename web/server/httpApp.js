@@ -12,6 +12,7 @@ import { createServerLogger } from './logger.js';
 import { createRateLimiter } from './rateLimiter.js';
 import { handleProjectRoutes } from './projectRoutes.js';
 import { handleAssetRoutes } from './assetRoutes.js';
+import { handleJobRoutes } from './jobRoutes.js';
 
 export const MAX_JSON_BODY_BYTES = 256 * 1024;
 export const MAX_MULTIPART_BODY_BYTES = 22 * 1024 * 1024;
@@ -171,7 +172,9 @@ function mapErrorToHttp(error) {
     return { status: 409, code: error.code || 'REVISION_CONFLICT', message: error.message };
   }
   if (error instanceof ValidationError) {
-    const status = error.code === 'UNSUPPORTED_AUDIO_TYPE' ? 415 : 422;
+    let status = 422;
+    if (error.code === 'UNSUPPORTED_AUDIO_TYPE') status = 415;
+    else if (error.code === 'JOB_QUEUE_FULL') status = 429;
     return { status, code: error.code || 'VALIDATION_ERROR', message: error.message, field: error.field };
   }
   if (error instanceof StorageError) return { status: 500, code: error.code || 'STORAGE_ERROR', message: error.message };
@@ -446,6 +449,7 @@ async function routeApiRequest(ctx) {
     || (await handleAnchorRoutes(ctx))
     || (await handleProjectRoutes(ctx))
     || (await handleAssetRoutes(ctx))
+    || (await handleJobRoutes(ctx))
     || (await handleGlossaryRoutes(ctx))
     || (await handleTerminologyRoutes(ctx))
     || (await handleAudioMasterRoute(ctx))
@@ -460,12 +464,15 @@ function assertSafePathSegments(rawPath) {
   if (/^\/api\/v1\/assets\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
     throw new HttpApiError(400, 'INVALID_ASSET_ID', 'Asset id must be a UUID.');
   }
+  if (/^\/api\/v1\/jobs\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
+    throw new HttpApiError(400, 'INVALID_JOB_ID', 'Job id must be a UUID.');
+  }
 }
 
 function handleDispatchError({ res, error, url, method, requestId, logger }) {
   const mapped = mapErrorToHttp(error);
   const retryHeader = mapped.status === 429 ? { 'Retry-After': String(error?.retryAfterSeconds || 60) } : {};
-  const extraHeaders = mapped.status === 405 ? { Allow: 'GET, PUT' } : retryHeader;
+  const extraHeaders = mapped.status === 405 ? { Allow: error?.allow || 'GET, PUT' } : retryHeader;
   logger.error('HTTP request failed', { method, path: url.pathname, status: mapped.status, code: mapped.code, errorMessage: error?.message }, requestId);
   const errorBody = { code: mapped.code, message: mapped.message, ...(mapped.field ? { field: mapped.field } : {}) };
   if (!res.headersSent) sendJson({ res, status: mapped.status, payload: { data: null, error: errorBody }, requestId, headers: extraHeaders });

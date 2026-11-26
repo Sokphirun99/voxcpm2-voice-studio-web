@@ -11,9 +11,11 @@ import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useNotifications } from '../hooks/useNotifications.js';
 import { useOfflineReadiness } from '../hooks/useOfflineReadiness.js';
+import { useProductionJobs } from '../hooks/useProductionJobs.js';
 import { useGlobalTerminology } from '../hooks/useTerminology.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
+import { BatchJobsWorkspace } from './BatchJobsWorkspace.jsx';
 import { Icon } from './Icon.jsx';
 import { ModelsSetupWorkspace } from './ModelsSetupWorkspace.jsx';
 import { ProjectsWorkspace } from './ProjectsWorkspace.jsx';
@@ -208,6 +210,40 @@ export function Studio() {
   const handleOpenProject = useCallback(project => {
     void openWorkspaceProject({ project, repo: services?.projectRepository, logger: services?.logger, ttsRef, subtitlesRef, setActiveWorkspace });
   }, [services, setActiveWorkspace]);
+  const handleOpenProjectById = useCallback(async projectId => {
+    if (!projectId || !services?.projectRepository) return;
+    try {
+      const project = await services.projectRepository.getProject(projectId);
+      if (!project) {
+        notifications.notify({ kind: 'error', title: 'Project not found', message: 'This batch job project was deleted or is unavailable.' });
+        return;
+      }
+      await openWorkspaceProject({ project, repo: services.projectRepository, logger: services.logger, ttsRef, subtitlesRef, setActiveWorkspace });
+    } catch (err) {
+      services?.logger?.error?.('Studio.handleOpenProjectById', err, { projectId });
+      notifications.notify({ kind: 'error', title: 'Could not open project', message: err?.message || 'Project failed to load.' });
+    }
+  }, [services, setActiveWorkspace, notifications]);
+  const syncProjectFromJob = useCallback(async job => {
+    if (!job) return;
+    if (job.type === 'subtitle_voiceover') {
+      void subtitlesRef.current?.syncVoiceoverJob?.(job);
+    }
+    if (!job.projectId || !services?.projectRepository) return;
+    try {
+      const updatedProject = await services.projectRepository.getProject(job.projectId);
+      if (!updatedProject) return;
+      ttsRef.current?.reloadProjectIfActive?.(job.projectId, updatedProject);
+      subtitlesRef.current?.reloadProjectIfActive?.(job.projectId, updatedProject);
+    } catch (err) {
+      services?.logger?.error?.('Studio.syncProjectFromJob', err, { projectId: job.projectId, jobId: job.id });
+    }
+  }, [services]);
+  const productionJobs = useProductionJobs({
+    onNotify: notifications.notify,
+    onJobCompleted: job => { void syncProjectFromJob(job); },
+    onProjectUpdated: job => { void syncProjectFromJob(job); },
+  });
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
   const { readiness: offlineReadiness } = useOfflineReadiness({ gateway: services?.diagnosticsGateway });
@@ -219,7 +255,7 @@ export function Studio() {
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
   });
-  const canAutoReload = !ttsState.libraryOpen && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
+  const canAutoReload = !ttsState.libraryOpen && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo && !(productionJobs.summary.active > 0);
   const versionCheck = useAppVersionCheck({ canAutoReload });
   const ttsNotices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
   const updateBanner = <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />;
@@ -238,6 +274,7 @@ export function Studio() {
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
     globalTerminology,
+    productionJobs,
   };
 
   const subtitleVoiceCatalog = useMemo(() => ({
@@ -253,6 +290,7 @@ export function Studio() {
         activeWorkspace={activeWorkspace}
         workspaces={DEFAULT_WORKSPACES}
         onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
+        jobsBadgeCount={productionJobs.badgeCount}
         soundMuted={notifications.soundMuted}
         onToggleSoundMuted={notifications.toggleSoundMuted}
       />
@@ -271,6 +309,7 @@ export function Studio() {
           hidden={activeWorkspace !== 'subtitles'}
           voiceCatalog={subtitleVoiceCatalog}
           globalTerminology={globalTerminology}
+          productionJobs={productionJobs}
           actionsRef={subtitlesRef}
           onRefreshEngine={refreshEngine}
           onSendToTts={handleSendToTts}
@@ -279,6 +318,12 @@ export function Studio() {
           onUnlockSound={notifications.unlockSound}
           offlineReadiness={offlineReadiness}
           onSelectModels={handleSelectModels}
+        />
+        <BatchJobsWorkspace
+          hidden={activeWorkspace !== 'jobs'}
+          controller={productionJobs}
+          onOpenProjectById={handleOpenProjectById}
+          onNotify={notifications.notify}
         />
         <ModelsSetupWorkspace
           hidden={activeWorkspace !== 'models'}

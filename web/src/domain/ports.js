@@ -50,6 +50,20 @@
  */
 
 /**
+ * @typedef {object} JobRepositoryPort
+ * @property {(query?: { limit?: number, offset?: number, status?: string, type?: string, projectId?: string }) => Promise<{ items: Array<object>, total: number, limit: number, offset: number, hasMore: boolean, summary?: object }>} listJobs
+ * @property {(id: string) => Promise<object|null>} getJob
+ * @property {(spec: object) => Promise<{ job: object, evictedIds?: string[] }>} enqueueJob
+ * @property {(id: string, patch: object, options?: { expectedRevision?: number }) => Promise<{ job: object }>} updateJob
+ * @property {(id: string, options?: { finalize?: boolean, expectedRevision?: number }) => Promise<{ job: object }>} cancelJob
+ * @property {(id: string, options?: { expectedRevision?: number }) => Promise<{ job: object }>} retryJob
+ * @property {(id: string, options?: { reason?: string, expectedRevision?: number }) => Promise<{ job: object }>} interruptJob
+ * @property {() => Promise<{ recoveredCount: number, jobs: Array<object> }>} recoverInterruptedJobs
+ * @property {(id: string, options?: { expectedRevision?: number }) => Promise<{ deleted: boolean, id: string }>} deleteJob
+ * @property {() => Promise<{ clearedCount: number }>} clearHistory
+ */
+
+/**
  * @typedef {object} GlossaryRepositoryPort
  * @property {() => Promise<Array<{ id: string, source: string, replacement: string, enabled: boolean }>>} loadRules
  * @property {(rules: Array<object>) => Promise<{ rules: Array<object>, localOnly: boolean }>} [saveRules]

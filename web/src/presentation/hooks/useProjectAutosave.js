@@ -419,6 +419,8 @@ export function useProjectAutosave({
     revision,
     projectId,
     lastSavedAt,
+    getProjectId: () => projectIdRef.current || null,
+    hasUnsavedChanges: () => dirtyRef.current,
     saveNow,
     retry,
     markDirty,

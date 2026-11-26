@@ -609,6 +609,226 @@ function useDubExportAction({
  * @param {object} config - Hook configuration.
  * @returns {object} Subtitle voiceover controller.
  */
+function buildSubtitleJobItems({ targets, activeCharacter, anchorTag, pronunciationSignature, existingClips }) {
+  const items = [];
+  const artifacts = [];
+  for (let i = 0; i < targets.length; i += 1) {
+    const { seg, text } = targets[i];
+    const sig = buildSubtitleSpeechSignature({ text, characterId: activeCharacter.id, anchorTag, pronunciationTag: pronunciationSignature });
+    const existing = existingClips?.[seg.id];
+    const isReady = Boolean(existing?.signature === sig && existing?.blob);
+    const assetId = isReady ? (existing.audioAssetId || null) : null;
+    items.push({
+      itemId: seg.id,
+      segmentId: seg.id,
+      label: `Frame #${i + 1}`,
+      status: isReady ? 'completed' : 'pending',
+      inputSignature: sig,
+      outputAssetId: assetId,
+      metadata: { text, voiceId: activeCharacter.id, signature: sig },
+    });
+    if (isReady && assetId) {
+      artifacts.push({ itemId: seg.id, segmentId: seg.id, assetId, kind: 'audio', fileName: `frame-${String(i + 1).padStart(2, '0')}.wav`, mimeType: 'audio/wav', durationSeconds: existing.durationSeconds ?? null, signature: sig });
+    }
+  }
+  return { items, artifacts };
+}
+
+async function uploadSubtitleFrameAsset({ assetRepository, recording, segId, idx, projectId, logger }) {
+  if (!assetRepository?.uploadAsset || !recording?.blob) return { outputAssetId: null, artifact: null };
+  const fileName = `frame-${String(idx + 1).padStart(2, '0')}.wav`;
+  try {
+    const uploaded = await assetRepository.uploadAsset({
+      bytes: recording.blob,
+      fileName,
+      kind: 'audio',
+      mimeType: recording.blob.type || 'audio/wav',
+      projectId: projectId || undefined,
+    });
+    const assetId = uploaded?.asset?.id || null;
+    if (!assetId) return { outputAssetId: null, artifact: null };
+    return {
+      outputAssetId: assetId,
+      artifact: { itemId: segId, segmentId: segId, assetId, takeId: recording.id || null, kind: 'audio', fileName, mimeType: recording.blob.type || 'audio/wav', sizeBytes: recording.blob.size || 0 },
+    };
+  } catch (err) {
+    logger?.warn?.('useSubtitleVoiceover.uploadSubtitleFrameAsset', err?.message || 'Could not persist subtitle frame audio asset');
+    return { outputAssetId: null, artifact: null };
+  }
+}
+
+function syncTrackedJobUi(productionJobs, job) {
+  if (job && productionJobs?.syncJob) productionJobs.syncJob(job);
+  else if (productionJobs?.refreshJobs) void productionJobs.refreshJobs();
+}
+
+async function startTrackedSubtitleJob({ jobRepository, spec, workerSessionId, productionJobs, logger }) {
+  if (!jobRepository?.enqueueJob) return null;
+  let createdId = null;
+  try {
+    const { job: created } = await jobRepository.enqueueJob(spec);
+    createdId = created.id;
+    await jobRepository.updateJob(created.id, { action: 'prepare', workerSessionId });
+    const started = (await jobRepository.updateJob(created.id, { action: 'start', workerSessionId }))?.job;
+    syncTrackedJobUi(productionJobs, started || created);
+    return created.id;
+  } catch (err) {
+    logger?.error?.('useSubtitleVoiceover.startTrackedSubtitleJob', err, { type: spec?.type, createdId });
+    if (createdId && jobRepository?.cancelJob) {
+      await jobRepository.cancelJob(createdId, { finalize: true }).catch(cleanupErr => {
+        logger?.warn?.('useSubtitleVoiceover.cleanupOrphanedJob', cleanupErr?.message || 'Could not cancel partially created job', { createdId });
+      });
+    }
+    return null;
+  }
+}
+
+async function finalizeTrackedSubtitleJob({ jobRepository, jobId, outcome, err, productionJobs, logger }) {
+  if (!jobRepository || !jobId) return;
+  let finalJob = null;
+  try {
+    if (outcome === 'completed') finalJob = (await jobRepository.updateJob(jobId, { action: 'complete' }))?.job;
+    else if (outcome === 'interrupted') {
+      finalJob = (await jobRepository.interruptJob(jobId, {
+        reason: 'Interrupted before completion. Retry to resume remaining frames.',
+      }))?.job;
+    } else if (outcome === 'cancelled') finalJob = (await jobRepository.cancelJob(jobId, { finalize: true }))?.job;
+    else finalJob = (await jobRepository.updateJob(jobId, { action: 'fail', code: err?.code || 'VOICEOVER_ERROR', message: err?.message || 'Subtitle voiceover failed.' }))?.job;
+  } catch (updateErr) {
+    logger?.error?.('useSubtitleVoiceover.finalizeTrackedSubtitleJob', updateErr, { jobId, outcome });
+  } finally {
+    syncTrackedJobUi(productionJobs, finalJob);
+  }
+}
+
+const SUBTITLE_JOB_HEARTBEAT_MS = 10_000;
+
+async function assertSubtitleJobNotCancelled({ jobRepository, jobId, signal, logger }) {
+  if (signal?.aborted) throw new SynthesisCancelledError();
+  if (!jobRepository || !jobId) return;
+  const res = await jobRepository.getJob(jobId).catch(err => {
+    logger?.debug?.('useSubtitleVoiceover.assertSubtitleJobNotCancelled', err?.message || 'Could not poll job status', { jobId });
+    return null;
+  });
+  const status = (res?.job ?? res)?.status;
+  if (status === 'cancel_requested' || status === 'cancelled') throw new SynthesisCancelledError();
+}
+
+function startSubtitleJobHeartbeat({ jobRepository, jobId, workerSessionId, controller, userCancelledRef, productionJobs, logger }) {
+  if (!jobRepository?.updateJob || !jobId) return undefined;
+  const timer = globalThis.setInterval?.(() => {
+    void jobRepository.updateJob(jobId, { action: 'heartbeat', workerSessionId })
+      .then(res => {
+        const latest = res?.job;
+        if (!latest) return;
+        syncTrackedJobUi(productionJobs, latest);
+        if (latest.status === 'cancel_requested' || latest.status === 'cancelled') {
+          if (userCancelledRef) userCancelledRef.current = true;
+          controller?.abort();
+        }
+      })
+      .catch(err => {
+        logger?.debug?.('useSubtitleVoiceover.heartbeat', err?.message || 'Heartbeat skipped', { jobId });
+      });
+  }, SUBTITLE_JOB_HEARTBEAT_MS);
+  timer?.unref?.();
+  return timer;
+}
+
+function createTrackedSubtitleSpec({ targets, projectTitle, videoFile, projectId, activeCharacter, items, artifacts, lockedSeeds, terminology, speechLanguage }) {
+  return {
+    type: 'subtitle_voiceover',
+    title: `${projectTitle || videoFile?.name || 'Subtitle Voiceover'} (${targets.length} frames)`,
+    projectId: projectId || null,
+    projectTitle: projectTitle || videoFile?.name || '',
+    items,
+    artifacts,
+    metadata: {
+      sourceWorkspace: 'subtitles',
+      voiceId: activeCharacter.id,
+      seed: lockedSeeds?.[activeCharacter.id] ?? '',
+      terminology,
+      speechLanguage,
+    },
+  };
+}
+
+async function processTrackedSubtitleTarget(ctx) {
+  const { target, idx, total, trackedJobId, workerSessionId, signal, session } = ctx;
+  const { seg, text } = target;
+  const sig = buildSubtitleSpeechSignature({
+    text, characterId: ctx.activeCharacter.id, anchorTag: ctx.anchorTag, pronunciationTag: ctx.pronunciationSignature,
+  });
+  const existing = ctx.segmentClipsRef.current[seg.id];
+  if (existing?.signature === sig && existing?.blob) {
+    ctx.setBatchProgress({ completed: idx + 1, total, currentSegmentId: seg.id });
+    if (trackedJobId && !existing.audioAssetId) {
+      const { outputAssetId, artifact } = await uploadSubtitleFrameAsset({
+        assetRepository: ctx.assetRepository,
+        recording: { blob: existing.blob, id: existing.takeId || null },
+        segId: seg.id,
+        idx,
+        projectId: ctx.projectId,
+        logger: ctx.logger,
+      });
+      if (outputAssetId) {
+        ctx.storeClip(seg.id, { ...existing, audioAssetId: outputAssetId });
+      }
+      const updated = (await ctx.jobRepository.updateJob(trackedJobId, {
+        action: 'item_complete',
+        itemId: seg.id,
+        outputAssetId,
+        durationSeconds: existing.durationSeconds ?? null,
+        artifact: artifact ? { ...artifact, durationSeconds: existing.durationSeconds ?? null, signature: sig } : undefined,
+      }).catch(err => {
+        ctx.logger?.debug?.('useSubtitleVoiceover.syncCachedItem', err?.message || 'Could not update cached item', { trackedJobId, segId: seg.id });
+        return null;
+      }))?.job;
+      if (updated) syncTrackedJobUi(ctx.productionJobs, updated);
+    }
+    return;
+  }
+  ctx.setGeneratingSegmentId(seg.id);
+  ctx.setBatchProgress({ completed: idx, total, currentSegmentId: seg.id });
+  ctx.onStatus?.({ message: `Generating voice ${idx + 1} of ${total} (${ctx.activeCharacter.name})…`, error: false });
+  if (trackedJobId) {
+    await ctx.jobRepository.updateJob(trackedJobId, { action: 'item_start', itemId: seg.id, workerSessionId }).catch(err => {
+      ctx.logger?.debug?.('useSubtitleVoiceover.itemStart', err?.message || 'Could not mark item running', { trackedJobId, segId: seg.id });
+    });
+  }
+  const res = await synthesizeOneFrame({
+    synthesizeSpeech: ctx.synthesizeSpeech, text, character: ctx.activeCharacter, anchor: session.anchor,
+    cachedUpload: session.upload, seed: ctx.seed, terminology: ctx.terminology, speechLanguage: ctx.speechLanguage, signal,
+    onReferenceUploaded: fileData => {
+      session.upload = fileData;
+      if (ctx.activeAnchor) ctx.cachedUploadsRef.current[ctx.activeCharacter.id] = fileData;
+    },
+  });
+  if (!session.anchor && res.recording?.anchorBlob) {
+    session.anchor = { characterId: ctx.activeCharacter.id, blob: res.recording.anchorBlob, exactClone: false };
+    session.upload = res.uploadedFileData || session.upload;
+  }
+  if (signal?.aborted) throw new SynthesisCancelledError();
+  const durationSeconds = await resolveRecordingDuration(res.recording);
+  const { outputAssetId, artifact } = await uploadSubtitleFrameAsset({
+    assetRepository: ctx.assetRepository, recording: res.recording, segId: seg.id, idx, projectId: ctx.projectId, logger: ctx.logger,
+  });
+  ctx.storeClip(seg.id, {
+    ...buildClipRecord({ recording: res.recording, text, character: ctx.activeCharacter, signature: sig, durationSeconds }),
+    ...(outputAssetId ? { audioAssetId: outputAssetId } : {}),
+  });
+  if (trackedJobId) {
+    const updated = (await ctx.jobRepository.updateJob(trackedJobId, {
+      action: 'item_complete', itemId: seg.id, outputAssetId, takeId: res.recording?.id || null, durationSeconds, seed: res.recording?.seed ?? null,
+      artifact: artifact ? { ...artifact, durationSeconds, signature: sig } : undefined,
+    }).catch(err => {
+      ctx.logger?.warn?.('useSubtitleVoiceover.itemComplete', err?.message || 'Could not record completed frame', { trackedJobId, segId: seg.id });
+      return null;
+    }))?.job;
+    if (updated) syncTrackedJobUi(ctx.productionJobs, updated);
+  }
+}
+
 export function useSubtitleVoiceover({
   segments = [],
   useTranslation = false,
@@ -622,12 +842,15 @@ export function useSubtitleVoiceover({
   terminology = null,
   pronunciationSignature = '',
   speechLanguage = '',
+  projectId = '',
+  projectTitle = '',
+  productionJobs = null,
   onStatus,
   onNotify,
   onUnlockSound,
   onEngineFailure,
 } = {}) {
-  const { synthesizeSpeech, mediaSubtitleGateway, audioMaster, logger } = useStudioServices();
+  const { synthesizeSpeech, mediaSubtitleGateway, audioMaster, logger, jobRepository = null, assetRepository = null } = useStudioServices();
   const characters = useMemo(
     () => (voiceCatalog?.characters?.length ? voiceCatalog.characters : BUILT_IN_VOICES),
     [voiceCatalog?.characters]
@@ -662,9 +885,13 @@ export function useSubtitleVoiceover({
 
   const segmentClipsRef = useRef(segmentClips);
   segmentClipsRef.current = segmentClips;
+  const segmentsRef = useRef(segments);
+  segmentsRef.current = segments;
   const clipUrlsRef = useRef(new Map());
   const cachedUploadsRef = useRef({});
   const abortRef = useRef(null);
+  const mountedRef = useRef(true);
+  const userCancelledRef = useRef(false);
 
   const { selectedIds, toggleSelectSegment, toggleSelectAll, clearSelection } = useVoiceSelectionState(segments);
   const { togglePlaySegment, stopPlayback } = useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, logger });
@@ -752,10 +979,14 @@ export function useSubtitleVoiceover({
     });
   }, [segments]);
 
-  useEffect(() => () => {
-    abortRef.current?.abort();
-    for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
-    clipUrlsRef.current.clear();
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+      for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
+      clipUrlsRef.current.clear();
+    };
   }, []);
 
   const isClipStale = useCallback(segment => {
@@ -852,6 +1083,129 @@ export function useSubtitleVoiceover({
     }
   }, [alignedClip, isAlignmentSettled, segments, selectedIds, segmentClips, effectiveTotalDuration, audioMaster, spillApprovals, logger, videoFile, exportMismatchReport, onStatus, onNotify]);
 
+  const generateSelectedVoicesTracked = useCallback(async () => {
+    const targets = selectOrderedSegments(segments, selectedIds)
+      .map(seg => ({ seg, text: resolveSubtitleSpeechText(seg, useTranslation) }))
+      .filter(item => Boolean(item.text));
+    if (!targets.length) return synthesis.generateSelectedVoices();
+    if (abortRef.current || !synthesizeSpeech?.execute) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    userCancelledRef.current = false;
+    onUnlockSound?.();
+    setVoiceBusy(true);
+    setGeneratingSegmentId(targets[0].seg.id);
+    setBatchProgress({ completed: 0, total: targets.length, currentSegmentId: targets[0].seg.id });
+    const { items, artifacts } = buildSubtitleJobItems({
+      targets, activeCharacter, anchorTag, pronunciationSignature, existingClips: segmentClipsRef.current,
+    });
+    const workerSessionId = productionJobs?.workerSessionId || 'subtitle-fg';
+    let trackedJobId = null;
+    let heartbeat;
+    try {
+      trackedJobId = await startTrackedSubtitleJob({
+        jobRepository, workerSessionId, productionJobs, logger,
+        spec: createTrackedSubtitleSpec({ targets, projectTitle, videoFile, projectId, activeCharacter, items, artifacts, lockedSeeds, terminology, speechLanguage }),
+      });
+      if (controller.signal.aborted || !mountedRef.current) throw new SynthesisCancelledError();
+      heartbeat = startSubtitleJobHeartbeat({
+        jobRepository, jobId: trackedJobId, workerSessionId, controller, userCancelledRef, productionJobs, logger,
+      });
+      if (trackedJobId) {
+        productionJobs?.registerAbortHandler?.(trackedJobId, () => {
+          userCancelledRef.current = true;
+          controller.abort();
+        });
+      }
+      const session = { anchor: activeAnchor, upload: cachedUploadsRef.current[activeCharacter.id] || null };
+      for (let i = 0; i < targets.length; i += 1) {
+        await assertSubtitleJobNotCancelled({ jobRepository, jobId: trackedJobId, signal: controller.signal, logger });
+        await processTrackedSubtitleTarget({
+          target: targets[i], idx: i, total: targets.length, trackedJobId, workerSessionId,
+          signal: controller.signal, session, activeCharacter, anchorTag, pronunciationSignature,
+          segmentClipsRef, setBatchProgress, setGeneratingSegmentId, onStatus, jobRepository,
+          synthesizeSpeech, seed: lockedSeeds?.[activeCharacter.id] ?? '', terminology, speechLanguage,
+          activeAnchor, cachedUploadsRef, assetRepository, projectId, storeClip, productionJobs, logger,
+        });
+      }
+      await assertSubtitleJobNotCancelled({ jobRepository, jobId: trackedJobId, signal: controller.signal, logger });
+      await finalizeTrackedSubtitleJob({ jobRepository, jobId: trackedJobId, outcome: 'completed', productionJobs, logger });
+      const summary = `Voice ready for ${targets.length} selected ${targets.length === 1 ? 'frame' : 'frames'} (${activeCharacter.name}).`;
+      onStatus?.({ message: summary, error: false });
+      onNotify?.({ kind: 'success', title: 'Selected voiceover ready', message: summary });
+    } catch (err) {
+      if (isCancellationError(err) || controller.signal.aborted) {
+        const outcome = !mountedRef.current && !userCancelledRef.current ? 'interrupted' : 'cancelled';
+        await finalizeTrackedSubtitleJob({ jobRepository, jobId: trackedJobId, outcome, productionJobs, logger });
+        if (mountedRef.current) onStatus?.({ message: 'Voiceover generation cancelled.', error: false });
+        return;
+      }
+      await finalizeTrackedSubtitleJob({ jobRepository, jobId: trackedJobId, outcome: 'failed', err, productionJobs, logger });
+      logger?.error?.('useSubtitleVoiceover.generateSelectedVoices', err);
+      const msg = err?.message || 'Could not generate selected subtitle voiceover.';
+      if (mountedRef.current) {
+        onStatus?.({ message: msg, error: true });
+        onNotify?.({ kind: 'error', title: 'Subtitle voiceover failed', message: msg });
+      }
+      if (err?.status >= 500 || err?.code === 'ENGINE_UNAVAILABLE') onEngineFailure?.();
+    } finally {
+      if (heartbeat !== undefined) globalThis.clearInterval?.(heartbeat);
+      if (trackedJobId) productionJobs?.registerAbortHandler?.(trackedJobId, null);
+      if (abortRef.current === controller) abortRef.current = null;
+      userCancelledRef.current = false;
+      if (mountedRef.current) {
+        setVoiceBusy(false);
+        setGeneratingSegmentId('');
+        setBatchProgress(null);
+      }
+    }
+  }, [
+    segments, selectedIds, useTranslation, synthesis, activeCharacter, anchorTag, pronunciationSignature,
+    segmentClipsRef, productionJobs, jobRepository, assetRepository, logger, projectTitle, projectId,
+    videoFile, lockedSeeds, terminology, speechLanguage, abortRef, onUnlockSound, setVoiceBusy,
+    setGeneratingSegmentId, setBatchProgress, activeAnchor, cachedUploadsRef, onStatus, synthesizeSpeech,
+    storeClip, onNotify, onEngineFailure,
+  ]);
+
+  const cancelVoiceGeneration = useCallback(() => {
+    userCancelledRef.current = true;
+    synthesis.cancelVoiceGeneration();
+  }, [synthesis]);
+
+  const hydrateClipsFromJob = useCallback(async job => {
+    if (!job || job.type !== 'subtitle_voiceover' || !assetRepository?.getAssetBinary) return 0;
+    const activeIds = new Set((segmentsRef.current || []).map(seg => seg.id));
+    if (activeIds.size === 0) return 0;
+    const artifactByItem = new Map((job.artifacts || []).map(art => [art.itemId || art.segmentId, art]));
+    let hydrated = 0;
+    for (const item of job.items || []) {
+      const segId = item?.segmentId || item?.itemId;
+      const assetId = item?.outputAssetId || artifactByItem.get(segId)?.assetId || null;
+      if (item?.status !== 'completed' || !segId || !assetId || !activeIds.has(segId)) continue;
+      const existing = segmentClipsRef.current[segId];
+      const sig = item.inputSignature || item.metadata?.signature || artifactByItem.get(segId)?.signature || '';
+      if (existing?.blob && (existing.audioAssetId === assetId || (sig && existing.signature === sig))) continue;
+      try {
+        const fetched = await assetRepository.getAssetBinary(assetId);
+        if (!mountedRef.current || !fetched?.bytes) continue;
+        const blob = new Blob([fetched.bytes], { type: fetched.mimeType || 'audio/wav' });
+        const voiceId = item.metadata?.voiceId || job.metadata?.voiceId || activeCharacter.id;
+        const character = findCharacterById(characters, voiceId);
+        const text = item.metadata?.text || '';
+        const durationSeconds = await resolveRecordingDuration({ blob, audioDurationSeconds: item.durationSeconds });
+        const effectiveSig = sig || buildSubtitleSpeechSignature({ text, characterId: character.id, anchorTag, pronunciationTag: pronunciationSignature });
+        storeClip(segId, {
+          ...buildClipRecord({ recording: { blob, seed: item.seed ?? null, audioDurationSeconds: durationSeconds }, text, character, signature: effectiveSig, durationSeconds }),
+          audioAssetId: assetId,
+        });
+        hydrated += 1;
+      } catch (err) {
+        logger?.warn?.('useSubtitleVoiceover.hydrateClipsFromJob', err?.message || 'Could not hydrate subtitle clip from batch job', { segId, assetId, jobId: job.id });
+      }
+    }
+    return hydrated;
+  }, [assetRepository, characters, activeCharacter.id, anchorTag, pronunciationSignature, storeClip, logger]);
+
   return {
     characters,
     anchors,
@@ -890,7 +1244,10 @@ export function useSubtitleVoiceover({
     downloadSegmentVoice,
     downloadCombinedVoice,
     downloadAlignedVoice,
+    hydrateClipsFromJob,
     ...remedies,
     ...synthesis,
+    cancelVoiceGeneration,
+    generateSelectedVoices: jobRepository ? generateSelectedVoicesTracked : synthesis.generateSelectedVoices,
   };
 }

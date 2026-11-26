@@ -268,6 +268,14 @@ const ICON_PATHS = {
       <path d="M4 12C4 13.6569 7.58172 15 12 15C16.4183 15 20 13.6569 20 12" />
     </g>
   ),
+  // Iconoir: stack / layers (Batch Jobs)
+  layers: (
+    <g {...STROKE_STYLE}>
+      <path d="M12 3L3 7.5L12 12L21 7.5L12 3Z" />
+      <path d="M3 12L12 16.5L21 12" />
+      <path d="M3 16.5L12 21L21 16.5" />
+    </g>
+  ),
 };
 
 /**

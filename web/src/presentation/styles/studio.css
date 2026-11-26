@@ -1604,7 +1604,13 @@ a {
   .studio-page .sound-toggle-button { min-height: 36px; padding: 6px 10px; border-radius: 10px; font-size: 12px; }
   .brand-mark { width: 28px; height: 28px; flex-basis: 28px; border-radius: 9px; }
   .brand-mark .studio-icon { width: 17px; height: 17px; }
-  .studio-nav { display: contents; }
+  .studio-nav {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 6px;
+  }
 
   .studio-page .sidebar-item {
     width: 100%;
@@ -1614,9 +1620,6 @@ a {
     font-size: 13px;
     font-weight: 600;
   }
-
-  .studio-page #nav-tts { grid-column: 1; grid-row: 2; }
-  .studio-page #nav-subtitles { grid-column: 2; grid-row: 2; }
 
   .studio-workspace {
     display: flex;
@@ -5408,5 +5411,345 @@ a {
 }
 
 .studio-page .terminology-danger-btn {
+  color: var(--error);
+}
+
+/* ── Batch Jobs workspace & Sidebar badge (R3-07) ─────────────────────────────────────────────── */
+
+.studio-page .nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--action);
+  color: var(--action-text);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.studio-page .jobs-workspace {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--window);
+}
+
+.studio-page .jobs-workspace-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px clamp(14px, 3vw, 24px) 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.studio-page .jobs-filter-bar {
+  padding: 12px clamp(14px, 3vw, 24px);
+  border-bottom: 1px solid var(--line);
+  background: var(--toolbar);
+}
+
+.studio-page .jobs-recovery-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: var(--accent-wash);
+}
+
+.studio-page .jobs-recovery-icon {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.studio-page .jobs-recovery-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+}
+
+.studio-page .jobs-recovery-copy span {
+  color: var(--muted);
+}
+
+.studio-page .jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.studio-page .job-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--editor);
+  transition: border-color 140ms ease;
+}
+
+.studio-page .job-card.status-interrupted {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+
+.studio-page .job-card.status-failed {
+  border-color: color-mix(in srgb, var(--error) 50%, var(--line));
+}
+
+.studio-page .job-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.studio-page .job-card-title-group {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.studio-page .job-card-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.studio-page .job-type-badge {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--control);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.studio-page .job-project-name {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.studio-page .job-card-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studio-page .status-pill {
+  flex-shrink: 0;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--control);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.studio-page .status-pill.status-running,
+.studio-page .status-pill.status-preparing {
+  background: var(--accent-wash);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--accent);
+}
+
+.studio-page .status-pill.status-completed {
+  background: color-mix(in srgb, var(--online) 14%, transparent);
+  border-color: color-mix(in srgb, var(--online) 40%, var(--line));
+  color: var(--online);
+}
+
+.studio-page .status-pill.status-failed {
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+  border-color: color-mix(in srgb, var(--error) 40%, var(--line));
+  color: var(--error);
+}
+
+.studio-page .status-pill.status-interrupted,
+.studio-page .status-pill.status-cancel_requested {
+  background: var(--accent-wash);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  color: var(--accent);
+}
+
+.studio-page .job-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.studio-page .job-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.studio-page .job-attempt-badge {
+  font-size: 11px;
+  color: var(--quiet);
+}
+
+.studio-page .job-progress-track {
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--control);
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+
+.studio-page .job-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.studio-page .job-progress-fill.status-completed {
+  background: var(--online);
+}
+
+.studio-page .job-progress-fill.status-failed {
+  background: var(--error);
+}
+
+.studio-page .job-progress-fill.status-cancelled {
+  background: var(--offline);
+}
+
+.studio-page .job-error-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--error) 35%, var(--line));
+  background: color-mix(in srgb, var(--error) 10%, transparent);
+  color: var(--error);
+  font-size: 12px;
+}
+
+.studio-page .job-artifacts-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.studio-page .job-section-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.studio-page .job-artifacts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.studio-page .job-artifact-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  font-size: 12px;
+}
+
+.studio-page .job-artifact-name {
+  color: var(--text);
+}
+
+.studio-page .job-artifact-download {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.studio-page .job-artifact-download:hover {
+  text-decoration: underline;
+}
+
+.studio-page .job-items-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.studio-page .job-items-toggle {
+  align-self: flex-start;
+  font-size: 12px;
+}
+
+.studio-page .job-items-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.studio-page .job-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.studio-page .job-item-label {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studio-page .job-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.studio-page .job-card-actions .project-delete-btn:hover {
   color: var(--error);
 }

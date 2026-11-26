@@ -26,18 +26,26 @@ function EditorViewToggle({ segmentsCount, effectiveMode, onToggleMode }) {
   );
 }
 
-function EditorSegmentAudioActions({ effectiveMode, hasTakesToRestitch, onRestitchSegments, onExportNarration, disabled }) {
-  if (effectiveMode !== 'segments' || !hasTakesToRestitch) return null;
+function EditorSegmentAudioActions({ effectiveMode, hasTakesToRestitch, onRestitchSegments, onExportNarration, onQueueBatchJob, disabled }) {
+  if (effectiveMode !== 'segments') return null;
+  if (!hasTakesToRestitch && !onQueueBatchJob) return null;
   return (
     <>
-      {onRestitchSegments && (
+      {onQueueBatchJob && (
+        <button type="button" className="button subtle-button" id="queue-tts-batch-btn"
+          onClick={onQueueBatchJob} disabled={disabled}
+          title="Queue pending or outdated segments as a resumable batch job">
+          <Icon name="layers" /><span>Queue batch</span>
+        </button>
+      )}
+      {hasTakesToRestitch && onRestitchSegments && (
         <button type="button" className="button subtle-button" id="restitch-segments"
           onClick={onRestitchSegments} disabled={disabled}
           title="Stitch active segment takes into a single smooth audio track with pauses">
           <Icon name="waveform" /><span>Restitch audio</span>
         </button>
       )}
-      {onExportNarration && (
+      {hasTakesToRestitch && onExportNarration && (
         <button type="button" className="button subtle-button" id="export-narration"
           onClick={onExportNarration} disabled={disabled}
           title="Assemble and download full narration WAV">
@@ -146,6 +154,7 @@ export function ScriptEditor(props) {
           effectiveMode={effectiveMode} onToggleMode={handleToggle}
           onRestitchSegments={props.onRestitchSegments}
           onExportNarration={props.onExportNarration}
+          onQueueBatchJob={props.onQueueBatchJob}
           hasTakesToRestitch={props.hasTakesToRestitch} disabled={props.disabled} />
       </div>
       <EditorContent props={props} effectiveMode={effectiveMode} />
