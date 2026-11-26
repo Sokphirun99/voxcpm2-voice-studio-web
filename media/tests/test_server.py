@@ -1001,3 +1001,171 @@ def test_burn_and_dub_apply_audio_language_metadata_safely(tmp_path: Path) -> No
         },
     )
     assert bad_lang_burn.status_code == 200, bad_lang_burn.text
+
+
+def test_r309_dub_endpoint_original_replace_mix_gains_subtitles_and_silent_video_guards(tmp_path: Path) -> None:
+    import json
+    import shutil
+    from video_io import probe_media_duration, resolve_ffprobe_bin
+
+    ffprobe = resolve_ffprobe_bin()
+    if not Path(ffprobe).exists() and not shutil.which(ffprobe):
+        pytest.skip("ffprobe not installed")
+
+    sample_mp4 = tmp_path / "dub_modes.mp4"
+    _make_sample_mp4(sample_mp4)
+    client = _make_client(tmp_path)
+
+    with open(sample_mp4, "rb") as fh:
+        tr = client.post("/transcribe", files={"file": ("dub_modes.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert tr.status_code == 200
+    tr_body = tr.json()
+    assert tr_body["hasAudioStream"] is True
+    job_id = tr_body["jobId"]
+
+    subs_payload = json.dumps({
+        "segments": [
+            {"id": "seg-1", "start": 0.1, "end": 1.1, "speakerId": "speaker-1", "text": "Hello world", "translatedText": "សួស្តីពិភពលោក"},
+        ],
+        "speakerNames": {"speaker-1": "Host"},
+        "includeSpeaker": True,
+        "useTranslation": True,
+        "bilingual": True,
+        "subtitleLanguage": "khm_Khmr",
+        "videoSize": {"width": 640, "height": 360},
+    })
+
+    # 1. Original audio + Soft embedded subtitles (0 uploaded WAV clips, full 2s duration preserved)
+    orig_soft = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": "[]",
+            "originalAudioMode": "original",
+            "audioLanguage": "en",
+            "originalVolume": "0.85",
+            "subtitleMode": "soft",
+            "subtitles": subs_payload,
+        },
+    )
+    assert orig_soft.status_code == 200, orig_soft.text
+    orig_soft_mp4 = tmp_path / "orig_soft.mp4"
+    orig_soft_mp4.write_bytes(orig_soft.content)
+    assert 1.8 <= probe_media_duration(orig_soft_mp4) <= 2.3
+    soft_probe = json.loads(subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(orig_soft_mp4)], capture_output=True, text=True, check=True).stdout)
+    assert any(s["codec_type"] == "subtitle" and s["codec_name"] == "mov_text" and (s.get("tags") or {}).get("language") == "khm" for s in soft_probe["streams"])
+
+    # Original mode rejects unexpected WAV clips or non-empty metadata rather than silently ignoring them
+    wav_a = _make_wav_bytes(0.4)
+    orig_with_clips = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "s1", "start": 0.1, "end": 0.6, "fileIndex": 0}]), "originalAudioMode": "original"},
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert orig_with_clips.status_code == 400
+
+    # 2. Replacement dubbing (`replace` alias) + Burned ASS subtitles + custom dubVolume
+    rep_burned = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.9, "fileIndex": 0}]),
+            "originalAudioMode": "replace",
+            "dubVolume": "1.2",
+            "audioLanguage": "khm_Khmr",
+            "subtitleMode": "burned",
+            "subtitles": subs_payload,
+        },
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert rep_burned.status_code == 200, rep_burned.text
+    rep_mp4 = tmp_path / "rep_burned.mp4"
+    rep_mp4.write_bytes(rep_burned.content)
+    rep_probe = json.loads(subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(rep_mp4)], capture_output=True, text=True, check=True).stdout)
+    assert not any(s["codec_type"] == "subtitle" for s in rep_probe["streams"])
+    assert any(s["codec_type"] == "audio" and (s.get("tags") or {}).get("language") == "khm" for s in rep_probe["streams"])
+
+    # 3. Ducking mix with custom gains; passing `subtitles` when `subtitleMode == 'none'` fails loudly (400)
+    bad_none_subs = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.9, "fileIndex": 0}]),
+            "originalAudioMode": "duck",
+            "subtitleMode": "none",
+            "subtitles": subs_payload,
+        },
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert bad_none_subs.status_code == 400
+
+    # Out-of-bounds gains or invalid audio/subtitle modes return HTTP 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "stereo"}).status_code == 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "original", "subtitleMode": "vtt"}).status_code == 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "original", "originalVolume": "2.5"}).status_code == 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "original", "duckVolume": "not-a-num"}).status_code == 400
+
+    # 4. Silent video (`hasAudioStream=False`): `/transcribe` registers job, `/dub` rejects `duck`/`keep`/`original` with 422 and succeeds on `replace`
+    silent_mp4 = tmp_path / "silent_vid.mp4"
+    ffmpeg = resolve_ffmpeg_bin()
+    subprocess.run([
+        ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=#111111:s=320x240:d=1.6:r=24",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(silent_mp4),
+    ], check=True, capture_output=True)
+
+    with open(silent_mp4, "rb") as fh:
+        silent_tr = client.post("/transcribe", files={"file": ("silent.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert silent_tr.status_code == 200, silent_tr.text
+    silent_info = silent_tr.json()
+    assert silent_info["hasAudioStream"] is False
+    assert silent_info["isAudioOnly"] is False
+    silent_job_id = silent_info["jobId"]
+
+    for blocked_mode in ("duck", "keep", "original"):
+        res_blocked = client.post(
+            "/dub",
+            data={
+                "jobId": silent_job_id,
+                "metadata": "[]" if blocked_mode == "original" else json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.8, "fileIndex": 0}]),
+                "originalAudioMode": blocked_mode,
+            },
+            files=[] if blocked_mode == "original" else [("files", ("c1.wav", wav_a, "audio/wav"))],
+        )
+        assert res_blocked.status_code == 422, f"Expected 422 for silent video mode {blocked_mode}, got {res_blocked.status_code}"
+
+    silent_replace = client.post(
+        "/dub",
+        data={
+            "jobId": silent_job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.8, "fileIndex": 0}]),
+            "originalAudioMode": "replace",
+        },
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert silent_replace.status_code == 200, silent_replace.text
+    silent_dub_out = tmp_path / "silent_replaced.mp4"
+    silent_dub_out.write_bytes(silent_replace.content)
+    assert has_audio_stream(silent_dub_out) is True
+
+    # 5. Zero/negative-duration subtitle cues fail loudly (HTTP 400) rather than silently producing a 0-cue MP4
+    zero_dur_subs = json.dumps({
+        "segments": [{"id": "seg-1", "start": 1.0, "end": 1.0, "speakerId": "speaker-1", "text": "Zero duration cue"}],
+    })
+    assert client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": "[]", "originalAudioMode": "original", "subtitleMode": "soft", "subtitles": zero_dur_subs},
+    ).status_code == 400
+    assert client.post(
+        "/burn",
+        json={"jobId": job_id, "segments": [{"id": "seg-1", "start": 1.2, "end": 0.5, "speakerId": "speaker-1", "text": "Inverted cue"}]},
+    ).status_code == 400
+
+    # 6. Isolated per-request export-*.mp4 files are cleaned up after streaming, and evicted jobs (>12) return HTTP 404 cleanly
+    job_root = (tmp_path / "jobs" / job_id)
+    assert list(job_root.glob("export-*.mp4")) == []
+    assert list(job_root.glob("dub-*")) == []
+    for i in range(12):
+        with open(sample_mp4, "rb") as fh:
+            assert client.post("/transcribe", files={"file": (f"extra_{i}.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"}).status_code == 200
+    evicted_res = client.post("/dub", data={"jobId": job_id, "metadata": "[]", "originalAudioMode": "original"})
+    assert evicted_res.status_code == 404

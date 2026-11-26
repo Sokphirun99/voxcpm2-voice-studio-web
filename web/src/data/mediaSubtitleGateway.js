@@ -111,17 +111,50 @@ function buildVerifySpeechFormData({ blob, expectedText, language = 'km', fileNa
   return form;
 }
 
+function appendOptionalDubMixFields(form, mixSettings) {
+  if (!mixSettings || typeof mixSettings !== 'object') return;
+  const { originalVolume, dubVolume, duckVolume } = mixSettings;
+  if (Number.isFinite(originalVolume) && Math.abs(originalVolume - 1) > 1e-4) {
+    form.append('originalVolume', String(originalVolume));
+  }
+  if (Number.isFinite(dubVolume) && Math.abs(dubVolume - 1) > 1e-4) {
+    form.append('dubVolume', String(dubVolume));
+  }
+  if (Number.isFinite(duckVolume) && Math.abs(duckVolume - 0.15) > 1e-4) {
+    form.append('duckVolume', String(duckVolume));
+  }
+}
+
+function appendOptionalDubSubtitles(form, subtitleMode, subtitles) {
+  const cleanSubMode = String(subtitleMode || '').trim().toLowerCase();
+  if (!cleanSubMode || cleanSubMode === 'none') return;
+  form.append('subtitleMode', cleanSubMode);
+  if (subtitles && typeof subtitles === 'object') {
+    form.append('subtitles', JSON.stringify(subtitles));
+  }
+}
+
 /**
  * Builds the multipart FormData payload for time-aligned dubbed MP4 export (`/media_api/dub`).
- * @param {{ jobId: string, clips: Array<{ segmentId: string, start: number, end: number, blob: Blob }>, originalAudioMode?: string }} spec - Dub export inputs.
- * @returns {FormData} Multipart payload containing jobId, originalAudioMode, metadata JSON, and WAV files.
+ * @param {object} spec - Dub export inputs (`jobId`, `clips`, `originalAudioMode`, `audioLanguage`, `mixSettings`, `subtitleMode`, `subtitles`).
+ * @returns {FormData} Multipart payload containing jobId, audio/subtitle modes, gains, metadata JSON, and WAV files.
  */
-function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck', audioLanguage = '' }) {
+function buildDubVideoFormData({
+  jobId,
+  clips = [],
+  originalAudioMode = 'duck',
+  audioLanguage = '',
+  mixSettings = null,
+  subtitleMode = 'none',
+  subtitles = null,
+}) {
   const form = new FormData();
   form.append('jobId', String(jobId || ''));
   form.append('originalAudioMode', String(originalAudioMode || 'duck'));
   const cleanAudioLanguage = String(audioLanguage || '').trim();
   if (cleanAudioLanguage) form.append('audioLanguage', cleanAudioLanguage);
+  appendOptionalDubMixFields(form, mixSettings);
+  appendOptionalDubSubtitles(form, subtitleMode, subtitles);
   const metadata = clips.map((clip, fileIndex) => {
     const fileName = `dub-clip-${String(fileIndex + 1).padStart(3, '0')}.wav`;
     form.append('files', clip.blob, fileName);
@@ -265,11 +298,28 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       }
     },
 
-    async exportDubbedVideo({ jobId, clips = [], originalAudioMode = 'duck', audioLanguage = '', signal }) {
+    async exportDubbedVideo({
+      jobId,
+      clips = [],
+      originalAudioMode = 'duck',
+      audioLanguage = '',
+      mixSettings = null,
+      subtitleMode = 'none',
+      subtitles = null,
+      signal,
+    }) {
       try {
         const res = await fetchImpl(DUB_ENDPOINT, {
           method: 'POST',
-          body: buildDubVideoFormData({ jobId, clips, originalAudioMode, audioLanguage }),
+          body: buildDubVideoFormData({
+            jobId,
+            clips,
+            originalAudioMode,
+            audioLanguage,
+            mixSettings,
+            subtitleMode,
+            subtitles,
+          }),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not export dubbed MP4'), { status: res.status });

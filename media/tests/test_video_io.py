@@ -380,3 +380,253 @@ def test_export_presets_mp4_codecs_duration_language_and_non_mp4_transcoding(tmp
     assert hv["codec_name"] == "hevc"
     assert hv["codec_tag_string"] == "hvc1"
     assert (ha.get("tags") or {}).get("language") == "jpn"
+
+
+def _decode_window_rms(media_path: Path, ffmpeg_bin: str, start_sec: float, end_sec: float) -> float:
+    """Decode mono 48 kHz s16le PCM samples from `media_path` and return RMS amplitude in `[start_sec, end_sec]`."""
+    import array
+    import math
+
+    proc = subprocess.run(
+        [ffmpeg_bin, "-v", "error", "-i", str(media_path), "-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "-"],
+        capture_output=True,
+        check=True,
+    )
+    samples = array.array("h")
+    samples.frombytes(proc.stdout)
+    lo = max(0, int(round(start_sec * 48000)))
+    hi = min(len(samples), int(round(end_sec * 48000)))
+    window = samples[lo:hi]
+    assert len(window) > 100
+    return math.sqrt(sum(float(x) * float(x) for x in window) / len(window))
+
+
+def _write_silent_wav(path: Path, duration_seconds: float, sample_rate: int = 48000) -> Path:
+    num_frames = int(round(sample_rate * duration_seconds))
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * num_frames)
+    return path
+
+
+def test_r309_audio_modes_ducking_gains_and_subtitle_modes_match_selected_output(tmp_path: Path) -> None:
+    from video_io import DubAudioMixConfig, VideoSubtitleRenderSpec
+
+    ffmpeg_bin = resolve_ffmpeg_bin()
+    if not Path(ffmpeg_bin).exists() and not shutil.which(ffmpeg_bin):
+        pytest.skip("ffmpeg not installed")
+
+    src_mp4 = tmp_path / "tone_src.mp4"
+    subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=#141414:s=320x240:d=3.0:r=24",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3.0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest",
+        str(src_mp4),
+    ], check=True, capture_output=True)
+
+    silent_clip = _write_silent_wav(tmp_path / "silent_dub.wav", 0.8)
+    loud_clip = _write_test_wav(tmp_path / "loud_dub.wav", 0.8)
+    dub_window = [DubClip(wav_path=silent_clip, start_seconds=0.6, end_seconds=1.5, segment_id="seg-1")]
+
+    # 1. Original mode: keeps original audio only, respects original_volume, rejects clips or silent videos
+    orig_full = mux_dubbed_audio(src_mp4, [], tmp_path / "orig_full.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin)
+    orig_half = mux_dubbed_audio(
+        src_mp4, [], tmp_path / "orig_half.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin,
+        mix_config=DubAudioMixConfig(mode="original", original_volume=0.5),
+    )
+    rms_orig_full = _decode_window_rms(orig_full, ffmpeg_bin, 0.7, 1.3)
+    rms_orig_half = _decode_window_rms(orig_half, ffmpeg_bin, 0.7, 1.3)
+    assert rms_orig_full > 1000
+    assert 0.42 <= (rms_orig_half / rms_orig_full) <= 0.58
+
+    with pytest.raises(MediaProcessingError, match="not permitted"):
+        mux_dubbed_audio(src_mp4, dub_window, tmp_path / "orig_bad.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin)
+
+    silent_src = tmp_path / "silent_src.mp4"
+    subprocess.run([
+        ffmpeg_bin, "-y", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=2.0:r=24",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(silent_src),
+    ], check=True, capture_output=True)
+    with pytest.raises(MediaProcessingError, match="no original audio"):
+        mux_dubbed_audio(silent_src, [], tmp_path / "orig_silent_fail.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin)
+
+    # 2. Replacement (`replace` -> `mute`) mode: zeroes out original audio outside dub window and scales dub_volume
+    rep_mp4 = mux_dubbed_audio(
+        src_mp4,
+        [DubClip(wav_path=loud_clip, start_seconds=0.6, end_seconds=1.5, segment_id="seg-1")],
+        tmp_path / "replace.mp4",
+        original_audio_mode="replace",
+        ffmpeg_bin=ffmpeg_bin,
+        mix_config=DubAudioMixConfig(mode="replace", dub_volume=1.25),
+    )
+    assert _decode_window_rms(rep_mp4, ffmpeg_bin, 0.05, 0.45) < 5.0
+    assert _decode_window_rms(rep_mp4, ffmpeg_bin, 0.70, 1.25) > 3500.0
+    assert _decode_window_rms(rep_mp4, ffmpeg_bin, 1.80, 2.60) < 5.0
+
+    # 3. Speech-gated ducking (`duck`) vs balanced mix (`mix` -> `keep`)
+    duck_15 = mux_dubbed_audio(src_mp4, dub_window, tmp_path / "duck15.mp4", original_audio_mode="duck", ffmpeg_bin=ffmpeg_bin)
+    duck_50 = mux_dubbed_audio(
+        src_mp4, dub_window, tmp_path / "duck50.mp4", original_audio_mode="duck", ffmpeg_bin=ffmpeg_bin,
+        mix_config=DubAudioMixConfig(mode="duck", original_volume=1.0, duck_volume=0.5),
+    )
+    keep_mp4 = mux_dubbed_audio(src_mp4, dub_window, tmp_path / "mix_keep.mp4", original_audio_mode="mix", ffmpeg_bin=ffmpeg_bin)
+
+    pre_rms = _decode_window_rms(duck_15, ffmpeg_bin, 0.05, 0.40)
+    mid_duck15 = _decode_window_rms(duck_15, ffmpeg_bin, 0.75, 1.25)
+    post_rms = _decode_window_rms(duck_15, ffmpeg_bin, 1.90, 2.60)
+    mid_duck50 = _decode_window_rms(duck_50, ffmpeg_bin, 0.75, 1.25)
+    mid_keep = _decode_window_rms(keep_mp4, ffmpeg_bin, 0.75, 1.25)
+
+    assert 0.10 <= (mid_duck15 / pre_rms) <= 0.22
+    assert 0.88 <= (post_rms / pre_rms) <= 1.12
+    assert 0.42 <= (mid_duck50 / pre_rms) <= 0.58
+    assert 0.90 <= (mid_keep / pre_rms) <= 1.10
+
+    # 4. Subtitle modes: `none` strips existing container subtitles (-sn), `soft` preserves full duration + UTF-8 Khmer, `burned` renders ASS with -sn
+    srt_file = tmp_path / "khmer.srt"
+    srt_file.write_text("1\n00:00:00,200 --> 00:00:01,000\nសួស្តីកម្ពុជា!\nHello Cambodia!\n", encoding="utf-8")
+
+    mkv_with_subs = tmp_path / "with_subs.mkv"
+    subprocess.run([
+        ffmpeg_bin, "-y", "-i", str(src_mp4), "-i", str(srt_file), "-c", "copy", str(mkv_with_subs),
+    ], check=True, capture_output=True)
+
+    no_sub_mp4 = mux_dubbed_audio(
+        mkv_with_subs, [], tmp_path / "none_subs.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin,
+        subtitle_spec=VideoSubtitleRenderSpec(mode="none"),
+    )
+    _, none_streams = _probe_streams(no_sub_mp4)
+    assert not any(s.get("codec_type") == "subtitle" for s in none_streams)
+
+    soft_mp4 = mux_dubbed_audio(
+        src_mp4,
+        [DubClip(wav_path=loud_clip, start_seconds=0.2, end_seconds=1.1, segment_id="seg-1")],
+        tmp_path / "soft_subs.mp4",
+        original_audio_mode="duck",
+        ffmpeg_bin=ffmpeg_bin,
+        audio_language="khm_Khmr",
+        subtitle_spec=VideoSubtitleRenderSpec(mode="soft", srt_path=srt_file, subtitle_language="khm_Khmr"),
+    )
+    soft_fmt, soft_streams = _probe_streams(soft_mp4)
+    assert 2.8 <= float(soft_fmt["duration"]) <= 3.2
+    sub_stream = next(s for s in soft_streams if s.get("codec_type") == "subtitle")
+    assert sub_stream["codec_name"] == "mov_text"
+    assert (sub_stream.get("tags") or {}).get("language") == "khm"
+    roundtrip_srt = subprocess.run(
+        [ffmpeg_bin, "-v", "error", "-i", str(soft_mp4), "-map", "0:s:0", "-f", "srt", "-"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "សួស្តីកម្ពុជា!" in roundtrip_srt
+    assert "Hello Cambodia!" in roundtrip_srt
+
+    ass_file = tmp_path / "dub_burn.ass"
+    ass_file.write_text(
+        build_ass([SubtitleSegment(start=0.2, end=1.2, text="សួស្តីពិភពលោក", speaker_id="speaker-1")], video_size=(320, 240)),
+        encoding="utf-8",
+    )
+    burned_dub_mp4 = mux_dubbed_audio(
+        mkv_with_subs,
+        [DubClip(wav_path=loud_clip, start_seconds=0.2, end_seconds=1.1, segment_id="seg-1")],
+        tmp_path / "burned_dub.mp4",
+        original_audio_mode="replace",
+        ffmpeg_bin=ffmpeg_bin,
+        subtitle_spec=VideoSubtitleRenderSpec(mode="burned", ass_path=ass_file),
+    )
+    burned_fmt, burned_streams = _probe_streams(burned_dub_mp4)
+    assert 2.8 <= float(burned_fmt["duration"]) <= 3.2
+    assert any(s.get("codec_type") == "video" and s.get("codec_name") == "h264" for s in burned_streams)
+    assert not any(s.get("codec_type") == "subtitle" for s in burned_streams)
+
+    # 5. Strict validation rejects invalid gains, modes, and empty subtitle files
+    empty_srt = tmp_path / "empty.srt"
+    empty_srt.write_text("", encoding="utf-8")
+    with pytest.raises(MediaProcessingError, match="SRT subtitle file"):
+        mux_dubbed_audio(src_mp4, [], tmp_path / "bad_srt.mp4", original_audio_mode="original", subtitle_spec=VideoSubtitleRenderSpec(mode="soft", srt_path=empty_srt))
+    with pytest.raises(MediaProcessingError, match="duck_volume"):
+        mux_dubbed_audio(src_mp4, dub_window, tmp_path / "bad_gain.mp4", mix_config=DubAudioMixConfig(mode="duck", duck_volume=0.95))
+    with pytest.raises(MediaProcessingError, match="subtitle mode"):
+        mux_dubbed_audio(src_mp4, [], tmp_path / "bad_submode.mp4", original_audio_mode="original", subtitle_spec=VideoSubtitleRenderSpec(mode="vtt"))
+
+
+def test_r309_120_duck_windows_delayed_audio_pts_multi_audio_disposition_and_ass_escaping(tmp_path: Path) -> None:
+    from video_io import VideoSubtitleRenderSpec, probe_primary_audio_index
+
+    ffmpeg_bin = resolve_ffmpeg_bin()
+    if not Path(ffmpeg_bin).exists() and not shutil.which(ffmpeg_bin):
+        pytest.skip("ffmpeg not installed")
+
+    # 1. 120 disjoint duck windows (`MAX_DUB_CLIPS = 120`) succeed without FFmpeg av_expr_parse ENOMEM
+    long_src = tmp_path / "long_125s.mp4"
+    subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=#141414:s=160x160:d=122.0:r=2",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=122.0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+        str(long_src),
+    ], check=True, capture_output=True)
+    tiny_silent = _write_silent_wav(tmp_path / "tiny_silent.wav", 0.2)
+    clips_120 = [
+        DubClip(wav_path=tiny_silent, start_seconds=float(i), end_seconds=float(i) + 0.3, segment_id=f"s-{i}")
+        for i in range(120)
+    ]
+    out_120 = mux_dubbed_audio(long_src, clips_120, tmp_path / "out_120.mp4", original_audio_mode="duck", ffmpeg_bin=ffmpeg_bin)
+    assert out_120.is_file() and out_120.stat().st_size > 1000
+    ducked_rms = _decode_window_rms(out_120, ffmpeg_bin, 100.02, 100.18)
+    unducked_rms = _decode_window_rms(out_120, ffmpeg_bin, 100.55, 100.85)
+    assert 0.10 <= (ducked_rms / unducked_rms) <= 0.22
+
+    # 2. Delayed original audio stream (`-itsoffset 1.0`) keeps DubClip at 0.2..0.6s instead of shifting to 1.2..1.6s
+    delayed_a = tmp_path / "delayed_audio.mp4"
+    subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=#222222:s=320x240:d=3.0:r=12",
+        "-itsoffset", "1.0", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2.0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        str(delayed_a),
+    ], check=True, capture_output=True)
+    asr_wav = tmp_path / "delayed_asr.wav"
+    extract_audio_16k_wav(delayed_a, asr_wav, ffmpeg_bin)
+    with wave.open(str(asr_wav), "rb") as wf:
+        assert 2.8 <= (wf.getnframes() / float(wf.getframerate())) <= 3.2
+
+    loud_dub = _write_test_wav(tmp_path / "loud_dub_400ms.wav", 0.4)
+    delayed_out = mux_dubbed_audio(
+        delayed_a,
+        [DubClip(wav_path=loud_dub, start_seconds=0.2, end_seconds=0.8, segment_id="seg-1")],
+        tmp_path / "delayed_dubbed.mp4",
+        original_audio_mode="duck",
+        ffmpeg_bin=ffmpeg_bin,
+    )
+    assert _decode_window_rms(delayed_out, ffmpeg_bin, 0.02, 0.14) < 10.0
+    assert _decode_window_rms(delayed_out, ffmpeg_bin, 0.25, 0.55) > 2500.0
+
+    # 3. Multi-audio-stream `.mkv` where primary dialogue is on `0:a:1` (`disposition.default == 1`)
+    dual_mkv = tmp_path / "dual_audio.mkv"
+    subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=#222222:s=320x240:d=2.0:r=12",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=2.0",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2.0",
+        "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+        "-disposition:a:0", "0", "-disposition:a:1", "default",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        str(dual_mkv),
+    ], check=True, capture_output=True)
+    assert probe_primary_audio_index(dual_mkv) == 1
+    dual_orig = mux_dubbed_audio(dual_mkv, [], tmp_path / "dual_orig.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin)
+    assert _decode_window_rms(dual_orig, ffmpeg_bin, 0.2, 1.5) > 1500.0
+
+    # 4. Special filter delimiter characters in ASS filename (`:`, `,`, `[`, `]`) burn cleanly
+    special_ass = tmp_path / "sub:1,[khmer].ass"
+    special_ass.write_text(
+        build_ass([SubtitleSegment(start=0.1, end=1.2, text="សួស្តី", speaker_id="speaker-1")], video_size=(320, 240)),
+        encoding="utf-8",
+    )
+    special_burned = mux_dubbed_audio(
+        dual_mkv, [], tmp_path / "special_burned.mp4", original_audio_mode="original", ffmpeg_bin=ffmpeg_bin,
+        subtitle_spec=VideoSubtitleRenderSpec(mode="burned", ass_path=special_ass),
+    )
+    assert special_burned.is_file() and special_burned.stat().st_size > 1000

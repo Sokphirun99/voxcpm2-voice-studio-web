@@ -12,8 +12,25 @@ import {
   trimClipWavToInterval,
 } from '../../domain/durationMismatch.js';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
-import { EXPORT_PRESET_IDS } from '../../domain/exportPresets.js';
+import {
+  DEFAULT_DUB_MIX_SETTINGS,
+  DEFAULT_DUB_SUBTITLE_MODE,
+  EXPORT_PRESET_IDS,
+  VIDEO_AUDIO_MODES,
+  VIDEO_SUBTITLE_MODES,
+  assertVideoAudioMode,
+  assertVideoSubtitleMode,
+  clampDubMixField,
+  formatPresetFilename,
+  hasCustomDubMixSettings,
+  normalizeDubMixSettings,
+  normalizeVideoAudioMode,
+  normalizeVideoSubtitleMode,
+  resolveDubVideoCodec,
+  validateDubMixSettings,
+} from '../../domain/exportPresets.js';
 import { resolveLanguageDisplayMeta } from '../../domain/subtitleLanguages.js';
+import { pickSegmentText } from '../../domain/subtitles.js';
 import {
   DEFAULT_DUB_AUDIO_MODE,
   DEFAULT_TIME_ALIGNED_SUFFIX,
@@ -26,7 +43,6 @@ import {
   buildSubtitleSynthesisCommand,
   buildTimeAlignedDubDownloadFilename,
   buildVoiceoverDownloadFilename,
-  normalizeDubAudioMode,
   normalizeSubtitleVoiceoverGapMs,
   resolveSubtitleSpeechText,
   selectOrderedSegments,
@@ -560,72 +576,150 @@ function resolveSafeTrimSeconds(segments, idx, mediaDuration, targetDurationSec)
   return Math.min(cueDur, nextCap, mediaCap);
 }
 
-function useDubExportAction({
-  mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration,
-  segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, audioLanguage, abortRef,
-  dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onExportRecorded,
-}) {
+function resolveDubFilenameForModes(videoFile, audioMode, subtitleMode) {
+  if (audioMode !== VIDEO_AUDIO_MODES.ORIGINAL && subtitleMode === VIDEO_SUBTITLE_MODES.NONE) {
+    return buildDubDownloadFilename(videoFile);
+  }
+  const suffix = audioMode === VIDEO_AUDIO_MODES.ORIGINAL
+    ? (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED ? '-subtitled.mp4' : (subtitleMode === VIDEO_SUBTITLE_MODES.SOFT ? '-captioned.mp4' : '-original.mp4'))
+    : (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED ? '-dubbed-subtitled.mp4' : '-dubbed-captioned.mp4');
+  return formatPresetFilename(EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4, {
+    videoFileName: videoFile?.name || '',
+    suffixOverride: suffix,
+  });
+}
+
+function buildValidatedDubSubtitlesPayload({ subtitleMode, segments, subtitleContext, overrides, burnInSupported }) {
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.NONE) return null;
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED && burnInSupported === false) {
+    throw new ValidationError('Installed FFmpeg lacks libass support for burning captions.', 'subtitleMode', 'BURNIN_UNSUPPORTED');
+  }
+  const subCtx = { ...(subtitleContext || {}), ...(overrides?.subtitleOptions || {}) };
+  const useTrans = Boolean(subCtx.useTranslation);
+  const biling = Boolean(subCtx.bilingual);
+  const renderedCues = segments.filter(seg => Boolean(pickSegmentText(seg, useTrans, biling)));
+  if (!renderedCues.length) {
+    throw new ValidationError('Add or transcribe at least one subtitle cue before exporting video subtitles.', 'segments', 'EMPTY_SUBTITLES');
+  }
+  if (renderedCues.some(seg => !(Number(seg?.end) > Number(seg?.start)) || Number(seg?.start) < 0)) {
+    throw new ValidationError('Subtitle cues must have positive duration (0 <= start < end) before exporting video subtitles.', 'segments', 'INVALID_SUBTITLE_TIMING');
+  }
+  if (!subCtx.hasTranslation && (useTrans || biling) && !segments.some(seg => Boolean(seg?.translatedText?.trim()))) {
+    throw new ValidationError('Translate at least one subtitle cue before exporting translated or bilingual video subtitles.', 'languageMode', 'MISSING_TRANSLATION_CUES');
+  }
+  return {
+    segments,
+    speakerNames: subCtx.speakerNames || {},
+    includeSpeaker: Boolean(subCtx.includeSpeaker),
+    useTranslation: useTrans,
+    bilingual: biling,
+    ...(subCtx.subtitleStyle ? { subtitleStyle: subCtx.subtitleStyle } : {}),
+    ...(subCtx.videoSize ? { videoSize: subCtx.videoSize } : {}),
+    ...(subCtx.subtitleLanguage ? { subtitleLanguage: String(subCtx.subtitleLanguage) } : {}),
+  };
+}
+
+function prepareValidatedDubExportRequest(ctx, overrides) {
+  const mode = assertVideoAudioMode(overrides?.originalAudioMode ?? ctx.dubAudioMode);
+  const subMode = assertVideoSubtitleMode(overrides?.subtitleMode ?? ctx.dubSubtitleMode);
+  const mix = validateDubMixSettings(overrides?.mixSettings ?? ctx.dubMixSettings);
+  if (mode !== VIDEO_AUDIO_MODES.REPLACE && ctx.hasAudioStream === false) {
+    throw new ValidationError(
+      'Source video has no original audio track; select Replacement dubbing (mute original) instead.',
+      'audioMode',
+      'MISSING_ORIGINAL_AUDIO'
+    );
+  }
+  const subtitles = buildValidatedDubSubtitlesPayload({
+    subtitleMode: subMode,
+    segments: ctx.segments,
+    subtitleContext: ctx.subtitleContext,
+    overrides,
+    burnInSupported: ctx.burnInSupported,
+  });
+  if (mode === VIDEO_AUDIO_MODES.ORIGINAL) {
+    const rawSrcLang = String(overrides?.sourceAudioLanguage ?? overrides?.audioLanguage ?? ctx.sourceLanguage ?? '').trim();
+    return { mode, subMode, mix, subtitles, clips: [], cleanLang: rawSrcLang && rawSrcLang !== 'auto' ? rawSrcLang : '' };
+  }
+  if (ctx.exportMismatchReport?.hasUnresolved) assertNoUnresolvedDurationMismatches(ctx.exportMismatchReport);
+  const clips = buildDubExportClips(ctx.segments, ctx.selectedIds, ctx.segmentClips, {
+    spillApprovals: ctx.spillApprovals, mediaDuration: ctx.mediaDuration,
+  });
+  if (!clips.length) throw new ValidationError('No valid voice clips match the subtitle timeline.', 'clips', 'NO_DUB_CLIPS');
+  const rawLang = String(overrides?.audioLanguage ?? ctx.audioLanguage ?? '').trim();
+  return { mode, subMode, mix, subtitles, clips, cleanLang: rawLang && rawLang !== 'auto' ? rawLang : '' };
+}
+
+function useDubExportAction(ctx) {
   return useCallback(async (overrides = null) => {
     const throwOnError = Boolean(overrides?.throwOnError);
-    if (dubBusy || voiceBusy || abortRef.current) {
+    if (ctx.dubBusy || ctx.voiceBusy || ctx.abortRef.current) {
       if (throwOnError) throw new Error('Another voice or dubbing export is already running.');
       return;
     }
-    if (!jobId || isAudioOnly || !mediaSubtitleGateway?.exportDubbedVideo) {
+    if (!ctx.jobId || ctx.isAudioOnly || !ctx.mediaSubtitleGateway?.exportDubbedVideo) {
       if (throwOnError) throw new Error('Dubbed MP4 export requires a loaded video on the media server.');
       return;
     }
-    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify, throwOnError })) return;
-    const clips = buildDubExportClips(segments, selectedIds, segmentClips, { spillApprovals, mediaDuration });
-    if (!clips.length) {
-      if (throwOnError) throw new Error('No valid voice clips match the subtitle timeline.');
+    let req;
+    try {
+      req = prepareValidatedDubExportRequest(ctx, overrides);
+    } catch (err) {
+      const msg = err?.message || 'Invalid video dubbing export configuration.';
+      ctx.onStatus?.({ message: msg, error: true });
+      ctx.onNotify?.({ kind: 'error', title: err?.code === 'DURATION_MISMATCH' ? 'Resolve duration mismatches' : 'Video export blocked', message: msg });
+      if (throwOnError) throw err;
       return;
     }
-    onUnlockSound?.();
+    ctx.onUnlockSound?.();
     const controller = new AbortController();
-    abortRef.current = controller;
-    setDubBusy(true);
-    const clipWord = clips.length === 1 ? 'clip' : 'clips';
-    const effectiveMode = overrides?.originalAudioMode || dubAudioMode;
-    const effectiveLang = String(overrides?.audioLanguage ?? audioLanguage ?? '').trim();
-    const cleanLang = effectiveLang && effectiveLang !== 'auto' ? effectiveLang : '';
-    onStatus?.({ message: `Exporting dubbed MP4 (${clips.length} ${clipWord})…`, error: false });
+    ctx.abortRef.current = controller;
+    ctx.setDubBusy(true);
+    const clipWord = req.clips.length === 1 ? 'clip' : 'clips';
+    const progressLabel = req.mode === VIDEO_AUDIO_MODES.ORIGINAL ? 'original audio' : `${req.clips.length} ${clipWord}`;
+    ctx.onStatus?.({ message: `Exporting MP4 (${progressLabel})…`, error: false });
     try {
-      const mp4Blob = await mediaSubtitleGateway.exportDubbedVideo({
-        jobId,
-        clips,
-        originalAudioMode: effectiveMode,
-        ...(cleanLang ? { audioLanguage: cleanLang } : {}),
+      const mp4Blob = await ctx.mediaSubtitleGateway.exportDubbedVideo({
+        jobId: ctx.jobId,
+        clips: req.clips,
+        originalAudioMode: req.mode,
+        ...(req.cleanLang ? { audioLanguage: req.cleanLang } : {}),
+        ...(hasCustomDubMixSettings(req.mix) ? { mixSettings: req.mix } : {}),
+        ...(req.subMode !== VIDEO_SUBTITLE_MODES.NONE ? { subtitleMode: req.subMode, subtitles: req.subtitles } : {}),
         signal: controller.signal,
       });
-      const filename = overrides?.filename || buildDubDownloadFilename(videoFile);
+      const filename = overrides?.filename || resolveDubFilenameForModes(ctx.videoFile, req.mode, req.subMode);
       triggerFileDownload(mp4Blob, filename);
-      const langMeta = resolveLanguageDisplayMeta(cleanLang);
-      const maxEnd = segments.reduce((m, s) => Math.max(m, Number(s?.end) || 0), 0);
-      onExportRecorded?.(EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4, {
+      const langMeta = resolveLanguageDisplayMeta(req.cleanLang);
+      const maxEnd = ctx.segments.reduce((m, s) => Math.max(m, Number(s?.end) || 0), 0);
+      ctx.onExportRecorded?.(EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4, {
         filename,
-        durationSeconds: Number(mediaDuration) || maxEnd || null,
+        codec: resolveDubVideoCodec(req.subMode),
+        durationSeconds: Number(ctx.mediaDuration) || maxEnd || null,
         languageCode: langMeta.bcp47,
         languageLabel: langMeta.label,
+        audioMode: req.mode,
+        subtitleMode: req.subMode,
       });
-      const doneMsg = `Dubbed MP4 exported (${clips.length} ${clipWord}).`;
-      onStatus?.({ message: doneMsg, error: false });
-      onNotify?.({ kind: 'success', title: 'Dubbed MP4 exported', message: doneMsg });
+      const doneMsg = req.mode === VIDEO_AUDIO_MODES.ORIGINAL ? 'Video MP4 exported (original audio).' : `Dubbed MP4 exported (${req.clips.length} ${clipWord}).`;
+      ctx.onStatus?.({ message: doneMsg, error: false });
+      ctx.onNotify?.({ kind: 'success', title: 'MP4 exported', message: doneMsg });
     } catch (err) {
       if (isCancellationError(err)) {
-        onStatus?.({ message: 'Dubbed video export cancelled.', error: false });
+        ctx.onStatus?.({ message: 'Dubbed video export cancelled.', error: false });
         return;
       }
+      if (err?.status === 404) ctx.onMediaJobExpired?.();
       const message = err?.message || 'Could not export dubbed MP4. Check that the media service is running.';
-      logger?.error?.('useSubtitleVoiceover.exportDubbedVideo', err, { jobId, clipCount: clips.length, dubAudioMode: effectiveMode });
-      onStatus?.({ message, error: true });
-      onNotify?.({ kind: 'error', title: 'Dubbed MP4 export failed', message });
+      ctx.logger?.error?.('useSubtitleVoiceover.exportDubbedVideo', err, { jobId: ctx.jobId, clipCount: req.clips.length, dubAudioMode: req.mode, dubSubtitleMode: req.subMode });
+      ctx.onStatus?.({ message, error: true });
+      ctx.onNotify?.({ kind: 'error', title: 'Dubbed MP4 export failed', message });
       if (throwOnError) throw err;
     } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      setDubBusy(false);
+      if (ctx.abortRef.current === controller) ctx.abortRef.current = null;
+      ctx.setDubBusy(false);
     }
-  }, [mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration, segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, audioLanguage, abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onExportRecorded]);
+  }, [ctx]);
 }
 
 /**
@@ -864,14 +958,24 @@ export function useSubtitleVoiceover({
   videoFileName = '',
   jobId = '',
   isAudioOnly = false,
+  hasAudioStream = true,
+  burnInSupported = true,
   voiceCatalog = null,
   mediaDuration = 0,
   totalDuration = 0,
   transcriptEpoch = 0,
   terminology = null,
   pronunciationSignature = '',
+  sourceLanguage = '',
   speechLanguage = '',
   audioLanguage = '',
+  subtitleContext = null,
+  dubAudioModeProp = undefined,
+  onChangeDubAudioMode = null,
+  dubSubtitleModeProp = undefined,
+  onChangeDubSubtitleMode = null,
+  dubMixSettingsProp = undefined,
+  onChangeDubMixSettings = null,
   projectId = '',
   projectTitle = '',
   productionJobs = null,
@@ -879,6 +983,7 @@ export function useSubtitleVoiceover({
   onNotify,
   onUnlockSound,
   onEngineFailure,
+  onMediaJobExpired = null,
   onExportRecorded = null,
 } = {}) {
   const effectiveNameSource = useMemo(() => {
@@ -905,20 +1010,51 @@ export function useSubtitleVoiceover({
   const [segmentClips, setSegmentClips] = useState({});
   const [spillApprovals, setSpillApprovals] = useState({});
   const [pauseGapMs, setPauseGapMsState] = useState(SUBTITLE_VOICEOVER_PAUSE_MS);
-  const [dubAudioMode, setDubAudioModeState] = useState(DEFAULT_DUB_AUDIO_MODE);
+  const [dubAudioModeState, setDubAudioModeState] = useState(() => normalizeVideoAudioMode(dubAudioModeProp, DEFAULT_DUB_AUDIO_MODE));
+  const [dubSubtitleModeState, setDubSubtitleModeState] = useState(() => normalizeVideoSubtitleMode(dubSubtitleModeProp, DEFAULT_DUB_SUBTITLE_MODE));
+  const [dubMixSettingsState, setDubMixSettingsState] = useState(() => normalizeDubMixSettings(dubMixSettingsProp));
   const [dubBusy, setDubBusy] = useState(false);
   const [playingSegmentId, setPlayingSegmentId] = useState('');
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [generatingSegmentId, setGeneratingSegmentId] = useState('');
   const [batchProgress, setBatchProgress] = useState(null);
 
+  const dubAudioMode = dubAudioModeProp !== undefined ? normalizeVideoAudioMode(dubAudioModeProp, dubAudioModeState) : dubAudioModeState;
+  const dubSubtitleMode = dubSubtitleModeProp !== undefined ? normalizeVideoSubtitleMode(dubSubtitleModeProp, dubSubtitleModeState) : dubSubtitleModeState;
+  const dubMixSettings = useMemo(
+    () => (dubMixSettingsProp !== undefined ? normalizeDubMixSettings(dubMixSettingsProp) : dubMixSettingsState),
+    [dubMixSettingsProp, dubMixSettingsState]
+  );
+
   const setPauseGapMs = useCallback(rawMs => {
     setPauseGapMsState(normalizeSubtitleVoiceoverGapMs(rawMs));
   }, []);
 
   const setDubAudioMode = useCallback(rawMode => {
-    setDubAudioModeState(normalizeDubAudioMode(rawMode));
-  }, []);
+    const next = normalizeVideoAudioMode(rawMode);
+    setDubAudioModeState(next);
+    onChangeDubAudioMode?.(next);
+  }, [onChangeDubAudioMode]);
+
+  const setDubSubtitleMode = useCallback(rawMode => {
+    const next = normalizeVideoSubtitleMode(rawMode);
+    setDubSubtitleModeState(next);
+    onChangeDubSubtitleMode?.(next);
+  }, [onChangeDubSubtitleMode]);
+
+  const updateDubMixSetting = useCallback((field, rawValue) => {
+    setDubMixSettingsState(prev => {
+      const base = dubMixSettingsProp !== undefined ? normalizeDubMixSettings(dubMixSettingsProp) : prev;
+      const next = Object.freeze({ ...base, [field]: clampDubMixField(field, rawValue) });
+      onChangeDubMixSettings?.(next);
+      return next;
+    });
+  }, [dubMixSettingsProp, onChangeDubMixSettings]);
+
+  const resetDubMixSettings = useCallback(() => {
+    setDubMixSettingsState(DEFAULT_DUB_MIX_SETTINGS);
+    onChangeDubMixSettings?.(DEFAULT_DUB_MIX_SETTINGS);
+  }, [onChangeDubMixSettings]);
 
   const segmentClipsRef = useRef(segmentClips);
   segmentClipsRef.current = segmentClips;
@@ -1076,14 +1212,44 @@ export function useSubtitleVoiceover({
     onStatus, onNotify, onUnlockSound, onEngineFailure,
   });
 
-  const exportDubbedVideo = useDubExportAction({
-    mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile: effectiveNameSource, mediaDuration: effectiveTotalDuration,
-    segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, audioLanguage: audioLanguage || speechLanguage,
-    abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onExportRecorded,
-  });
+  const dubActionCtx = useMemo(() => ({
+    mediaSubtitleGateway, logger, jobId, isAudioOnly, hasAudioStream, burnInSupported,
+    videoFile: effectiveNameSource, mediaDuration: effectiveTotalDuration,
+    segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport,
+    dubAudioMode, dubSubtitleMode, dubMixSettings, subtitleContext,
+    sourceLanguage, audioLanguage: audioLanguage || speechLanguage,
+    abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onMediaJobExpired, onExportRecorded,
+  }), [
+    mediaSubtitleGateway, logger, jobId, isAudioOnly, hasAudioStream, burnInSupported,
+    effectiveNameSource, effectiveTotalDuration, segments, selectedIds, segmentClips,
+    spillApprovals, exportMismatchReport, dubAudioMode, dubSubtitleMode, dubMixSettings,
+    subtitleContext, sourceLanguage, audioLanguage, speechLanguage, abortRef,
+    dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onMediaJobExpired, onExportRecorded,
+  ]);
+  const exportDubbedVideo = useDubExportAction(dubActionCtx);
 
   const canExportAlignedVoice = Boolean(alignedClip?.blob) && !exportMismatchReport.hasUnresolved;
-  const canExportDub = Boolean(jobId && !isAudioOnly && combinedClip?.count > 0 && mediaSubtitleGateway?.exportDubbedVideo) && !exportMismatchReport.hasUnresolved;
+  const canExportDub = useMemo(() => {
+    if (!jobId || isAudioOnly || !mediaSubtitleGateway?.exportDubbedVideo) return false;
+    if (dubAudioMode !== VIDEO_AUDIO_MODES.REPLACE && hasAudioStream === false) return false;
+    if (dubAudioMode !== VIDEO_AUDIO_MODES.ORIGINAL) {
+      if (!combinedClip?.count || exportMismatchReport.hasUnresolved) return false;
+    }
+    if (dubSubtitleMode !== VIDEO_SUBTITLE_MODES.NONE) {
+      if (dubSubtitleMode === VIDEO_SUBTITLE_MODES.BURNED && burnInSupported === false) return false;
+      const useTrans = Boolean(subtitleContext?.useTranslation);
+      const biling = Boolean(subtitleContext?.bilingual);
+      const rendered = segments.filter(s => Boolean(pickSegmentText(s, useTrans, biling)));
+      if (!rendered.length) return false;
+      if (rendered.some(s => !(Number(s?.end) > Number(s?.start)) || Number(s?.start) < 0)) return false;
+      if (!subtitleContext?.hasTranslation && (useTrans || biling) && !segments.some(s => Boolean(s?.translatedText?.trim()))) return false;
+    }
+    return true;
+  }, [
+    jobId, isAudioOnly, mediaSubtitleGateway, dubAudioMode, hasAudioStream,
+    combinedClip?.count, exportMismatchReport.hasUnresolved, dubSubtitleMode,
+    burnInSupported, subtitleContext, segments,
+  ]);
 
   const downloadSegmentVoice = useCallback((segment, index) => {
     const clip = segmentClips[segment?.id];
@@ -1286,6 +1452,11 @@ export function useSubtitleVoiceover({
     setPauseGapMs,
     dubAudioMode,
     setDubAudioMode,
+    dubSubtitleMode,
+    setDubSubtitleMode,
+    dubMixSettings,
+    updateDubMixSetting,
+    resetDubMixSettings,
     dubBusy,
     canExportAlignedVoice,
     canExportDub,

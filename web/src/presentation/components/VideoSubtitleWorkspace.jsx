@@ -23,7 +23,12 @@ import {
   validateSubtitleSegments,
 } from '../../domain/subtitles.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
-import { EXPORT_PRESET_IDS } from '../../domain/exportPresets.js';
+import {
+  EXPORT_PRESET_IDS,
+  VIDEO_AUDIO_MODES,
+  normalizeDubMixSettings,
+  resolvePresetLanguageInfo,
+} from '../../domain/exportPresets.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
 import { useTerminology } from '../hooks/useTerminology.js';
@@ -865,13 +870,20 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
         canExportAlignedVoice={voice.canExportAlignedVoice}
         busy={busy || voice.voiceBusy}
         dubAudioMode={voice.dubAudioMode}
+        dubSubtitleMode={voice.dubSubtitleMode}
+        dubMixSettings={voice.dubMixSettings}
         dubBusy={voice.dubBusy}
         canExportDub={voice.canExportDub}
         isAudioOnly={Boolean(ctrl.state.isAudioOnly)}
         hasJobId={Boolean(ctrl.state.jobId)}
+        hasAudioStream={ctrl.state.hasAudioStream !== false}
+        burnInSupported={ctrl.health?.burnInSupported !== false}
         onDownload={voice.downloadCombinedVoice}
         onDownloadAligned={() => void voice.downloadAlignedVoice?.()}
         onChangeDubAudioMode={voice.setDubAudioMode}
+        onChangeDubSubtitleMode={voice.setDubSubtitleMode}
+        onUpdateDubMixSetting={voice.updateDubMixSetting}
+        onResetDubMixSettings={voice.resetDubMixSettings}
         onExportDub={() => void voice.exportDubbedVideo()}
         onJumpToMismatch={jumpToSegmentIssue}
         onFixSafeMismatches={() => ctrl.extendSafeMismatchSegments?.(voice.exportDurationMismatches?.unresolved || [])}
@@ -934,6 +946,31 @@ export function VideoSubtitleWorkspace({
   const activeSpeechLanguage = ctrl.useTranslation
     ? (state.translatedLanguage || state.options.targetLanguage)
     : (state.detectedLanguage || state.options.sourceLanguage);
+  const cleanSourceLang = effectiveSourceLanguage && effectiveSourceLanguage !== 'auto' ? effectiveSourceLanguage : '';
+  const subtitleVoiceContext = useMemo(() => ({
+    speakerNames: state.speakerNames,
+    includeSpeaker: ctrl.effectiveIncludeSpeaker,
+    hasTranslation: state.hasTranslation,
+    useTranslation: ctrl.useTranslation,
+    bilingual: ctrl.bilingual,
+    subtitleStyle: state.options.subtitleStyle,
+    videoSize: state.videoSize,
+    subtitleLanguage: ctrl.useTranslation ? effectiveTargetLanguage : cleanSourceLang,
+  }), [
+    state.speakerNames,
+    ctrl.effectiveIncludeSpeaker,
+    state.hasTranslation,
+    ctrl.useTranslation,
+    ctrl.bilingual,
+    state.options.subtitleStyle,
+    state.videoSize,
+    effectiveTargetLanguage,
+    cleanSourceLang,
+  ]);
+  const handleUpdateOption = ctrl.updateOption;
+  const onChangeDubAudioMode = React.useCallback(next => handleUpdateOption('dubAudioMode', next), [handleUpdateOption]);
+  const onChangeDubSubtitleMode = React.useCallback(next => handleUpdateOption('dubSubtitleMode', next), [handleUpdateOption]);
+  const onChangeDubMixSettings = React.useCallback(next => handleUpdateOption('dubMixSettings', next), [handleUpdateOption]);
   const voice = useSubtitleVoiceover({
     segments: state.segments,
     useTranslation: ctrl.useTranslation,
@@ -941,13 +978,23 @@ export function VideoSubtitleWorkspace({
     videoFileName: state.videoFileName,
     jobId: state.jobId,
     isAudioOnly: state.isAudioOnly,
+    hasAudioStream: state.hasAudioStream,
+    burnInSupported: health.burnInSupported,
     voiceCatalog,
     mediaDuration: ctrl.mediaDuration,
     transcriptEpoch: ctrl.transcriptEpoch,
     terminology: terminologyCtrl.effectiveTerms,
     pronunciationSignature: terminologyCtrl.pronunciationSignature,
+    sourceLanguage: cleanSourceLang,
     speechLanguage: activeSpeechLanguage,
     audioLanguage: activeSpeechLanguage,
+    subtitleContext: subtitleVoiceContext,
+    dubAudioModeProp: state.options.dubAudioMode,
+    onChangeDubAudioMode,
+    dubSubtitleModeProp: state.options.dubSubtitleMode,
+    onChangeDubSubtitleMode,
+    dubMixSettingsProp: state.options.dubMixSettings,
+    onChangeDubMixSettings,
     projectId: activeProjectId,
     projectTitle: activeProjectTitle,
     productionJobs,
@@ -955,6 +1002,7 @@ export function VideoSubtitleWorkspace({
     onNotify,
     onUnlockSound,
     onEngineFailure: onRefreshEngine,
+    onMediaJobExpired: ctrl.clearExpiredJobId,
     onExportRecorded: ctrl.recordExportHistory,
   });
   if (actionsRef) {
@@ -994,8 +1042,8 @@ export function VideoSubtitleWorkspace({
 
   const handleSelectFile = file => {
     if (!file) return;
-    voice.resetVoiceover();
-    ctrl.selectVideoFile(file);
+    const outcome = ctrl.selectVideoFile(file);
+    if (outcome?.accepted && !outcome.relinked) voice.resetVoiceover();
   };
   const handleImportSubtitle = async file => {
     if (await ctrl.importSubtitleFile(file)) voice.resetVoiceover();
@@ -1061,6 +1109,7 @@ export function VideoSubtitleWorkspace({
     segments: state.segments,
     segmentClips: voice.segmentClips,
     detectedLanguage: state.detectedLanguage || state.options.sourceLanguage,
+    sourceLanguage: cleanSourceLang,
     translatedLanguage: state.translatedLanguage,
     selectedTargetLanguage: state.options.targetLanguage,
     speechLanguage: activeSpeechLanguage,
@@ -1070,9 +1119,12 @@ export function VideoSubtitleWorkspace({
     includeSpeaker: ctrl.effectiveIncludeSpeaker,
     canShowSpeakerOption: speakers.length > 1 || Boolean(state.options.detectSpeakers),
     dubAudioMode: voice.dubAudioMode,
+    dubSubtitleMode: voice.dubSubtitleMode,
+    dubMixSettings: voice.dubMixSettings,
     videoDuration: ctrl.mediaDuration,
     videoSize: state.videoSize,
     isAudioOnly: state.isAudioOnly,
+    hasAudioStream: state.hasAudioStream,
     hasLinkedVideo: Boolean(state.videoFile),
     jobId: state.jobId,
     burnInSupported: health.burnInSupported,
@@ -1088,13 +1140,17 @@ export function VideoSubtitleWorkspace({
     state.options.targetLanguage,
     state.options.detectSpeakers,
     state.translatedLanguage,
+    cleanSourceLang,
     activeSpeechLanguage,
     state.hasTranslation,
     state.videoSize,
     state.isAudioOnly,
+    state.hasAudioStream,
     state.jobId,
     voice.segmentClips,
     voice.dubAudioMode,
+    voice.dubSubtitleMode,
+    voice.dubMixSettings,
     voice.selectedIds,
     voice.spillApprovals,
     ctrl.useTranslation,
@@ -1104,6 +1160,45 @@ export function VideoSubtitleWorkspace({
     speakers.length,
     health.burnInSupported,
   ]);
+  const runDubbedExportPreset = async (filename, draft) => {
+    const nextAudioMode = draft?.dubAudioMode || voice.dubAudioMode;
+    const nextSubtitleMode = draft?.dubSubtitleMode || voice.dubSubtitleMode;
+    const nextMix = normalizeDubMixSettings(draft?.dubMixSettings ?? voice.dubMixSettings);
+    const prevMix = voice.dubMixSettings;
+    if (nextAudioMode !== voice.dubAudioMode) voice.setDubAudioMode?.(nextAudioMode);
+    if (nextSubtitleMode !== voice.dubSubtitleMode) voice.setDubSubtitleMode?.(nextSubtitleMode);
+    if (
+      nextMix.originalVolume !== prevMix.originalVolume ||
+      nextMix.dubVolume !== prevMix.dubVolume ||
+      nextMix.duckVolume !== prevMix.duckVolume
+    ) {
+      handleUpdateOption('dubMixSettings', nextMix);
+    }
+    const langInfo = resolvePresetLanguageInfo({
+      languageMode: draft?.languageMode,
+      useTranslation: ctrl.useTranslation,
+      bilingual: ctrl.bilingual,
+      detectedLanguage: cleanSourceLang,
+      translatedLanguage: state.translatedLanguage,
+      selectedTargetLanguage: state.options.targetLanguage,
+    });
+    await voice.exportDubbedVideo({
+      filename,
+      originalAudioMode: nextAudioMode,
+      subtitleMode: nextSubtitleMode,
+      mixSettings: nextMix,
+      sourceAudioLanguage: cleanSourceLang,
+      audioLanguage: nextAudioMode === VIDEO_AUDIO_MODES.ORIGINAL ? cleanSourceLang : activeSpeechLanguage,
+      subtitleOptions: {
+        hasTranslation: state.hasTranslation,
+        includeSpeaker: draft?.includeSpeaker ?? ctrl.effectiveIncludeSpeaker,
+        useTranslation: langInfo.useTranslation,
+        bilingual: langInfo.bilingual,
+        subtitleLanguage: langInfo.rawLanguageCode || langInfo.bcp47,
+      },
+      throwOnError: true,
+    });
+  };
   const handleRunExportPreset = async (preset, draft) => {
     const filename = preset.expectedOutput?.filename || '';
     switch (preset.id) {
@@ -1126,15 +1221,7 @@ export function VideoSubtitleWorkspace({
         await voice.downloadAlignedVoice({ filename, throwOnError: true });
         return;
       case EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4:
-        if (draft?.dubAudioMode && draft.dubAudioMode !== voice.dubAudioMode) {
-          voice.setDubAudioMode?.(draft.dubAudioMode);
-        }
-        await voice.exportDubbedVideo({
-          filename,
-          originalAudioMode: draft?.dubAudioMode || voice.dubAudioMode,
-          audioLanguage: activeSpeechLanguage,
-          throwOnError: true,
-        });
+        await runDubbedExportPreset(filename, draft);
         return;
       default:
         break;
@@ -1163,7 +1250,7 @@ export function VideoSubtitleWorkspace({
       <SubtitleToolbar
         busy={busy}
         extracting={mediaBusy}
-        relinking={Boolean(state.projectId && !state.jobId && state.segments.length)}
+        relinking={Boolean(!state.jobId && state.segments.length)}
         hasFile={Boolean(state.videoFile)}
         hasSegments={state.segments.length > 0}
         onClear={handleClear}

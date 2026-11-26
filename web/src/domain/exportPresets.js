@@ -14,10 +14,59 @@ import {
 } from './exportHistory.js';
 import { getSegmentActiveTake, hasSegmentAudio } from './projectSegments.js';
 import { resolveLanguageDisplayMeta } from './subtitleLanguages.js';
-import { DUB_AUDIO_MODE_OPTIONS, buildDubExportClips, selectOrderedSegments } from './subtitleTts.js';
+import { buildDubExportClips, selectOrderedSegments } from './subtitleTts.js';
 import { pickSegmentText } from './subtitles.js';
+import {
+  DEFAULT_DUB_MIX_SETTINGS,
+  DEFAULT_DUB_SUBTITLE_MODE,
+  DUB_MIX_BOUNDS,
+  VIDEO_AUDIO_MODES,
+  VIDEO_EXPORT_AUDIO_MODE_OPTIONS,
+  VIDEO_SUBTITLE_MODES,
+  VIDEO_SUBTITLE_MODE_OPTIONS,
+  assertVideoAudioMode,
+  assertVideoSubtitleMode,
+  clampDubMixField,
+  formatGainDbLabel,
+  formatGainPercentLabel,
+  formatVideoAudioModeSummary,
+  formatVideoSubtitleModeSummary,
+  hasCustomDubMixSettings,
+  normalizeDubMixSettings,
+  normalizeVideoAudioMode,
+  normalizeVideoSubtitleMode,
+  resolveCanonicalVideoAudioMode,
+  resolveCanonicalVideoSubtitleMode,
+  validateDubMixSettings,
+} from './videoDubExport.js';
 
-export { MAX_EXPORT_HISTORY, appendExportHistory, createExportHistoryEntry, normalizeExportHistory };
+export {
+  DEFAULT_DUB_MIX_SETTINGS,
+  DEFAULT_DUB_SUBTITLE_MODE,
+  DUB_MIX_BOUNDS,
+  MAX_EXPORT_HISTORY,
+  VIDEO_AUDIO_MODES,
+  VIDEO_EXPORT_AUDIO_MODE_OPTIONS,
+  VIDEO_SUBTITLE_MODES,
+  VIDEO_SUBTITLE_MODE_OPTIONS,
+  appendExportHistory,
+  assertVideoAudioMode,
+  assertVideoSubtitleMode,
+  clampDubMixField,
+  createExportHistoryEntry,
+  formatGainDbLabel,
+  formatGainPercentLabel,
+  formatVideoAudioModeSummary,
+  formatVideoSubtitleModeSummary,
+  hasCustomDubMixSettings,
+  normalizeDubMixSettings,
+  normalizeExportHistory,
+  normalizeVideoAudioMode,
+  normalizeVideoSubtitleMode,
+  resolveCanonicalVideoAudioMode,
+  resolveCanonicalVideoSubtitleMode,
+  validateDubMixSettings,
+};
 export const DEFAULT_WAV_SAMPLE_RATE = 48000;
 export const DEFAULT_WAV_BITS = 16;
 export const DEFAULT_EXPORT_STEM = 'subtitle';
@@ -266,20 +315,30 @@ function resolveSubtitleDuration(segments) {
   }, 0);
 }
 
+function hasValidCueInterval(seg) {
+  const start = Number(seg?.start);
+  const end = Number(seg?.end);
+  return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end > start;
+}
+
 function countRenderedCueTexts(segments, useTranslation, bilingual) {
   let rendered = 0;
+  let translatedCount = 0;
   let missingTranslation = 0;
+  let invalidTimingCount = 0;
   let hasArrowToken = false;
   for (const seg of segments) {
+    const hasOrig = Boolean(String(seg?.text || '').trim());
+    const hasTrans = Boolean(String(seg?.translatedText || '').trim());
+    if (hasTrans) translatedCount += 1;
     const text = pickSegmentText(seg, useTranslation, bilingual);
     if (!text) continue;
     rendered += 1;
+    if (!hasValidCueInterval(seg)) invalidTimingCount += 1;
     if (text.includes('-->')) hasArrowToken = true;
-    if (useTranslation && String(seg?.text || '').trim() && !String(seg?.translatedText || '').trim()) {
-      missingTranslation += 1;
-    }
+    if (useTranslation && hasOrig && !hasTrans) missingTranslation += 1;
   }
-  return { rendered, missingTranslation, hasArrowToken };
+  return { rendered, translatedCount, missingTranslation, invalidTimingCount, hasArrowToken };
 }
 
 function collectSubtitleAudioTargets(segments, clips, selectedIds) {
@@ -319,16 +378,20 @@ function estimateTtsSegmentsDuration(nonEmptySegments) {
   return total;
 }
 
-function buildExpectedOutput({ preset, filename, durationSeconds, language }) {
+function buildExpectedOutput({ preset, filename, durationSeconds, language, codecOverride = '', videoMeta = null }) {
   return Object.freeze({
     filename,
     format: preset.format,
-    codec: preset.codec,
+    codec: codecOverride || preset.codec,
     sampleRate: preset.sampleRate,
     channels: preset.channels,
     durationSeconds: Number.isFinite(durationSeconds) && durationSeconds > 0 ? Math.round(durationSeconds * 100) / 100 : null,
     languageCode: language.bcp47,
     languageLabel: language.label,
+    audioMode: videoMeta?.audioMode || null,
+    audioModeLabel: videoMeta?.audioModeLabel || null,
+    subtitleMode: videoMeta?.subtitleMode || null,
+    subtitleModeLabel: videoMeta?.subtitleModeLabel || null,
   });
 }
 
@@ -400,7 +463,9 @@ function evaluateSubtitleTextPreset(preset, ctx, langInfo) {
   const blockers = [];
   const warnings = [];
   if (stats.rendered === 0) blockers.push('Add or transcribe at least one subtitle cue before exporting.');
-  if (stats.missingTranslation > 0) {
+  else if (!ctx.hasTranslation && (langInfo.useTranslation || langInfo.bilingual) && stats.translatedCount === 0) {
+    blockers.push('Translate at least one subtitle cue before exporting translated or bilingual subtitles.');
+  } else if (stats.missingTranslation > 0) {
     warnings.push(`${stats.missingTranslation} cue${stats.missingTranslation === 1 ? '' : 's'} lack translations and will fall back to original text.`);
   }
   if (preset.id === EXPORT_PRESET_IDS.SUBTITLE_VTT && !langInfo.bcp47) {
@@ -431,50 +496,158 @@ function evaluateVideoBurnedPreset(preset, ctx, langInfo) {
   const warnings = [];
   if (ctx.burnInSupported === false) blockers.push('Installed FFmpeg lacks libass support for burning captions.');
   if (stats.rendered === 0) blockers.push('Add or transcribe at least one subtitle cue to burn into MP4.');
-  if (stats.missingTranslation > 0) {
+  else if (stats.invalidTimingCount > 0) {
+    blockers.push(`Fix ${stats.invalidTimingCount} subtitle cue${stats.invalidTimingCount === 1 ? '' : 's'} with zero or negative duration before burning video.`);
+  } else if (!ctx.hasTranslation && (langInfo.useTranslation || langInfo.bilingual) && stats.translatedCount === 0) {
+    blockers.push('Translate at least one subtitle cue before burning translated or bilingual subtitles.');
+  } else if (stats.missingTranslation > 0) {
     warnings.push(`${stats.missingTranslation} cue${stats.missingTranslation === 1 ? '' : 's'} lack translations and will render original text.`);
   }
+  if (ctx.hasAudioStream === false) warnings.push('Source video has no audio stream; exported MP4 will be silent.');
   if (ctx.videoSize?.width && ctx.videoSize?.height && ((ctx.videoSize.width % 2 !== 0) || (ctx.videoSize.height % 2 !== 0))) {
     warnings.push('Odd video dimensions will be aligned to even pixels for universal H.264 yuv420p playback.');
   }
   const durationSeconds = Number(ctx.videoDuration) || resolveSubtitleDuration(segments);
   const filename = formatPresetFilename(preset.id, { ...ctx, languageCode: langInfo.bcp47 });
-  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput: buildExpectedOutput({ preset, filename, durationSeconds, language: langInfo }) };
+  const videoMeta = {
+    audioMode: VIDEO_AUDIO_MODES.ORIGINAL,
+    audioModeLabel: 'Original audio',
+    subtitleMode: VIDEO_SUBTITLE_MODES.BURNED,
+    subtitleModeLabel: formatVideoSubtitleModeSummary(VIDEO_SUBTITLE_MODES.BURNED, langInfo),
+  };
+  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput: buildExpectedOutput({ preset, filename, durationSeconds, language: langInfo, videoMeta }) };
 }
 
-function collectDubVideoMessages({ segments, dubClips, ctx }) {
-  const blockers = collectCommonVideoBlockers(ctx);
-  const warnings = [];
+function resolveDubVideoSuffix(audioMode, subtitleMode) {
+  if (audioMode === VIDEO_AUDIO_MODES.ORIGINAL) {
+    if (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED) return '-subtitled.mp4';
+    if (subtitleMode === VIDEO_SUBTITLE_MODES.SOFT) return '-captioned.mp4';
+    return '-original.mp4';
+  }
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED) return '-dubbed-subtitled.mp4';
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.SOFT) return '-dubbed-captioned.mp4';
+  return PRESET_SUFFIXES.video_dubbed_mp4;
+}
+
+/**
+ * Resolves the exact MP4 stream codec summary for a dubbed video export given its subtitle mode.
+ * Inputs: `subtitleMode` (`'none' | 'burned' | 'soft'`) and optional `defaultCodec`.
+ * Outputs: human-readable codec string matching the actual FFmpeg muxing pipeline.
+ * Side effects: none.
+ * Failure modes: defaults cleanly to the standard H.264/HEVC + AAC codec descriptor.
+ * @param {string} subtitleMode - Video subtitle mode.
+ * @param {string} [defaultCodec] - Base video+audio codec label.
+ * @returns {string} Exact codec summary.
+ */
+export function resolveDubVideoCodec(subtitleMode, defaultCodec = `H.264/HEVC (hvc1/yuv420p) + ${DUB_AAC_BITRATE_LABEL}`) {
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED) return `H.264 (yuv420p) + ${DUB_AAC_BITRATE_LABEL}`;
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.SOFT) return `${defaultCodec} + mov_text`;
+  return defaultCodec;
+}
+
+function appendDubAudioMessages({ audioMode, dubClips, segments, ctx, blockers, warnings }) {
+  if (!audioMode) {
+    blockers.push('Select a supported video audio mode (original, replace/mute, duck, or keep/mix).');
+    return;
+  }
+  if (audioMode !== VIDEO_AUDIO_MODES.REPLACE && ctx.hasAudioStream === false) {
+    blockers.push('Source video has no original audio track; select Replacement dubbing (mute original) instead.');
+  }
+  if (audioMode === VIDEO_AUDIO_MODES.ORIGINAL) {
+    if (dubClips.length > 0) warnings.push('Original audio mode is selected; generated dubbed voice clips will not be mixed.');
+    return;
+  }
   if (dubClips.length === 0) blockers.push('Generate at least one dubbed voice clip before exporting dubbed MP4.');
   else if (dubClips.length > MAX_DUB_EXPORT_CLIPS) blockers.push(`Dubbed MP4 supports up to ${MAX_DUB_EXPORT_CLIPS} voice clips per export.`);
-  const mismatchReport = dubClips.length > 0
+  const mismatch = dubClips.length > 0
     ? detectDurationMismatches({
       segments, segmentClips: ctx.segmentClips || {}, mediaDuration: Number(ctx.videoDuration) || 0,
       spillApprovals: ctx.spillApprovals || {}, selectedIds: ctx.selectedIds, targetOnly: true,
     })
     : { unresolved: [] };
-  if (mismatchReport.unresolved.length > 0) {
-    blockers.push(`Resolve ${mismatchReport.unresolved.length} speech duration mismatch${mismatchReport.unresolved.length === 1 ? '' : 'es'} before exporting dubbed MP4.`);
+  if (mismatch.unresolved.length > 0) {
+    blockers.push(`Resolve ${mismatch.unresolved.length} speech duration mismatch${mismatch.unresolved.length === 1 ? '' : 'es'} before exporting dubbed MP4.`);
   }
-  if (!DUB_AUDIO_MODE_OPTIONS.some(opt => opt.id === (ctx.dubAudioMode || 'duck'))) warnings.push('Original audio mix mode will default to ducking.');
-  if ((ctx.dubAudioMode || 'duck') === 'mute') warnings.push('Original video audio track will be muted in the exported dubbed MP4.');
-  const nameLower = String(ctx.videoFileName || '').toLowerCase();
-  if (nameLower && !MP4_EXT_PATTERN.test(nameLower)) warnings.push('Non-MP4 source container will be converted or hvc1-tagged into MP4 (H.264/HEVC + AAC) for QuickTime/VLC/browser playback.');
+  if (audioMode === VIDEO_AUDIO_MODES.REPLACE) warnings.push('Original video audio track will be muted in the exported dubbed MP4.');
   if (dubClips.length > 0 && dubClips.length < segments.length) warnings.push(`${dubClips.length} of ${segments.length} cues will receive dubbed voices.`);
+}
+
+function appendDubSubtitleMessages({ subtitleMode, segments, langInfo, ctx, blockers, warnings }) {
+  if (!subtitleMode) {
+    blockers.push('Select a supported video subtitle mode (none, burned, or soft).');
+    return;
+  }
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.NONE) return;
+  const stats = countRenderedCueTexts(segments, langInfo.useTranslation, langInfo.bilingual);
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED && ctx.burnInSupported === false) {
+    blockers.push('Installed FFmpeg lacks libass support for burning captions.');
+  }
+  if (stats.rendered === 0) {
+    blockers.push(`Add or transcribe at least one subtitle cue to ${subtitleMode === VIDEO_SUBTITLE_MODES.BURNED ? 'burn into' : 'embed into'} MP4.`);
+  } else if (stats.invalidTimingCount > 0) {
+    blockers.push(`Fix ${stats.invalidTimingCount} subtitle cue${stats.invalidTimingCount === 1 ? '' : 's'} with zero or negative duration before exporting video subtitles.`);
+  } else if (!ctx.hasTranslation && (langInfo.useTranslation || langInfo.bilingual) && stats.translatedCount === 0) {
+    blockers.push('Translate at least one subtitle cue before exporting translated or bilingual video subtitles.');
+  } else if (stats.missingTranslation > 0) {
+    warnings.push(`${stats.missingTranslation} cue${stats.missingTranslation === 1 ? '' : 's'} lack translations and will fall back to original text.`);
+  }
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.BURNED && ctx.videoSize?.width && ctx.videoSize?.height && ((ctx.videoSize.width % 2 !== 0) || (ctx.videoSize.height % 2 !== 0))) {
+    warnings.push('Odd video dimensions will be aligned to even pixels for universal H.264 yuv420p playback.');
+  }
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.SOFT) {
+    warnings.push('Embedded MP4 subtitle track (mov_text) can be toggled on/off in players; burn-in box/color styling applies only to Burned-in mode.');
+  }
+}
+
+function collectDubVideoMessages({ segments, dubClips, audioMode, subtitleMode, langInfo, ctx }) {
+  const blockers = collectCommonVideoBlockers(ctx);
+  const warnings = [];
+  if (ctx.dubMixSettings !== undefined && ctx.dubMixSettings !== null) {
+    try {
+      validateDubMixSettings(ctx.dubMixSettings);
+    } catch (err) {
+      blockers.push(err.message);
+    }
+  }
+  appendDubAudioMessages({ audioMode, dubClips, segments, ctx, blockers, warnings });
+  appendDubSubtitleMessages({ subtitleMode, segments, langInfo, ctx, blockers, warnings });
+  const nameLower = String(ctx.videoFileName || '').toLowerCase();
+  if (nameLower && !MP4_EXT_PATTERN.test(nameLower)) {
+    warnings.push('Non-MP4 source container will be converted or hvc1-tagged into MP4 (H.264/HEVC + AAC) for QuickTime/VLC/browser playback.');
+  }
   return { blockers, warnings };
 }
 
 function evaluateVideoDubbedPreset(preset, ctx, langInfo) {
   const segments = Array.isArray(ctx.segments) ? ctx.segments : [];
+  const rawAudio = ctx.dubAudioMode === undefined || ctx.dubAudioMode === null || ctx.dubAudioMode === '' ? VIDEO_AUDIO_MODES.DUCK : ctx.dubAudioMode;
+  const rawSub = ctx.dubSubtitleMode === undefined || ctx.dubSubtitleMode === null || ctx.dubSubtitleMode === '' ? DEFAULT_DUB_SUBTITLE_MODE : ctx.dubSubtitleMode;
+  const audioMode = resolveCanonicalVideoAudioMode(rawAudio);
+  const subtitleMode = resolveCanonicalVideoSubtitleMode(rawSub);
   const dubClips = buildDubExportClips(segments, ctx.selectedIds, ctx.segmentClips || {}, {
     spillApprovals: ctx.spillApprovals || {},
     mediaDuration: Number(ctx.videoDuration) || 0,
   });
-  const { blockers, warnings } = collectDubVideoMessages({ segments, dubClips, ctx });
+  const { blockers, warnings } = collectDubVideoMessages({ segments, dubClips, audioMode, subtitleMode, langInfo, ctx });
+  const safeAudio = audioMode || VIDEO_AUDIO_MODES.DUCK;
+  const safeSub = subtitleMode || DEFAULT_DUB_SUBTITLE_MODE;
   const durationSeconds = Number(ctx.videoDuration) || resolveSubtitleDuration(segments);
-  const audioLang = resolveAudioLanguageInfo(ctx, langInfo);
-  const filename = formatPresetFilename(preset.id, { ...ctx, languageCode: audioLang.bcp47 });
-  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput: buildExpectedOutput({ preset, filename, durationSeconds, language: audioLang }) };
+  const audioLang = safeAudio === VIDEO_AUDIO_MODES.ORIGINAL
+    ? resolvePresetLanguageInfo({ languageMode: 'original', detectedLanguage: ctx.detectedLanguage, sourceLanguage: ctx.sourceLanguage })
+    : resolveAudioLanguageInfo(ctx, langInfo);
+  const suffixOverride = resolveDubVideoSuffix(safeAudio, safeSub);
+  const filename = formatPresetFilename(preset.id, { ...ctx, languageCode: audioLang.bcp47, suffixOverride });
+  const videoMeta = {
+    audioMode: safeAudio,
+    audioModeLabel: formatVideoAudioModeSummary(safeAudio, ctx.dubMixSettings),
+    subtitleMode: safeSub,
+    subtitleModeLabel: formatVideoSubtitleModeSummary(safeSub, langInfo),
+  };
+  const expectedOutput = buildExpectedOutput({
+    preset, filename, durationSeconds, language: audioLang,
+    codecOverride: resolveDubVideoCodec(safeSub, preset.codec), videoMeta,
+  });
+  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput };
 }
 
 /**

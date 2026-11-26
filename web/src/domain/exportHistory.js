@@ -3,6 +3,7 @@
  */
 
 import { ValidationError } from './errors.js';
+import { resolveCanonicalVideoAudioMode, resolveCanonicalVideoSubtitleMode } from './videoDubExport.js';
 
 export const MAX_EXPORT_HISTORY = 50;
 export const EXPORT_HISTORY_CATEGORIES = Object.freeze(['audio', 'subtitle', 'video']);
@@ -12,6 +13,7 @@ const MAX_FILENAME_LEN = 180;
 const MAX_CODEC_LEN = 120;
 const MAX_LANG_CODE_LEN = 24;
 const MAX_LANG_LABEL_LEN = 64;
+const MAX_MODE_LEN = 24;
 const RANDOM_FALLBACK_MODULUS = 100000;
 
 function buildExportEntryId(rawId) {
@@ -23,7 +25,7 @@ function buildExportEntryId(rawId) {
 
 /**
  * Creates a validated, immutable export history entry for project persistence.
- * Inputs: `{ id, presetId, category, label, filename, format, codec, durationSeconds, sampleRate, languageCode, languageLabel, warningsCount, exportedAt }`.
+ * Inputs: `{ id, presetId, category, label, filename, format, codec, durationSeconds, sampleRate, languageCode, languageLabel, audioMode, subtitleMode, warningsCount, exportedAt }`.
  * Outputs: Frozen export history record.
  * Side effects: none.
  * Failure modes: throws ValidationError when `filename` is missing or blank.
@@ -51,6 +53,8 @@ export function createExportHistoryEntry(spec = {}) {
     sampleRate: Number.isFinite(sampleRate) && sampleRate > 0 ? Math.round(sampleRate) : null,
     languageCode: String(spec.languageCode || '').trim().slice(0, MAX_LANG_CODE_LEN),
     languageLabel: String(spec.languageLabel || '').trim().slice(0, MAX_LANG_LABEL_LEN),
+    audioMode: resolveCanonicalVideoAudioMode(spec.audioMode) || String(spec.audioMode || '').trim().toLowerCase().slice(0, MAX_MODE_LEN),
+    subtitleMode: resolveCanonicalVideoSubtitleMode(spec.subtitleMode) || String(spec.subtitleMode || '').trim().toLowerCase().slice(0, MAX_MODE_LEN),
     warningsCount: Number.isFinite(warnings) ? Math.max(0, Math.round(warnings)) : 0,
     exportedAt: typeof spec.exportedAt === 'string' && spec.exportedAt.trim() ? spec.exportedAt : new Date().toISOString(),
   });
@@ -72,8 +76,9 @@ export function normalizeExportHistory(rawHistory) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     try {
       normalized.push(createExportHistoryEntry(item));
-    } catch {
-      continue;
+    } catch (err) {
+      if (err instanceof ValidationError) continue;
+      throw err;
     }
     if (normalized.length >= MAX_EXPORT_HISTORY) break;
   }

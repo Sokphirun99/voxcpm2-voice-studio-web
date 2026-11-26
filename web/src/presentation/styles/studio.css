@@ -2713,14 +2713,104 @@ a {
   height: 36px;
 }
 
+.subtitle-voice-dub-section {
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
 .subtitle-voice-dub-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px 12px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
+}
+
+.subtitle-voice-dub-selects,
+.subtitle-voice-dub-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.subtitle-dub-mix-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--control);
+}
+
+.subtitle-dub-mix-panel[hidden] {
+  display: none;
+}
+
+.subtitle-dub-mix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.subtitle-dub-gain-field,
+.studio-page .export-mix-slider-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.subtitle-dub-gain-field[data-disabled="true"],
+.studio-page .export-mix-slider-field[data-disabled="true"] {
+  opacity: 0.55;
+}
+
+.subtitle-dub-gain-head,
+.studio-page .export-mix-slider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.subtitle-dub-gain-head strong,
+.studio-page .export-mix-slider-head strong {
+  color: var(--text);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.subtitle-dub-gain-field input[type="range"],
+.studio-page .export-mix-slider-field input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.subtitle-dub-mix-foot {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.studio-page .export-mix-controls {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 10px 12px;
+  align-items: end;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--editor);
+}
+
+.studio-page .export-reset-mix-btn {
+  justify-self: end;
+  min-height: 30px;
+  font-size: 12px;
 }
 
 .subtitle-voice-dub-mode {

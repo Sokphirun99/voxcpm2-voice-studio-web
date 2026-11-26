@@ -17,6 +17,18 @@ import {
 } from '../../domain/productionJobs.js';
 import { attachTakeToSegment, computeSegmentStatus, getSegmentActiveTake } from '../../domain/projectSegments.js';
 import { buildSubtitleSynthesisCommand } from '../../domain/subtitleTts.js';
+import {
+  EXPORT_PRESET_IDS,
+  VIDEO_AUDIO_MODES,
+  VIDEO_SUBTITLE_MODES,
+  assertVideoAudioMode,
+  assertVideoSubtitleMode,
+  hasCustomDubMixSettings,
+  recordPresetExport,
+  resolveDubVideoCodec,
+  validateDubMixSettings,
+} from '../../domain/exportPresets.js';
+import { resolveLanguageDisplayMeta } from '../../domain/subtitleLanguages.js';
 import { BUILT_IN_VOICES, findCharacterById } from '../../domain/voiceLibrary.js';
 import { tryReadWavDurationSeconds } from '../../domain/wavCodec.js';
 import { StudioContext } from '../StudioContext.jsx';
@@ -436,6 +448,22 @@ function wrapMediaSessionError(err) {
   return err;
 }
 
+async function recordBatchVideoExportHistory(deps, projectId, presetId, spec) {
+  if (!deps.projectRepository?.getProject || !deps.projectRepository?.saveProject || !projectId) return;
+  try {
+    await saveProjectMutationWithRetry(deps.projectRepository, projectId, project => {
+      const nextHistory = recordPresetExport(project.exportHistory ?? project.payload?.exportHistory ?? [], presetId, spec);
+      return {
+        ...project,
+        exportHistory: nextHistory,
+        payload: { ...(project.payload || {}), exportHistory: nextHistory },
+      };
+    });
+  } catch (err) {
+    deps.logger?.warn?.('useProductionJobs.recordBatchVideoExportHistory', err?.message || 'Could not update project exportHistory', { projectId, presetId });
+  }
+}
+
 async function executeVideoBurnItem({ job, item, signal, deps }) {
   if (!deps.mediaSubtitleGateway?.burnSubtitles) {
     throw new ValidationError('Media burn-in service is unavailable.', 'mediaSubtitleGateway', 'MEDIA_UNAVAILABLE');
@@ -455,12 +483,23 @@ async function executeVideoBurnItem({ job, item, signal, deps }) {
       bilingual: Boolean(meta.bilingual),
       subtitleStyle: meta.subtitleStyle,
       videoSize: meta.videoSize,
+      ...(meta.audioLanguage ? { audioLanguage: String(meta.audioLanguage) } : {}),
       signal,
     });
   } catch (err) {
     throw wrapMediaSessionError(err);
   }
-  return uploadVideoOutputArtifact(deps, { blob: mp4Blob, fileName: meta.outputFileName || 'subtitled.mp4', projectId: job.projectId, item });
+  const fileName = meta.outputFileName || 'subtitled.mp4';
+  const uploaded = await uploadVideoOutputArtifact(deps, { blob: mp4Blob, fileName, projectId: job.projectId, item });
+  const langMeta = resolveLanguageDisplayMeta(meta.subtitleLanguage || meta.audioLanguage || '');
+  await recordBatchVideoExportHistory(deps, job.projectId, EXPORT_PRESET_IDS.VIDEO_BURNED_MP4, {
+    filename: fileName,
+    languageCode: langMeta.bcp47,
+    languageLabel: langMeta.label,
+    audioMode: VIDEO_AUDIO_MODES.ORIGINAL,
+    subtitleMode: VIDEO_SUBTITLE_MODES.BURNED,
+  });
+  return uploaded;
 }
 
 async function loadDubClipsFromAssets(meta, assetRepository) {
@@ -477,6 +516,14 @@ async function loadDubClipsFromAssets(meta, assetRepository) {
   return clips;
 }
 
+function validateBatchDubSubtitles(subtitleMode, subtitles) {
+  if (subtitleMode === VIDEO_SUBTITLE_MODES.NONE) return null;
+  if (!subtitles || typeof subtitles !== 'object' || !Array.isArray(subtitles.segments) || subtitles.segments.length === 0) {
+    throw new ValidationError('Non-empty subtitle segments are required when subtitleMode is burned or soft.', 'subtitles', 'MISSING_DUB_SUBTITLES');
+  }
+  return subtitles;
+}
+
 async function executeVideoDubItem({ job, item, signal, deps }) {
   if (!deps.mediaSubtitleGateway?.exportDubbedVideo) {
     throw new ValidationError('Media dubbing service is unavailable.', 'mediaSubtitleGateway', 'MEDIA_UNAVAILABLE');
@@ -485,19 +532,37 @@ async function executeVideoDubItem({ job, item, signal, deps }) {
   if (!meta.mediaJobId) {
     throw new ValidationError('Re-open the video and extract subtitles before retrying dubbed video export.', 'mediaJobId', 'MISSING_MEDIA_JOB');
   }
-  const clips = await loadDubClipsFromAssets(meta, deps.assetRepository);
+  const audioMode = assertVideoAudioMode(meta.originalAudioMode ?? meta.audioMode ?? VIDEO_AUDIO_MODES.DUCK);
+  const subtitleMode = assertVideoSubtitleMode(meta.subtitleMode ?? VIDEO_SUBTITLE_MODES.NONE);
+  const mixSettings = meta.mixSettings !== undefined ? validateDubMixSettings(meta.mixSettings) : null;
+  const subtitles = validateBatchDubSubtitles(subtitleMode, meta.subtitles);
+  const clips = audioMode === VIDEO_AUDIO_MODES.ORIGINAL ? [] : await loadDubClipsFromAssets(meta, deps.assetRepository);
   let mp4Blob;
   try {
     mp4Blob = await deps.mediaSubtitleGateway.exportDubbedVideo({
       jobId: meta.mediaJobId,
       clips,
-      originalAudioMode: meta.originalAudioMode || 'duck',
+      originalAudioMode: audioMode,
+      ...(meta.audioLanguage ? { audioLanguage: String(meta.audioLanguage) } : {}),
+      ...(mixSettings && hasCustomDubMixSettings(mixSettings) ? { mixSettings } : {}),
+      ...(subtitleMode !== VIDEO_SUBTITLE_MODES.NONE ? { subtitleMode, subtitles } : {}),
       signal,
     });
   } catch (err) {
     throw wrapMediaSessionError(err);
   }
-  return uploadVideoOutputArtifact(deps, { blob: mp4Blob, fileName: meta.outputFileName || 'dubbed.mp4', projectId: job.projectId, item });
+  const fileName = meta.outputFileName || 'dubbed.mp4';
+  const uploaded = await uploadVideoOutputArtifact(deps, { blob: mp4Blob, fileName, projectId: job.projectId, item });
+  const langMeta = resolveLanguageDisplayMeta(meta.audioLanguage || '');
+  await recordBatchVideoExportHistory(deps, job.projectId, EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4, {
+    filename: fileName,
+    codec: resolveDubVideoCodec(subtitleMode),
+    languageCode: langMeta.bcp47,
+    languageLabel: langMeta.label,
+    audioMode,
+    subtitleMode,
+  });
+  return uploaded;
 }
 
 function runBuiltInItemExecutor(ctx) {

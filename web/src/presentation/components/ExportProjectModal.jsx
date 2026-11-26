@@ -5,11 +5,23 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  DEFAULT_DUB_MIX_SETTINGS,
+  DEFAULT_DUB_SUBTITLE_MODE,
+  DUB_MIX_BOUNDS,
   EXPORT_PRESET_CATEGORIES,
+  VIDEO_AUDIO_MODES,
+  VIDEO_EXPORT_AUDIO_MODE_OPTIONS,
+  VIDEO_SUBTITLE_MODE_OPTIONS,
+  clampDubMixField,
   evaluateExportPresets,
+  formatGainDbLabel,
+  formatGainPercentLabel,
+  hasCustomDubMixSettings,
+  normalizeDubMixSettings,
+  normalizeVideoAudioMode,
+  normalizeVideoSubtitleMode,
   resolveExportFilenameStem,
 } from '../../domain/exportPresets.js';
-import { DUB_AUDIO_MODE_OPTIONS } from '../../domain/subtitleTts.js';
 import { Icon } from './Icon.jsx';
 
 const CATEGORY_TITLES = Object.freeze({
@@ -80,6 +92,18 @@ function PresetSpecsList({ expected }) {
         <dt>Language</dt>
         <dd>{formatLanguageSummary(expected)}</dd>
       </div>
+      {expected.audioModeLabel && (
+        <div className="export-preset-spec-row">
+          <dt>Audio mode</dt>
+          <dd title={expected.audioModeLabel}>{expected.audioModeLabel}</dd>
+        </div>
+      )}
+      {expected.subtitleModeLabel && (
+        <div className="export-preset-spec-row">
+          <dt>Subtitles</dt>
+          <dd title={expected.subtitleModeLabel}>{expected.subtitleModeLabel}</dd>
+        </div>
+      )}
     </dl>
   );
 }
@@ -131,6 +155,79 @@ function ExportPresetCard({ preset, busy, activePresetId, onRun }) {
   );
 }
 
+function ExportMixSlider({ id, label, valueText, field, value, disabled, onChange }) {
+  const spec = DUB_MIX_BOUNDS[field];
+  return (
+    <label className="export-mix-slider-field" htmlFor={id} data-disabled={disabled ? 'true' : undefined}>
+      <span className="export-mix-slider-head">
+        <span>{label}</span>
+        <strong>{valueText}</strong>
+      </span>
+      <input
+        id={id}
+        type="range"
+        min={spec.min}
+        max={spec.max}
+        step={spec.step}
+        value={value}
+        disabled={disabled}
+        onChange={e => onChange(field, Number(e.target.value))}
+      />
+    </label>
+  );
+}
+
+function ExportDubMixControls({ draft, setDraft }) {
+  const mix = normalizeDubMixSettings(draft.dubMixSettings);
+  const audioMode = draft.dubAudioMode;
+  const isCustom = hasCustomDubMixSettings(mix);
+  const duckLabel = `${formatGainPercentLabel(mix.duckVolume)} (${formatGainDbLabel(mix.duckVolume)})`;
+  const updateField = (field, val) => setDraft(prev => ({
+    ...prev,
+    dubMixSettings: Object.freeze({ ...normalizeDubMixSettings(prev.dubMixSettings), [field]: clampDubMixField(field, val) }),
+  }));
+  return (
+    <div className="export-mix-controls" aria-label="Dubbing audio mix and ducking controls">
+      <ExportMixSlider
+        id="export-orig-volume"
+        label="Original audio level"
+        valueText={audioMode === VIDEO_AUDIO_MODES.REPLACE ? 'Muted' : formatGainPercentLabel(mix.originalVolume)}
+        field="originalVolume"
+        value={mix.originalVolume}
+        disabled={audioMode === VIDEO_AUDIO_MODES.REPLACE}
+        onChange={updateField}
+      />
+      <ExportMixSlider
+        id="export-dub-volume"
+        label="Dubbed voice level"
+        valueText={audioMode === VIDEO_AUDIO_MODES.ORIGINAL ? 'Excluded' : formatGainPercentLabel(mix.dubVolume)}
+        field="dubVolume"
+        value={mix.dubVolume}
+        disabled={audioMode === VIDEO_AUDIO_MODES.ORIGINAL}
+        onChange={updateField}
+      />
+      <ExportMixSlider
+        id="export-duck-volume"
+        label="Ducking floor"
+        valueText={audioMode === VIDEO_AUDIO_MODES.DUCK ? duckLabel : 'Off'}
+        field="duckVolume"
+        value={mix.duckVolume}
+        disabled={audioMode !== VIDEO_AUDIO_MODES.DUCK}
+        onChange={updateField}
+      />
+      <button
+        type="button"
+        id="export-reset-mix-btn"
+        className="button subtle-button export-reset-mix-btn"
+        disabled={!isCustom}
+        onClick={() => setDraft(prev => ({ ...prev, dubMixSettings: DEFAULT_DUB_MIX_SETTINGS }))}
+      >
+        Reset mix
+      </button>
+    </div>
+  );
+}
+
 function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOption }) {
   return (
     <>
@@ -139,7 +236,7 @@ function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOp
         <select
           id="export-language-mode"
           value={draft.languageMode}
-          onChange={e => setDraft(prev => ({ ...prev, languageMode: e.target.value }))}
+          onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, languageMode: val })); }}
         >
           <option value="original">Original language</option>
           {hasTranslation && <option value="translated">Translated language</option>}
@@ -147,17 +244,30 @@ function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOp
         </select>
       </label>
       <label className="export-control-field" htmlFor="export-dub-audio-mode">
-        <span>Dubbed MP4 original audio</span>
+        <span>Dubbed MP4 audio mode</span>
         <select
           id="export-dub-audio-mode"
           value={draft.dubAudioMode}
-          onChange={e => setDraft(prev => ({ ...prev, dubAudioMode: e.target.value }))}
+          onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, dubAudioMode: val })); }}
         >
-          {DUB_AUDIO_MODE_OPTIONS.map(opt => (
+          {VIDEO_EXPORT_AUDIO_MODE_OPTIONS.map(opt => (
             <option key={opt.id} value={opt.id}>{opt.label}</option>
           ))}
         </select>
       </label>
+      <label className="export-control-field" htmlFor="export-dub-subtitle-mode">
+        <span>Dubbed MP4 subtitles</span>
+        <select
+          id="export-dub-subtitle-mode"
+          value={draft.dubSubtitleMode}
+          onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, dubSubtitleMode: val })); }}
+        >
+          {VIDEO_SUBTITLE_MODE_OPTIONS.map(opt => (
+            <option key={opt.id} value={opt.id}>{opt.label}</option>
+          ))}
+        </select>
+      </label>
+      <ExportDubMixControls draft={draft} setDraft={setDraft} />
       <div className="export-control-toggles">
         {showSpeakerOption && (
           <label className="export-checkbox-label" htmlFor="export-include-speaker">
@@ -165,7 +275,7 @@ function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOp
               id="export-include-speaker"
               type="checkbox"
               checked={draft.includeSpeaker}
-              onChange={e => setDraft(prev => ({ ...prev, includeSpeaker: e.target.checked }))}
+              onChange={e => { const checked = e.target.checked; setDraft(prev => ({ ...prev, includeSpeaker: checked })); }}
             />
             <span>Include speaker labels</span>
           </label>
@@ -175,7 +285,7 @@ function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOp
             id="export-language-suffix"
             type="checkbox"
             checked={draft.includeLanguageSuffix}
-            onChange={e => setDraft(prev => ({ ...prev, includeLanguageSuffix: e.target.checked }))}
+            onChange={e => { const checked = e.target.checked; setDraft(prev => ({ ...prev, includeLanguageSuffix: checked })); }}
           />
           <span>Append language code to subtitle filename</span>
         </label>
@@ -206,6 +316,8 @@ function ExportHistoryList({ exportHistory = [] }) {
                   <span>
                     {[
                       item.label,
+                      item.audioMode ? `Audio: ${item.audioMode}` : null,
+                      item.subtitleMode ? `Subs: ${item.subtitleMode}` : null,
                       item.languageLabel && item.languageLabel !== 'Undetermined' ? `${item.languageLabel}${item.languageCode ? ` (${item.languageCode})` : ''}` : null,
                       Number.isFinite(item.durationSeconds) && item.durationSeconds > 0 ? formatDurationLabel(item.durationSeconds) : null,
                     ].filter(Boolean).join(' · ')}
@@ -237,7 +349,9 @@ function buildInitialExportDraft(context = {}) {
     languageMode: mode,
     includeSpeaker: Boolean(context.includeSpeaker),
     includeLanguageSuffix: Boolean(context.includeLanguageSuffix),
-    dubAudioMode: context.dubAudioMode || 'duck',
+    dubAudioMode: normalizeVideoAudioMode(context.dubAudioMode, VIDEO_AUDIO_MODES.DUCK),
+    dubSubtitleMode: normalizeVideoSubtitleMode(context.dubSubtitleMode, DEFAULT_DUB_SUBTITLE_MODE),
+    dubMixSettings: normalizeDubMixSettings(context.dubMixSettings),
   };
 }
 
@@ -373,7 +487,7 @@ export function ExportProjectModal({
             type="text"
             value={draft.filenameStem}
             placeholder={workspace === 'tts' ? 'voxcpm2-narration' : 'subtitle'}
-            onChange={e => setDraft(prev => ({ ...prev, filenameStem: e.target.value }))}
+            onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, filenameStem: val })); }}
           />
         </label>
         {workspace === 'subtitle' && (
