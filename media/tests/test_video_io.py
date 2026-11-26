@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import wave
@@ -27,6 +28,7 @@ from video_io import (
     probe_media_duration,
     probe_video_dimensions,
     resolve_ffmpeg_bin,
+    resolve_ffprobe_bin,
 )
 
 
@@ -278,3 +280,103 @@ def test_mux_dubbed_audio_supports_duck_mute_keep_atempo_and_validation(tmp_path
     fake_fail.chmod(0o755)
     with pytest.raises(MediaProcessingError, match="Invalid filter parameter"):
         mux_dubbed_audio(sample_mp4, clips, tmp_path / "fail.mp4", ffmpeg_bin=str(fake_fail))
+
+
+def _probe_streams(media_path: Path) -> tuple[dict, list[dict]]:
+    ffprobe_bin = resolve_ffprobe_bin()
+    proc = subprocess.run(
+        [ffprobe_bin, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(media_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    return payload.get("format") or {}, payload.get("streams") or []
+
+
+def test_export_presets_mp4_codecs_duration_language_and_non_mp4_transcoding(tmp_path: Path) -> None:
+    ffmpeg_bin = resolve_ffmpeg_bin()
+    if not Path(ffmpeg_bin).exists() and not shutil.which(ffmpeg_bin):
+        pytest.skip("ffmpeg not installed")
+
+    clip_a = _write_test_wav(tmp_path / "clip.wav", 0.5)
+
+    # 1. Odd dimensions + yuv444p source must transcode cleanly to yuv420p H.264 even dims on dubbing
+    odd_mkv = tmp_path / "odd_444.mkv"
+    subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=#202020:s=321x241:d=1.4:r=24",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1.4",
+        "-c:v", "libx264", "-pix_fmt", "yuv444p", "-c:a", "aac", "-shortest",
+        str(odd_mkv),
+    ], check=True, capture_output=True)
+
+    dubbed_mp4 = tmp_path / "dubbed-khmer.mp4"
+    mux_dubbed_audio(
+        odd_mkv,
+        [DubClip(wav_path=clip_a, start_seconds=0.1, end_seconds=0.9, segment_id="seg-1")],
+        dubbed_mp4,
+        original_audio_mode="duck",
+        ffmpeg_bin=ffmpeg_bin,
+        audio_language="khm_Khmr",
+    )
+    fmt, streams = _probe_streams(dubbed_mp4)
+    v_stream = next(s for s in streams if s.get("codec_type") == "video")
+    a_stream = next(s for s in streams if s.get("codec_type") == "audio")
+    assert v_stream["codec_name"] == "h264"
+    assert v_stream["pix_fmt"] == "yuv420p"
+    assert v_stream["width"] % 2 == 0 and v_stream["height"] % 2 == 0
+    assert a_stream["codec_name"] == "aac"
+    assert str(a_stream.get("sample_rate")) == "48000"
+    assert (a_stream.get("tags") or {}).get("language") == "khm"
+    assert 1.1 <= float(fmt["duration"]) <= 1.7
+
+    # 2. Burned MP4 preserves audio language metadata and standard MP4 codecs
+    ass_path = tmp_path / "subs.ass"
+    ass_path.write_text(
+        build_ass([SubtitleSegment(start=0.1, end=1.1, text="សួស្តី", speaker_id="speaker-1")], video_size=(320, 240)),
+        encoding="utf-8",
+    )
+    burned_mp4 = tmp_path / "burned-en.mp4"
+    burn_ass_subtitles(odd_mkv, ass_path, burned_mp4, ffmpeg_bin=ffmpeg_bin, audio_language="en-US")
+    burn_fmt, burn_streams = _probe_streams(burned_mp4)
+    bv = next(s for s in burn_streams if s.get("codec_type") == "video")
+    ba = next(s for s in burn_streams if s.get("codec_type") == "audio")
+    assert bv["codec_name"] == "h264"
+    assert bv["pix_fmt"] == "yuv420p"
+    assert bv["width"] == 320 and bv["height"] == 240
+    assert ba["codec_name"] == "aac"
+    assert str(ba.get("sample_rate")) == "48000"
+    assert ba.get("channels") == 2
+    assert (ba.get("tags") or {}).get("language") == "eng"
+    assert 1.1 <= float(burn_fmt["duration"]) <= 1.7
+
+    # 3. HEVC MKV source stream-copies with hvc1 QuickTime/Safari-compatible tag and silent burn keeps audio_language
+    hevc_mkv = tmp_path / "hevc.mkv"
+    subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "lavfi", "-i", "color=c=#181818:s=320x240:d=1.2:r=24",
+        "-c:v", "libx265", "-pix_fmt", "yuv420p", "-an",
+        str(hevc_mkv),
+    ], check=True, capture_output=True)
+    silent_burned = tmp_path / "hevc-silent-burned.mp4"
+    burn_ass_subtitles(hevc_mkv, ass_path, silent_burned, ffmpeg_bin=ffmpeg_bin, audio_language="km")
+    _, sb_streams = _probe_streams(silent_burned)
+    assert any(s.get("codec_type") == "video" and s.get("codec_name") == "h264" for s in sb_streams)
+    assert not any(s.get("codec_type") == "audio" for s in sb_streams)
+
+    hevc_out = tmp_path / "hevc-dub.mp4"
+    mux_dubbed_audio(
+        hevc_mkv,
+        [DubClip(wav_path=clip_a, start_seconds=0.1, end_seconds=0.8)],
+        hevc_out,
+        original_audio_mode="mute",
+        ffmpeg_bin=ffmpeg_bin,
+        audio_language="ja",
+    )
+    _, hevc_streams = _probe_streams(hevc_out)
+    hv = next(s for s in hevc_streams if s.get("codec_type") == "video")
+    ha = next(s for s in hevc_streams if s.get("codec_type") == "audio")
+    assert hv["codec_name"] == "hevc"
+    assert hv["codec_tag_string"] == "hvc1"
+    assert (ha.get("tags") or {}).get("language") == "jpn"

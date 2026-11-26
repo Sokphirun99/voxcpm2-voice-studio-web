@@ -116,10 +116,12 @@ function buildVerifySpeechFormData({ blob, expectedText, language = 'km', fileNa
  * @param {{ jobId: string, clips: Array<{ segmentId: string, start: number, end: number, blob: Blob }>, originalAudioMode?: string }} spec - Dub export inputs.
  * @returns {FormData} Multipart payload containing jobId, originalAudioMode, metadata JSON, and WAV files.
  */
-function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck' }) {
+function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck', audioLanguage = '' }) {
   const form = new FormData();
   form.append('jobId', String(jobId || ''));
   form.append('originalAudioMode', String(originalAudioMode || 'duck'));
+  const cleanAudioLanguage = String(audioLanguage || '').trim();
+  if (cleanAudioLanguage) form.append('audioLanguage', cleanAudioLanguage);
   const metadata = clips.map((clip, fileIndex) => {
     const fileName = `dub-clip-${String(fileIndex + 1).padStart(3, '0')}.wav`;
     form.append('files', clip.blob, fileName);
@@ -215,13 +217,25 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       bilingual = false,
       subtitleStyle,
       videoSize,
+      audioLanguage = '',
       signal,
     }) {
       try {
+        const cleanAudioLanguage = String(audioLanguage || '').trim();
         const res = await fetchImpl(BURN_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jobId, segments, speakerNames, includeSpeaker, useTranslation, bilingual, subtitleStyle, videoSize }),
+          body: JSON.stringify({
+            jobId,
+            segments,
+            speakerNames,
+            includeSpeaker,
+            useTranslation,
+            bilingual,
+            subtitleStyle,
+            videoSize,
+            ...(cleanAudioLanguage ? { audioLanguage: cleanAudioLanguage } : {}),
+          }),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not burn subtitles onto video'), { status: res.status });
@@ -251,11 +265,11 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       }
     },
 
-    async exportDubbedVideo({ jobId, clips = [], originalAudioMode = 'duck', signal }) {
+    async exportDubbedVideo({ jobId, clips = [], originalAudioMode = 'duck', audioLanguage = '', signal }) {
       try {
         const res = await fetchImpl(DUB_ENDPOINT, {
           method: 'POST',
-          body: buildDubVideoFormData({ jobId, clips, originalAudioMode }),
+          body: buildDubVideoFormData({ jobId, clips, originalAudioMode, audioLanguage }),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not export dubbed MP4'), { status: res.status });

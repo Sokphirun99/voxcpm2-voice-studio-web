@@ -23,12 +23,14 @@ import {
   validateSubtitleSegments,
 } from '../../domain/subtitles.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
+import { EXPORT_PRESET_IDS } from '../../domain/exportPresets.js';
 import { useStudioServices } from '../StudioContext.jsx';
 import { useSubtitleVoiceover } from '../hooks/useSubtitleVoiceover.js';
 import { useTerminology } from '../hooks/useTerminology.js';
 import { useVideoSubtitles } from '../hooks/useVideoSubtitles.js';
 import { Icon } from './Icon.jsx';
 import { DraftRecoveryBanner } from './DraftRecoveryBanner.jsx';
+import { ExportProjectModal } from './ExportProjectModal.jsx';
 import { MissingAssetBanner } from './MissingAssetBanner.jsx';
 import { OfflineReadinessBadge } from './OfflineReadinessBadge.jsx';
 import { ProjectAutosaveBadge } from './ProjectAutosaveBadge.jsx';
@@ -905,6 +907,7 @@ export function VideoSubtitleWorkspace({
   const services = useStudioServices();
   const effectiveTermsRef = useRef([]);
   const [terminologyOpen, setTerminologyOpen] = useState(false);
+  const [exportProjectOpen, setExportProjectOpen] = useState(false);
   const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden, effectiveTermsRef });
   const effectiveSourceLanguage = (ctrl.state.detectedLanguage && ctrl.state.detectedLanguage !== 'auto')
     ? ctrl.state.detectedLanguage
@@ -935,6 +938,7 @@ export function VideoSubtitleWorkspace({
     segments: state.segments,
     useTranslation: ctrl.useTranslation,
     videoFile: state.videoFile,
+    videoFileName: state.videoFileName,
     jobId: state.jobId,
     isAudioOnly: state.isAudioOnly,
     voiceCatalog,
@@ -943,6 +947,7 @@ export function VideoSubtitleWorkspace({
     terminology: terminologyCtrl.effectiveTerms,
     pronunciationSignature: terminologyCtrl.pronunciationSignature,
     speechLanguage: activeSpeechLanguage,
+    audioLanguage: activeSpeechLanguage,
     projectId: activeProjectId,
     projectTitle: activeProjectTitle,
     productionJobs,
@@ -950,6 +955,7 @@ export function VideoSubtitleWorkspace({
     onNotify,
     onUnlockSound,
     onEngineFailure: onRefreshEngine,
+    onExportRecorded: ctrl.recordExportHistory,
   });
   if (actionsRef) {
     actionsRef.current = {
@@ -1048,6 +1054,92 @@ export function VideoSubtitleWorkspace({
     voice.isClipStale,
     terminologyCtrl.effectiveTerms,
   ]);
+  const exportPresetContext = useMemo(() => ({
+    workspace: 'subtitle',
+    projectTitle: state.projectTitle,
+    videoFileName: state.videoFile?.name || state.videoFileName || '',
+    segments: state.segments,
+    segmentClips: voice.segmentClips,
+    detectedLanguage: state.detectedLanguage || state.options.sourceLanguage,
+    translatedLanguage: state.translatedLanguage,
+    selectedTargetLanguage: state.options.targetLanguage,
+    speechLanguage: activeSpeechLanguage,
+    hasTranslation: state.hasTranslation,
+    useTranslation: ctrl.useTranslation,
+    bilingual: ctrl.bilingual,
+    includeSpeaker: ctrl.effectiveIncludeSpeaker,
+    canShowSpeakerOption: speakers.length > 1 || Boolean(state.options.detectSpeakers),
+    dubAudioMode: voice.dubAudioMode,
+    videoDuration: ctrl.mediaDuration,
+    videoSize: state.videoSize,
+    isAudioOnly: state.isAudioOnly,
+    hasLinkedVideo: Boolean(state.videoFile),
+    jobId: state.jobId,
+    burnInSupported: health.burnInSupported,
+    selectedIds: voice.selectedIds,
+    spillApprovals: voice.spillApprovals,
+  }), [
+    state.projectTitle,
+    state.videoFile,
+    state.videoFileName,
+    state.segments,
+    state.detectedLanguage,
+    state.options.sourceLanguage,
+    state.options.targetLanguage,
+    state.options.detectSpeakers,
+    state.translatedLanguage,
+    activeSpeechLanguage,
+    state.hasTranslation,
+    state.videoSize,
+    state.isAudioOnly,
+    state.jobId,
+    voice.segmentClips,
+    voice.dubAudioMode,
+    voice.selectedIds,
+    voice.spillApprovals,
+    ctrl.useTranslation,
+    ctrl.bilingual,
+    ctrl.effectiveIncludeSpeaker,
+    ctrl.mediaDuration,
+    speakers.length,
+    health.burnInSupported,
+  ]);
+  const handleRunExportPreset = async (preset, draft) => {
+    const filename = preset.expectedOutput?.filename || '';
+    switch (preset.id) {
+      case EXPORT_PRESET_IDS.SUBTITLE_SRT:
+        ctrl.exportFile('srt', { ...draft, filename, throwOnError: true });
+        return;
+      case EXPORT_PRESET_IDS.SUBTITLE_VTT:
+        ctrl.exportFile('vtt', { ...draft, filename, throwOnError: true });
+        return;
+      case EXPORT_PRESET_IDS.SUBTITLE_TXT:
+        ctrl.exportFile('txt', { ...draft, filename, throwOnError: true });
+        return;
+      case EXPORT_PRESET_IDS.VIDEO_BURNED_MP4:
+        await ctrl.burnVideo({ ...draft, filename, throwOnError: true });
+        return;
+      case EXPORT_PRESET_IDS.SUBTITLE_VOICEOVER_WAV:
+        voice.downloadCombinedVoice({ filename, throwOnError: true });
+        return;
+      case EXPORT_PRESET_IDS.SUBTITLE_ALIGNED_WAV:
+        await voice.downloadAlignedVoice({ filename, throwOnError: true });
+        return;
+      case EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4:
+        if (draft?.dubAudioMode && draft.dubAudioMode !== voice.dubAudioMode) {
+          voice.setDubAudioMode?.(draft.dubAudioMode);
+        }
+        await voice.exportDubbedVideo({
+          filename,
+          originalAudioMode: draft?.dubAudioMode || voice.dubAudioMode,
+          audioLanguage: activeSpeechLanguage,
+          throwOnError: true,
+        });
+        return;
+      default:
+        break;
+    }
+  };
   return (
     <div className="workspace-panel subtitle-workspace" hidden={hidden}>
       <div className="workspace-notices">
@@ -1133,11 +1225,24 @@ export function VideoSubtitleWorkspace({
         canExportAlignedVoice={voice.canExportAlignedVoice}
         unresolvedMismatchCount={voice.exportDurationMismatches?.unresolvedCount || 0}
         onExportAlignedVoice={() => void voice.downloadAlignedVoice?.()}
+        onOpenExportProject={() => setExportProjectOpen(true)}
+        exportHistoryCount={(ctrl.exportHistory || []).length}
         onExportFile={ctrl.exportFile}
         onCopyDialogue={() => void ctrl.copyDialogue()}
         onBurnVideo={() => void ctrl.burnVideo()}
         onSendToTts={handleSendToTts}
       />
+      {exportProjectOpen && (
+        <ExportProjectModal
+          open={exportProjectOpen}
+          workspace="subtitle"
+          context={exportPresetContext}
+          exportHistory={ctrl.exportHistory || []}
+          busy={busy}
+          onExportPreset={handleRunExportPreset}
+          onClose={() => setExportProjectOpen(false)}
+        />
+      )}
       <TerminologyManagerModal
         open={terminologyOpen}
         terminologyCtrl={terminologyCtrl}

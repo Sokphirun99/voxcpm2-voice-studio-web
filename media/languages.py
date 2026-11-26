@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Final
 
 # Maps Whisper ISO-639-1 codes (plus common locale aliases) to exact NLLB-200 FLORES-200 tags.
@@ -172,6 +173,64 @@ SUPPORTED_NLLB_CODES: Final[frozenset[str]] = frozenset({
 
 _NLLB_LOWER_MAP: Final[dict[str, str]] = {code.lower(): code for code in SUPPORTED_NLLB_CODES}
 UNSUPPORTED_WHISPER_TRANSLATION_CODES: Final[frozenset[str]] = frozenset({"br", "haw", "la"})
+UNDETERMINED_ISO639_2: Final[str] = "und"
+NLLB_PREFIX_TO_ISO639_2: Final[dict[str, str]] = {
+    "acm": "ara", "acq": "ara", "aeb": "ara", "ajp": "ara", "als": "sqi",
+    "apc": "ara", "arb": "ara", "ars": "ara", "ary": "ara", "arz": "ara",
+    "ayr": "aym", "azb": "aze", "azj": "aze", "ckb": "kur", "dik": "din",
+    "fuv": "ful", "gaz": "orm", "khk": "mon", "kmr": "kur", "knc": "kau",
+    "lvs": "lav", "npi": "nep", "pbt": "pus", "pes": "fas", "plt": "mlg",
+    "prs": "fas", "quy": "que", "swh": "swa", "uzn": "uzb", "ydd": "yid",
+    "zsm": "msa",
+}
+EXTRA_ISO639_2_ALIASES: Final[dict[str, str]] = {
+    "br": "bre", "haw": "haw", "la": "lat", "mul": "mul", "no": "nor",
+}
+_BCP47_TAG_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+_SKIP_REVERSE_BCP47_KEYS: Final[frozenset[str]] = frozenset(
+    {"in", "iw", "jw", "no", "fil", "zh-cn", "zh-hans", "zh-hant", "zh-hk", "zh-sg", "zh-tw"}
+)
+_NLLB_TO_BCP47: Final[dict[str, str]] = {
+    **{
+        nllb: iso
+        for iso, nllb in ISO_TO_NLLB.items()
+        if iso not in _SKIP_REVERSE_BCP47_KEYS and "-" not in iso
+    },
+    "ace_Arab": "ace-Arab",
+    "aka_Latn": "ak",
+    "ayr_Latn": "ay",
+    "bam_Latn": "bm",
+    "bjn_Arab": "bjn-Arab",
+    "dzo_Tibt": "dz",
+    "ewe_Latn": "ee",
+    "fij_Latn": "fj",
+    "kas_Arab": "ks-Arab",
+    "kas_Deva": "ks-Deva",
+    "kik_Latn": "ki",
+    "kmr_Latn": "kmr",
+    "knc_Arab": "knc-Arab",
+    "kon_Latn": "kg",
+    "lim_Latn": "li",
+    "nob_Latn": "nb",
+    "run_Latn": "rn",
+    "sag_Latn": "sg",
+    "srd_Latn": "sc",
+    "ssw_Latn": "ss",
+    "taq_Tfng": "taq-Tfng",
+    "tgl_Latn": "tl",
+    "yue_Hant": "yue",
+    "zho_Hans": "zh-Hans",
+    "zho_Hant": "zh-Hant",
+}
+_KNOWN_ISO639_2_CODES: Final[frozenset[str]] = frozenset(
+    {
+        *(code.split("_", 1)[0].lower() for code in SUPPORTED_NLLB_CODES),
+        *NLLB_PREFIX_TO_ISO639_2.values(),
+        *EXTRA_ISO639_2_ALIASES.values(),
+        "fil",
+        "zho",
+    }
+)
 
 
 class UnsupportedLanguageError(ValueError):
@@ -209,3 +268,81 @@ def is_same_translation_language(source_lang: str, target_lang: str) -> bool:
         return resolve_nllb_lang_code(source_lang, strict=True) == resolve_nllb_lang_code(target_lang, strict=True)
     except UnsupportedLanguageError:
         return source_lang.strip().lower() == target_lang.strip().lower()
+
+
+def resolve_iso639_2_code(lang: str) -> str:
+    """Resolve a Whisper, BCP-47, NLLB-200, or ISO-639 tag into a 3-letter MP4 `mdhd` language code.
+
+    Inputs: `lang` language string.
+    Outputs: 3-letter lowercase ASCII language code (or `'und'` when undetermined).
+    Side effects: none.
+    Failure modes: returns `'und'` safely when `lang` is empty, `'auto'`, or unrecognized.
+    """
+    cleaned = (lang or "").strip().lower()
+    if not cleaned or cleaned in {"auto", UNDETERMINED_ISO639_2}:
+        return UNDETERMINED_ISO639_2
+    base = cleaned.replace("_", "-").split("-", 1)[0]
+    if base in EXTRA_ISO639_2_ALIASES:
+        return EXTRA_ISO639_2_ALIASES[base]
+    try:
+        nllb = resolve_nllb_lang_code(cleaned, strict=True)
+        prefix = nllb.split("_", 1)[0].lower()
+        return NLLB_PREFIX_TO_ISO639_2.get(prefix, prefix)
+    except UnsupportedLanguageError:
+        if len(base) == 3 and base.isascii() and base.isalpha():
+            mapped = NLLB_PREFIX_TO_ISO639_2.get(base, base)
+            if mapped in _KNOWN_ISO639_2_CODES:
+                return mapped
+        return UNDETERMINED_ISO639_2
+
+
+def _format_bcp47_subtags(parts: list[str]) -> str:
+    """Format canonical BCP-47 casing across language, script, and region subtags."""
+    formatted = [parts[0].lower()]
+    for subtag in parts[1:]:
+        if len(subtag) == 4 and subtag.isalpha():
+            formatted.append(subtag.title())
+        elif len(subtag) == 2 and subtag.isalpha():
+            formatted.append(subtag.upper())
+        else:
+            formatted.append(subtag.lower())
+    return "-".join(formatted)
+
+
+def _resolve_single_bcp47_part(base: str) -> str:
+    """Resolve a single-subtag ISO-639-1/2 code into a canonical BCP-47 tag or `''`."""
+    if base in _KNOWN_ISO639_2_CODES or base in ISO_TO_NLLB:
+        try:
+            nllb = resolve_nllb_lang_code(base, strict=True)
+            return _NLLB_TO_BCP47.get(nllb, base)
+        except UnsupportedLanguageError:
+            return base
+    return base if base in UNSUPPORTED_WHISPER_TRANSLATION_CODES else ""
+
+
+def resolve_bcp47_code(lang: str) -> str:
+    """Resolve language tags safely into a sanitized BCP-47 string for WebVTT headers, or `''` when unknown.
+
+    Inputs: `lang` (Whisper ISO-639-1, BCP-47, NLLB-200 FLORES tag, or 3-letter ISO-639-2 code).
+    Outputs: sanitized BCP-47 tag without whitespace/newlines, or `''` when invalid/undetermined.
+    Side effects: none.
+    Failure modes: rejects malformed or control-character strings cleanly with `''`.
+    """
+    raw = (lang or "").strip()
+    if not raw or any(ch in raw for ch in ("\r", "\n", "\x00", "\t", " ")):
+        return ""
+    lowered = raw.lower()
+    if lowered in {"auto", UNDETERMINED_ISO639_2}:
+        return ""
+    if lowered in _NLLB_LOWER_MAP:
+        nllb = _NLLB_LOWER_MAP[lowered]
+        return _NLLB_TO_BCP47.get(nllb, nllb.split("_", 1)[0].lower())
+    candidate = raw.replace("_", "-")
+    if not _BCP47_TAG_PATTERN.match(candidate):
+        return ""
+    parts = candidate.split("-")
+    if len(parts) == 1:
+        return _resolve_single_bcp47_part(parts[0].lower())
+    if resolve_iso639_2_code(candidate) == UNDETERMINED_ISO639_2:
+        return ""
+    return _format_bcp47_subtags(parts)

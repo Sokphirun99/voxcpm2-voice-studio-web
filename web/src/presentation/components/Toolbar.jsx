@@ -30,7 +30,7 @@ function GenerateButton({ busy, generateDisabled, shortcut }) {
  * @param {{ busy: boolean, generateDisabled: boolean, shortcut: string, onCancel: () => void, autosave?: object, offlineReadiness?: object, onSelectModels?: () => void }} props - Toolbar props.
  * @returns {React.ReactElement} Toolbar element.
  */
-export function Toolbar({ busy, generateDisabled, shortcut, onCancel, autosave, offlineReadiness, onSelectModels }) {
+export function Toolbar({ busy, generateDisabled, shortcut, onCancel, autosave, offlineReadiness, onSelectModels, onOpenExport, exportHistoryCount = 0 }) {
   return (
     <header className="studio-toolbar">
       <div className="toolbar-heading-group">
@@ -39,6 +39,18 @@ export function Toolbar({ busy, generateDisabled, shortcut, onCancel, autosave, 
         {offlineReadiness && <OfflineReadinessBadge readiness={offlineReadiness} onSelect={onSelectModels} />}
       </div>
       <div className="toolbar-actions">
+        {onOpenExport && (
+          <button
+            type="button"
+            id="tts-export-project-btn"
+            className="button subtle-button"
+            disabled={busy}
+            onClick={onOpenExport}
+          >
+            <Icon name="arrow_down_to_line" />
+            <span>Export project{exportHistoryCount > 0 ? ` (${exportHistoryCount})` : ''}</span>
+          </button>
+        )}
         {busy && (
           <button type="button" className="button subtle-button cancel-button" id="cancel-generate" onClick={onCancel}>
             <Icon name="stop_fill" /><span>Cancel</span>

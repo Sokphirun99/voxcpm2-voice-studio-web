@@ -4,6 +4,7 @@
 
 import { MAX_SCRIPT_LENGTH, countGraphemes } from './presets.js';
 import { ValidationError } from './errors.js';
+import { resolveBcp47LanguageTag } from './subtitleLanguages.js';
 export {
   DEFAULT_ENGLISH_TARGET,
   DEFAULT_KHMER_TARGET,
@@ -17,6 +18,8 @@ export {
   isSameSubtitleLanguage,
   normalizeTargetLanguageCode,
   pickDefaultTargetLanguage,
+  resolveBcp47LanguageTag,
+  resolveLanguageDisplayMeta,
   resolveTargetLanguageMeta,
 } from './subtitleLanguages.js';
 export {
@@ -388,15 +391,22 @@ export function pickSegmentText(seg, useTranslation = false, bilingual = false) 
 }
 
 /**
- * Normalizes CRLF line endings and collapses blank lines inside a single SRT/VTT cue body.
+ * Normalizes CRLF line endings, sanitizes cue timing arrows, and collapses blank lines inside a single SRT/VTT cue body.
  * @param {string} text - Raw cue text.
- * @returns {string} Cue-safe text without internal blank lines.
+ * @returns {string} Cue-safe text without internal blank lines or `-->` markers.
  */
 function normalizeCueText(text) {
   return String(text || '')
     .replace(/\r\n?/g, '\n')
+    .replace(/-->/g, '→')
     .replace(/\n(?:[ \t]*\n)+/g, '\n')
     .trim();
+}
+
+function buildVttHeader(language = '') {
+  const bcp47 = resolveBcp47LanguageTag(language);
+  if (!bcp47) return 'WEBVTT';
+  return `WEBVTT\nKind: subtitles\nLanguage: ${bcp47}`;
 }
 
 /**
@@ -409,7 +419,7 @@ export function buildSrt({ segments = [], speakerNames = {}, includeSpeaker = tr
   for (const seg of segments) {
     const body = normalizeCueText(pickSegmentText(seg, useTranslation, bilingual));
     if (!body) continue;
-    const prefix = includeSpeaker ? `[${resolveSpeakerLabel(seg.speakerId, speakerNames)}] ` : '';
+    const prefix = includeSpeaker ? `[${normalizeCueText(resolveSpeakerLabel(seg.speakerId, speakerNames))}] ` : '';
     const timing = `${formatSubtitleTime(seg.start, ',')} --> ${formatSubtitleTime(seg.end, ',')}`;
     blocks.push(`${blocks.length + 1}\n${timing}\n${prefix}${body}`);
   }
@@ -417,16 +427,16 @@ export function buildSrt({ segments = [], speakerNames = {}, includeSpeaker = tr
 }
 
 /**
- * Formats subtitle segments into WebVTT (`.vtt`) text for `<video><track>` preview.
+ * Formats subtitle segments into WebVTT (`.vtt`) text for `<video><track>` preview and external players.
  * @param {object} [spec] - WebVTT formatting specification.
  * @returns {string} WebVTT content.
  */
-export function buildVtt({ segments = [], speakerNames = {}, includeSpeaker = true, useTranslation = false, bilingual = false } = {}) {
-  const blocks = ['WEBVTT'];
+export function buildVtt({ segments = [], speakerNames = {}, includeSpeaker = true, useTranslation = false, bilingual = false, language = '' } = {}) {
+  const blocks = [buildVttHeader(language)];
   for (const seg of segments) {
     const body = normalizeCueText(pickSegmentText(seg, useTranslation, bilingual));
     if (!body) continue;
-    const prefix = includeSpeaker ? `${resolveSpeakerLabel(seg.speakerId, speakerNames)}: ` : '';
+    const prefix = includeSpeaker ? `${normalizeCueText(resolveSpeakerLabel(seg.speakerId, speakerNames))}: ` : '';
     const timing = `${formatSubtitleTime(seg.start, '.')} --> ${formatSubtitleTime(seg.end, '.')}`;
     blocks.push(`${timing}\n${prefix}${body}`);
   }

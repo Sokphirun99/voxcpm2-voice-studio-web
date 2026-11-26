@@ -7,6 +7,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from languages import resolve_bcp47_code
+
 DEFAULT_SPEAKER_PREFIX = "Speaker"
 NEAREST_TURN_MAX_GAP_SEC = 2.0
 WORD_TURN_MIN_OVERLAP_SEC = 0.05
@@ -177,9 +179,17 @@ def _display_line_text(segment: SubtitleSegment, use_translation: bool = False, 
 
 
 def _normalize_cue_text(text: str) -> str:
-    """Normalize CRLF line endings and collapse consecutive blank lines inside one SRT/VTT cue."""
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    """Normalize CRLF line endings, sanitize timing arrows, and collapse internal blank lines."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("-->", "→")
     return re.sub(r"\n(?:[ \t]*\n)+", "\n", normalized).strip()
+
+
+def _build_vtt_header(language: str) -> str:
+    """Build WebVTT header block with sanitized BCP-47 language metadata."""
+    bcp47 = resolve_bcp47_code(language)
+    if not bcp47:
+        return "WEBVTT"
+    return f"WEBVTT\nKind: subtitles\nLanguage: {bcp47}"
 
 
 def align_even_dimensions(width: int, height: int, *, min_size: int = 2) -> tuple[int, int]:
@@ -202,7 +212,7 @@ def build_srt(
         body = _normalize_cue_text(_display_line_text(seg, use_translation=use_translation, bilingual=bilingual))
         if not body:
             continue
-        prefix = f"[{resolve_speaker_label(seg.speaker_id, speaker_names)}] " if include_speaker else ""
+        prefix = f"[{_normalize_cue_text(resolve_speaker_label(seg.speaker_id, speaker_names))}] " if include_speaker else ""
         timing = f"{format_timestamp(seg.start, ',')} --> {format_timestamp(seg.end, ',')}"
         blocks.append(f"{len(blocks) + 1}\n{timing}\n{prefix}{body}")
     return "\n\n".join(blocks) + ("\n" if blocks else "")
@@ -214,14 +224,16 @@ def build_vtt(
     include_speaker: bool = True,
     use_translation: bool = False,
     bilingual: bool = False,
+    *,
+    language: str = "",
 ) -> str:
-    """Render subtitle segments to WebVTT (.vtt) format for HTML5 video preview."""
-    blocks: list[str] = ["WEBVTT"]
+    """Render subtitle segments to WebVTT (.vtt) format for HTML5 video preview and external players."""
+    blocks: list[str] = [_build_vtt_header(language)]
     for seg in segments:
         body = _normalize_cue_text(_display_line_text(seg, use_translation=use_translation, bilingual=bilingual))
         if not body:
             continue
-        prefix = f"{resolve_speaker_label(seg.speaker_id, speaker_names)}: " if include_speaker else ""
+        prefix = f"{_normalize_cue_text(resolve_speaker_label(seg.speaker_id, speaker_names))}: " if include_speaker else ""
         timing = f"{format_timestamp(seg.start, '.')} --> {format_timestamp(seg.end, '.')}"
         blocks.append(f"{timing}\n{prefix}{body}")
     return "\n\n".join(blocks) + "\n"

@@ -13,7 +13,6 @@ import {
   createEditableSegment,
   deleteSegment,
   attachTakeToSegment,
-  getSegmentActiveTake,
   getSegmentTake,
   hasSegmentAudio,
   selectSegmentTakeInList,
@@ -37,7 +36,13 @@ import {
   countGraphemes,
 } from '../../domain/presets.js';
 import { findCharacterById } from '../../domain/voiceLibrary.js';
+import {
+  EXPORT_PRESET_IDS,
+  normalizeExportHistory,
+  recordPresetExport,
+} from '../../domain/exportPresets.js';
 import { createTtsProjectSnapshot } from '../../domain/projects.js';
+import { resolveLanguageDisplayMeta } from '../../domain/subtitleLanguages.js';
 import {
   applySpellingTerms,
   createEmptyProjectTerminology,
@@ -54,6 +59,7 @@ import { useTerminology } from '../hooks/useTerminology.js';
 import { AudioPlayer } from './AudioPlayer.jsx';
 import { ChunkSegmentsPanel } from './ChunkSegmentsPanel.jsx';
 import { DraftRecoveryBanner } from './DraftRecoveryBanner.jsx';
+import { ExportProjectModal } from './ExportProjectModal.jsx';
 import { Icon } from './Icon.jsx';
 import { MissingAssetBanner } from './MissingAssetBanner.jsx';
 import { ScriptEditor } from './ScriptEditor.jsx';
@@ -460,6 +466,7 @@ function applyProjectSnapshotToTts(snapshot, setters) {
   if (opts && typeof opts === 'object') setters.setOptions(prev => ({ ...prev, ...opts }));
   setters.setProjectTerminology?.(normalizeProjectTerminology(snapshot.terminology ?? snapshot.payload?.terminology ?? snapshot.settings?.terminology));
   setters.setProjectSourceLanguage?.(snapshot.sourceLanguage || snapshot.payload?.detectedLanguage || '');
+  setters.setExportHistory?.(normalizeExportHistory(snapshot.exportHistory ?? snapshot.payload?.exportHistory ?? snapshot.settings?.exportHistory));
   const voiceId = snapshot.payload?.voiceId || snapshot.settings?.voiceId;
   if (voiceId && setters.allVoices.some(voice => voice.id === voiceId)) {
     setters.characterActions?.handleSelectCharacter?.(voiceId);
@@ -487,7 +494,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   const [options, setOptions] = useState(INITIAL_OPTIONS);
   const [projectTerminology, setProjectTerminology] = useState(createEmptyProjectTerminology);
   const [projectSourceLanguage, setProjectSourceLanguage] = useState('');
+  const [exportHistory, setExportHistory] = useState([]);
   const [terminologyModalOpen, setTerminologyModalOpen] = useState(false);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
   const [projectId, setProjectId] = useState('');
   const projectIdRef = useRef(projectId);
   useEffect(() => {
@@ -622,7 +631,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         const latest = page.items.find(project => project.kind === 'tts');
         if (!latest) return;
         const snapshot = await projectRepository.getProject(latest.id);
-        if (!active || !snapshot || receivedExternalScriptRef.current || scriptValueRef.current.trim()) return;
+        if (!active || !snapshot || receivedExternalScriptRef.current || scriptValueRef.current.trim() || projectIdRef.current) return;
         setProjectId(snapshot.id);
         setProjectTitle(snapshot.title);
         setProjectRevision(snapshot.revision || 1);
@@ -639,6 +648,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         }
         setProjectTerminology(normalizeProjectTerminology(snapshot.terminology ?? snapshot.payload?.terminology ?? snapshot.settings?.terminology));
         setProjectSourceLanguage(snapshot.sourceLanguage || snapshot.payload?.detectedLanguage || '');
+        setExportHistory(normalizeExportHistory(snapshot.exportHistory ?? snapshot.payload?.exportHistory ?? snapshot.settings?.exportHistory));
         const voiceId = snapshot.payload?.voiceId;
         if (voiceId && allVoicesRef.current.some(voice => voice.id === voiceId)) {
           characterActionsRef.current.handleSelectCharacter(voiceId);
@@ -706,8 +716,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       ttsOptions: options,
       sourceLanguage: projectSourceLanguage,
       terminology: projectTerminology,
+      exportHistory,
     });
-  }, [projectId, projectTitle, script, segments, activeCharacter.id, options, projectSourceLanguage, projectTerminology]);
+  }, [projectId, projectTitle, script, segments, activeCharacter.id, options, projectSourceLanguage, projectTerminology, exportHistory]);
 
   const autosave = useProjectAutosave({
     projectId,
@@ -715,7 +726,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     buildSnapshot,
     enabled: projectsReady,
     debounceMs: 1500,
-    deps: [script, segments, projectTitle, activeCharacter.id, options, projectSourceLanguage, projectTerminology],
+    deps: [script, segments, projectTitle, activeCharacter.id, options, projectSourceLanguage, projectTerminology, exportHistory],
     hidden,
     projectRepository,
     logger,
@@ -915,12 +926,55 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     });
   }, [segments, activeCharacter, options, assetRepository, synthesis, projectTitle]);
 
-  const handleExportNarration = useCallback(async () => {
+  const recordExportHistory = useCallback((presetId, spec = {}) => {
+    setExportHistory(prev => recordPresetExport(prev, presetId, spec));
+  }, []);
+
+  const handleExportNarration = useCallback(async (filenameOrEvent = '', { throwOnError = false } = {}) => {
+    const filenameOverride = typeof filenameOrEvent === 'string' ? filenameOrEvent.trim() : '';
     const assetFetcher = assetRepository ? id => assetRepository.getAssetBinary(id) : null;
-    await synthesis.exportNarration({
-      segments, character: activeCharacter, options, assetFetcher, projectTitle,
-    });
-  }, [segments, activeCharacter, options, assetRepository, synthesis, projectTitle]);
+    const langMeta = resolveLanguageDisplayMeta(projectSourceLanguage);
+    const hasSegmentTakes = segments.some(seg => Boolean(seg?.text?.trim() && hasSegmentAudio(seg)));
+    if (hasSegmentTakes) {
+      const stemOverride = filenameOverride ? filenameOverride.replace(/-narration\.wav$|\.wav$/i, '') : '';
+      const rec = await synthesis.exportNarration({
+        segments, character: activeCharacter, options, assetFetcher,
+        projectTitle: stemOverride || projectTitle,
+        ...(filenameOverride ? { filename: filenameOverride } : {}),
+        throwOnError,
+      });
+      if (rec) {
+        recordExportHistory(EXPORT_PRESET_IDS.TTS_NARRATION_WAV, {
+          filename: filenameOverride || rec.filename || 'voxcpm2-assembled-narration.wav',
+          durationSeconds: rec.audioDurationSeconds ?? rec.duration ?? null,
+          languageCode: langMeta.bcp47,
+          languageLabel: langMeta.label,
+        });
+      }
+      return rec;
+    }
+    const activeRec = synthesis.recording;
+    if (activeRec?.audioUrl && typeof document !== 'undefined' && document.body) {
+      const downloadName = filenameOverride || activeRec.filename || 'voxcpm2-narration.wav';
+      const anchor = document.createElement('a');
+      anchor.href = activeRec.audioUrl;
+      anchor.download = downloadName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      recordExportHistory(EXPORT_PRESET_IDS.TTS_NARRATION_WAV, {
+        filename: downloadName,
+        durationSeconds: activeRec.audioDurationSeconds ?? activeRec.duration ?? null,
+        languageCode: langMeta.bcp47,
+        languageLabel: langMeta.label,
+      });
+      return activeRec;
+    }
+    if (throwOnError) {
+      throw new Error('Generate audio or assemble narration before exporting WAV.');
+    }
+    return null;
+  }, [segments, activeCharacter, options, assetRepository, synthesis, projectTitle, projectSourceLanguage, recordExportHistory]);
 
   useEffect(() => () => {
     audioPreviewRef.current?.pause();
@@ -944,6 +998,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       setOptions,
       setProjectTerminology,
       setProjectSourceLanguage,
+      setExportHistory,
       allVoices: allVoicesRef.current,
       characterActions: characterActionsRef.current,
     });
@@ -957,6 +1012,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     ...(projectSourceLanguage ? { sourceLanguage: projectSourceLanguage } : {}),
     segments,
     terminology: projectTerminology,
+    exportHistory,
     payload: {
       script,
       segments,
@@ -964,8 +1020,9 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       voiceId: activeCharacter.id,
       ...(projectSourceLanguage ? { detectedLanguage: projectSourceLanguage } : {}),
       terminology: projectTerminology,
+      exportHistory,
     },
-  }), [projectId, projectTitle, projectRevision, projectSourceLanguage, script, segments, options, activeCharacter.id, projectTerminology]);
+  }), [projectId, projectTitle, projectRevision, projectSourceLanguage, script, segments, options, activeCharacter.id, projectTerminology, exportHistory]);
 
   const recovery = useProjectRecovery({
     projectId,
@@ -986,6 +1043,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
       closeLibrary: () => setLibraryModal({ open: false, openForm: false }),
       loadProject: snapshot => {
         projectIdRef.current = snapshot?.id || '';
+        synthesis.clearTakes?.();
         autosave.resetProject(snapshot?.id || '', snapshot?.revision || 1);
         applyProjectSnapshotToTts(snapshot, {
           setProjectId,
@@ -996,6 +1054,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
           setOptions,
           setProjectTerminology,
           setProjectSourceLanguage,
+          setExportHistory,
           allVoices: allVoicesRef.current,
           characterActions: characterActionsRef.current,
         });
@@ -1012,6 +1071,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
           autosave.resetProject(updatedProject.id || currentId, updatedProject.revision || 1);
           setProjectRevision(updatedProject.revision || 1);
           setSegments(normalizedSegs);
+          setExportHistory(normalizeExportHistory(updatedProject.exportHistory ?? updatedProject.payload?.exportHistory));
           void recovery.verifyAssets(updatedProject);
           return;
         }
@@ -1039,12 +1099,13 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     handleRestitchSegments, handleExportNarration, hasTakesToRestitch,
     canApplySpelling, handleApplySpelling,
     projectTerminology, setProjectTerminology, terminologyModalOpen, setTerminologyModalOpen,
+    exportHistory, recordExportHistory, exportModalOpen, setExportModalOpen,
     options, setOptions, lockedSeeds, setLockedSeeds, library, anchorApi,
     charactersRef, libraryModal, setLibraryModal,
   };
   const ctrl = {
     logger, glossaryRepository, assetRepository, projectId, projectTitle,
-    terminologyCtrl, projectTerminology, projectSourceLanguage,
+    terminologyCtrl, projectTerminology, projectSourceLanguage, exportHistory,
     synthesis, activeCharacter, activeAnchor, actions: characterActions,
     count, isOverLimit, generateDisabled, autosave, recovery,
   };
@@ -1070,6 +1131,13 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
     actions: ctrl.actions, activeCharacter: ctrl.activeCharacter,
     setLibraryModal: state.setLibraryModal, setOptions: state.setOptions, setLockedSeeds: state.setLockedSeeds,
   });
+  const ttsExportContext = useMemo(() => ({
+    workspace: 'tts',
+    projectTitle: ctrl.projectTitle || 'Text-to-speech script',
+    ttsRecording: ctrl.synthesis.recording,
+    ttsSegments: state.segments,
+    detectedLanguage: ctrl.projectSourceLanguage || '',
+  }), [ctrl.projectTitle, ctrl.synthesis.recording, state.segments, ctrl.projectSourceLanguage]);
   return (
     <div className="workspace-panel" hidden={hidden}>
       <div className="workspace-notices">
@@ -1093,7 +1161,9 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel}
         autosave={ctrl.autosave}
         offlineReadiness={shared?.offlineReadiness}
-        onSelectModels={shared?.onSelectModels} />
+        onSelectModels={shared?.onSelectModels}
+        onOpenExport={() => state.setExportModalOpen(true)}
+        exportHistoryCount={ctrl.exportHistory.length} />
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
         onOpenLibrary={() => state.setLibraryModal({ open: true, openForm: false })} />
       <AudioPlayer recording={ctrl.synthesis.recording} takes={ctrl.synthesis.takes}
@@ -1102,6 +1172,15 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         onSelectTake={ctrl.synthesis.selectTake} onDeleteTake={ctrl.synthesis.deleteTake}
         onPinTake={() => void ctrl.actions.handlePinCurrentTake(ctrl.synthesis.recording)}
         onAudioPlay={state.handleStopPreview}
+        onDownload={({ filename, durationSeconds }) => {
+          const langMeta = resolveLanguageDisplayMeta(ctrl.projectSourceLanguage);
+          state.recordExportHistory(EXPORT_PRESET_IDS.TTS_NARRATION_WAV, {
+            filename,
+            durationSeconds,
+            languageCode: langMeta.bcp47,
+            languageLabel: langMeta.label,
+          });
+        }}
         onPlaybackError={() => ctrl.synthesis.setStatus({ message: 'Could not play this audio in the browser. You can still download the WAV.', error: true })} />
       <VoiceLibrary open={state.libraryModal.open} openSaveForm={state.libraryModal.openForm}
         busy={ctrl.synthesis.busy} library={state.library} anchors={state.anchorApi.anchors}
@@ -1117,6 +1196,19 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
         projectTitle={ctrl.projectTitle || 'Text-to-speech script'}
         onClose={() => state.setTerminologyModalOpen(false)}
       />
+      {state.exportModalOpen && (
+        <ExportProjectModal
+          open={state.exportModalOpen}
+          workspace="tts"
+          context={ttsExportContext}
+          exportHistory={ctrl.exportHistory}
+          busy={ctrl.synthesis.busy}
+          onExportPreset={async preset => {
+            await state.handleExportNarration(preset.expectedOutput?.filename || '', { throwOnError: true });
+          }}
+          onClose={() => state.setExportModalOpen(false)}
+        />
+      )}
     </div>
   );
 }

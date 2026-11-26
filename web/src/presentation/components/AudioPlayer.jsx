@@ -288,12 +288,20 @@ function resolveNarrationDownloadName(recording) {
   return 'voxcpm2.wav';
 }
 
-function PlaybackActionButtons({ media, recording, activeCharacter, activeAnchor, verification, onPinTake }) {
+function PlaybackActionButtons({ media, recording, activeCharacter, activeAnchor, verification, onPinTake, onDownload }) {
   const downloadName = resolveNarrationDownloadName(recording);
   const downloadLabel = recording?.isAssembled ? 'Export Narration' : 'Download WAV';
   const downloadTitle = recording?.isAssembled ? 'Export complete assembled narration WAV' : 'Download WAV';
   const pin = resolvePinControlState({ recording, activeCharacter, activeAnchor });
   const canVerify = Boolean(verification?.canVerify && verification?.onVerify);
+  const handleDownloadClick = () => {
+    if (!media.url || !onDownload) return;
+    onDownload({
+      recording,
+      filename: downloadName,
+      durationSeconds: recording?.audioDurationSeconds ?? recording?.duration ?? (media.duration > 0 ? media.duration : null),
+    });
+  };
   return (
     <div className="player-actions">
       {verification?.onVerify && (
@@ -308,7 +316,8 @@ function PlaybackActionButtons({ media, recording, activeCharacter, activeAnchor
         <Icon name="lock" /><span>{pin.label}</span>
       </button>
       <a className="button download-button" id="download" href={media.url || undefined}
-        download={downloadName} aria-disabled={media.url ? undefined : true} title={downloadTitle}>
+        download={downloadName} aria-disabled={media.url ? undefined : true} title={downloadTitle}
+        onClick={handleDownloadClick}>
         <Icon name="arrow_down_to_line" /><span>{downloadLabel}</span>
       </a>
     </div>
@@ -431,7 +440,7 @@ function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError
  * @param {object} props - Player props.
  * @returns {React.ReactElement} Audio player dock.
  */
-export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError, onAudioPlay }) {
+export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError, onAudioPlay, onDownload = null }) {
   const { logger } = useStudioServices();
   const audio = useRef(null);
   const [media, setMedia] = useRecordingMedia(recording);
@@ -449,7 +458,7 @@ export function AudioPlayer({ recording, takes = [], activeTakeId = null, active
     <section className="playback" data-has-audio={media.url ? 'true' : 'false'} aria-labelledby="playback-title">
       <PlaybackInfo status={status} busyMeta={busyMeta} />
       <PlaybackControls media={media} recording={recording} activeCharacter={activeCharacter}
-        activeAnchor={activeAnchor} verification={verification} onSeek={handleSeek} onPinTake={onPinTake}
+        activeAnchor={activeAnchor} verification={verification} onSeek={handleSeek} onPinTake={onPinTake} onDownload={onDownload}
         onTogglePlay={() => void toggleAudioElement({ element: audio.current, logger, onPlaybackError })} />
       <TakeHistoryPills takes={takes} activeTakeId={activeTakeId || recording?.id || null}
         onSelectTake={onSelectTake} onDeleteTake={onDeleteTake} />

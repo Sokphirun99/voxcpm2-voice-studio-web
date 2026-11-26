@@ -3,6 +3,7 @@
  */
 
 import { ConflictError, ValidationError } from '../domain/errors.js';
+import { normalizeExportHistory } from '../domain/exportHistory.js';
 import { normalizeProjectRecord, toProjectSummary } from '../domain/projects.js';
 import { normalizeProjectTerminology } from '../domain/terminology.js';
 import {
@@ -219,7 +220,8 @@ function buildNormalizedProject(project, localMap, id) {
     ? project.payload
     : (project.settings || {});
   const terminology = normalizeProjectTerminology(project.terminology ?? rawPayload.terminology ?? project.settings?.terminology);
-  const payload = { ...rawPayload, terminology };
+  const exportHistory = normalizeExportHistory(project.exportHistory ?? rawPayload.exportHistory ?? project.settings?.exportHistory);
+  const payload = { ...rawPayload, terminology, exportHistory };
   const normalized = normalizeProjectRecord({
     ...project,
     kind,
@@ -229,7 +231,7 @@ function buildNormalizedProject(project, localMap, id) {
     updatedAt: now,
     deletedAt: null,
   });
-  return { ...normalized, terminology };
+  return { ...normalized, terminology, exportHistory };
 }
 
 function saveProjectOfflineFallback(ctx, normalized, isCreated) {

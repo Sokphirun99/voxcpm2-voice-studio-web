@@ -82,6 +82,8 @@ export function SubtitleExportDock({
   canExportAlignedVoice = hasAlignedVoice,
   unresolvedMismatchCount = 0,
   onExportAlignedVoice = null,
+  onOpenExportProject = null,
+  exportHistoryCount = 0,
   onExportFile,
   onCopyDialogue,
   onBurnVideo,
@@ -112,6 +114,18 @@ export function SubtitleExportDock({
             busy={busy}
             onExportAlignedVoice={onExportAlignedVoice}
           />
+          {onOpenExportProject && (
+            <button
+              type="button"
+              id="subtitle-export-project-btn"
+              className="button button-secondary"
+              disabled={busy}
+              onClick={onOpenExportProject}
+            >
+              <Icon name="arrow_down_to_line" />
+              <span>Export project{exportHistoryCount > 0 ? ` (${exportHistoryCount})` : ''}</span>
+            </button>
+          )}
           {showSpeakerFilter && (
             <div className="select-field select-field--plain subtitle-tts-speaker-wrap">
               <select id="subtitle-tts-speaker" aria-label="Speaker for Text to speech" value={ttsSpeakerId} disabled={busy}

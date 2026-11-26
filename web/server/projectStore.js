@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ConflictError, StorageError, ValidationError } from '../src/domain/errors.js';
+import { normalizeExportHistory } from '../src/domain/exportHistory.js';
 import { upgradeProjectSchema } from '../src/domain/projects.js';
 import { normalizeProjectTerminology } from '../src/domain/terminology.js';
 
@@ -181,8 +182,9 @@ function resolveRevision(existing, fallbackRevision) {
 
 function resolveProjectPayload(input, type) {
   const terminology = normalizeProjectTerminology(input.terminology ?? input.payload?.terminology ?? input.settings?.terminology);
+  const exportHistory = normalizeExportHistory(input.exportHistory ?? input.payload?.exportHistory ?? input.settings?.exportHistory);
   if (input.payload !== undefined) {
-    return { ...assertProjectPayload(input.payload), terminology };
+    return { ...assertProjectPayload(input.payload), terminology, exportHistory };
   }
   return {
     videoFileName: input.settings?.videoFileName ?? null,
@@ -193,6 +195,7 @@ function resolveProjectPayload(input, type) {
     translatedLanguage: input.targetLanguage || '',
     hasTranslation: Boolean(input.settings?.hasTranslation),
     terminology,
+    exportHistory,
     ...(type === 'tts' ? { script: input.settings?.script || '', voiceId: input.settings?.voiceId || '' } : {}),
   };
 }
@@ -235,6 +238,7 @@ function resolveProjectSettings(input, payload, type) {
 function assembleProjectDetails(spec, meta, timestamps) {
   const { input, payload, settings } = spec;
   const terminology = normalizeProjectTerminology(input.terminology ?? payload.terminology ?? settings.terminology);
+  const exportHistory = normalizeExportHistory(input.exportHistory ?? payload.exportHistory ?? settings.exportHistory);
   return {
     ...meta,
     sourceLanguage: input.sourceLanguage || payload.detectedLanguage || '',
@@ -243,6 +247,7 @@ function assembleProjectDetails(spec, meta, timestamps) {
     segments: Array.isArray(input.segments) ? input.segments : (payload.segments || []),
     settings,
     terminology,
+    exportHistory,
     payload,
     createdAt: timestamps.createdAt,
     updatedAt: timestamps.updatedAt,

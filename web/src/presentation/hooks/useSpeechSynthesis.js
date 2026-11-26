@@ -353,6 +353,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
       return result.recording;
     } catch (error) {
       handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify });
+      if (args?.throwOnError) throw error;
       return null;
     } finally {
       if (abortController.current === controller) abortController.current = null;
@@ -365,7 +366,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     if (rec?.audioUrl && typeof document !== 'undefined' && document.body) {
       const anchor = document.createElement('a');
       anchor.href = rec.audioUrl;
-      anchor.download = rec.filename || 'voxcpm2-assembled-narration.wav';
+      anchor.download = args?.filename || rec.filename || 'voxcpm2-assembled-narration.wav';
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);
@@ -373,10 +374,21 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     return rec;
   }, [restitchSegments]);
 
+  const clearTakes = useCallback(() => {
+    abortController.current?.abort();
+    takesRef.current = [];
+    setTakes([]);
+    setActiveTakeId(null);
+    setLastSeed(null);
+    setRegeneratingChunk(null);
+    setGeneratingSegmentId(null);
+    setStatus({ message: 'No audio generated yet.', error: false });
+  }, []);
+
   useEffect(() => () => abortController.current?.abort(), []);
   return {
     busy, busyMeta, activeCharacterId, takes, activeTakeId, regeneratingChunk, generatingSegmentId, recording, lastSeed, status, setStatus,
-    selectTake, deleteTake, regenerateChunk, generateSegment, restitchSegments,
+    selectTake, deleteTake, clearTakes, regenerateChunk, generateSegment, restitchSegments,
     assembleNarration: restitchSegments,
     exportNarration,
     runGeneration: args => startSynthesisGeneration({

@@ -38,6 +38,14 @@ import {
   splitSubtitleSegment,
 } from '../../domain/subtitles.js';
 import { ValidationError } from '../../domain/errors.js';
+import {
+  EXPORT_PRESET_IDS,
+  formatPresetFilename,
+  normalizeExportHistory,
+  recordPresetExport,
+  resolveExportFilenameStem,
+  resolvePresetLanguageInfo,
+} from '../../domain/exportPresets.js';
 import { assertFeatureOfflineReady } from '../../domain/offlineReadiness.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import {
@@ -131,7 +139,7 @@ function beginSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMe
   return controller;
 }
 
-async function runSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMessage, cancelMessage, errorTitle, fallbackError, resetTranslationOnStart = false, hadTranslation = false, hadTranslatedLanguage = '', onError, onNotify, onUnlockSound, run }) {
+async function runSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMessage, cancelMessage, errorTitle, fallbackError, resetTranslationOnStart = false, hadTranslation = false, hadTranslatedLanguage = '', onError, onNotify, onUnlockSound, throwOnError = false, run }) {
   onUnlockSound?.();
   const startedAt = Date.now();
   const controller = beginSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, baseMessage, resetTranslationOnStart });
@@ -140,6 +148,7 @@ async function runSubtitleTask({ abortRef, setState, setBusyMeta, busyAction, ba
   } catch (err) {
     if (abortRef.current !== controller) return;
     handleSubtitleTaskError({ err, setState, resetTranslationOnStart, hadTranslation, hadTranslatedLanguage, cancelMessage, errorTitle, fallbackError, onError, onNotify });
+    if (throwOnError && err?.name !== 'SynthesisCancelledError') throw err;
   } finally {
     if (abortRef.current === controller) {
       setBusyMeta(null);
@@ -154,22 +163,31 @@ function revokeUrl(url) {
   }
 }
 
-function buildExportName(file, suffix) {
-  const stem = (file?.name || 'video').replace(/\.[^.]+$/, '') || 'video';
+function buildExportName(file, suffix, fallbackName = '') {
+  const sourceName = file?.name || fallbackName || 'video';
+  const stem = sourceName.replace(/\.[^.]+$/, '') || 'video';
   return `${stem}${suffix}`;
 }
 
-function buildExportPayload(format, videoFile, spec) {
+function buildExportPayload(format, videoFile, spec, { fallbackName = '', filenameOverride = '' } = {}) {
   if (format === 'srt') {
-    return { data: buildSrt(spec), mimeType: 'application/x-subrip;charset=utf-8', filename: buildExportName(videoFile, '.srt') };
+    return {
+      data: buildSrt(spec),
+      mimeType: 'application/x-subrip;charset=utf-8',
+      filename: filenameOverride || buildExportName(videoFile, '.srt', fallbackName),
+    };
   }
   if (format === 'vtt') {
-    return { data: buildVtt(spec), mimeType: 'text/vtt;charset=utf-8', filename: buildExportName(videoFile, '.vtt') };
+    return {
+      data: buildVtt(spec),
+      mimeType: 'text/vtt;charset=utf-8',
+      filename: filenameOverride || buildExportName(videoFile, '.vtt', fallbackName),
+    };
   }
   return {
     data: buildDialogueText({ ...spec, includeTimestamps: true }),
     mimeType: 'text/plain;charset=utf-8',
-    filename: buildExportName(videoFile, '-dialogue.txt'),
+    filename: filenameOverride || buildExportName(videoFile, '-dialogue.txt', fallbackName),
   };
 }
 
@@ -285,7 +303,7 @@ function useMediaHealthState(gateway) {
   return [health, refresh, markOnline];
 }
 
-function useVttPreviewUrl({ segments, speakerNames, includeSpeaker, useTranslation, bilingual, hasSubtitleText }) {
+function useVttPreviewUrl({ segments, speakerNames, includeSpeaker, useTranslation, bilingual, hasSubtitleText, language = '' }) {
   const [vttUrl, setVttUrl] = useState('');
   const lastModeRef = useRef('');
   const lastVttTextRef = useRef('');
@@ -318,12 +336,12 @@ function useVttPreviewUrl({ segments, speakerNames, includeSpeaker, useTranslati
       return undefined;
     }
 
-    const modeKey = `${includeSpeaker ? 1 : 0}:${useTranslation ? 1 : 0}:${bilingual ? 1 : 0}`;
+    const modeKey = `${includeSpeaker ? 1 : 0}:${useTranslation ? 1 : 0}:${bilingual ? 1 : 0}:${language || ''}`;
     const shouldUpdateImmediately = !activeUrlRef.current || lastModeRef.current !== modeKey;
 
     const commitVtt = () => {
       timerRef.current = undefined;
-      const vttText = buildVtt({ segments, speakerNames, includeSpeaker, useTranslation, bilingual });
+      const vttText = buildVtt({ segments, speakerNames, includeSpeaker, useTranslation, bilingual, language });
       lastModeRef.current = modeKey;
       if (vttText === lastVttTextRef.current && activeUrlRef.current) return;
       lastVttTextRef.current = vttText;
@@ -344,7 +362,7 @@ function useVttPreviewUrl({ segments, speakerNames, includeSpeaker, useTranslati
         timerRef.current = undefined;
       }
     };
-  }, [segments, speakerNames, includeSpeaker, useTranslation, bilingual, hasSubtitleText]);
+  }, [segments, speakerNames, includeSpeaker, useTranslation, bilingual, hasSubtitleText, language]);
 
   return vttUrl;
 }
@@ -372,7 +390,8 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
   const detectedLanguage = res.language || prev.options.sourceLanguage;
   const segments = Array.isArray(res.segments) ? res.segments : [];
   const hasSegmentTranslation = hasAnyTranslatedText(segments);
-  const resolvedTarget = targetLanguage ? normalizeTargetLanguageCode(res.translatedLanguage || targetLanguage) : '';
+  const rawTarget = res.translatedLanguage || targetLanguage;
+  const resolvedTarget = rawTarget ? normalizeTargetLanguageCode(rawTarget) : '';
   const hasTranslated = Boolean(resolvedTarget) && !isSameSubtitleLanguage(detectedLanguage, resolvedTarget) && hasSegmentTranslation;
   const speakerCount = Array.isArray(res.speakers) ? res.speakers.length : collectUniqueSpeakers(segments).length;
   const nextIncludeSpeaker = (prev.options.detectSpeakers || speakerCount > 1) ? prev.options.includeSpeaker : false;
@@ -420,7 +439,7 @@ function toMediaTerminologyPayload(effectiveTerms) {
   return filtered.length > 0 ? filtered : null;
 }
 
-function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, effectiveTermsRef, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
+function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setActiveSegmentId, mediaDuration, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, effectiveTermsRef, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound }) {
   const cancel = useCallback(() => {
     abortRef.current?.abort();
   }, [abortRef]);
@@ -539,8 +558,14 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
     });
   }, [state.segments, state.detectedLanguage, state.options.sourceLanguage, state.options.targetLanguage, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
-  const burnVideo = useCallback(async () => {
-    if (!state.videoFile || !state.jobId || !hasSubtitleText || state.isAudioOnly) return;
+  const burnVideo = useCallback(async (overrides = null) => {
+    const throwOnError = Boolean(overrides?.throwOnError);
+    if (!state.videoFile || !state.jobId || !hasSubtitleText || state.isAudioOnly) {
+      if (throwOnError) {
+        throw new Error('Burned-in MP4 export requires a loaded video on the media server and non-empty subtitles.');
+      }
+      return;
+    }
     await runSubtitleTask({
       abortRef, setState, setBusyMeta, busyAction: 'burn',
       baseMessage: 'Rendering MP4 with burned-in subtitles…',
@@ -549,30 +574,62 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
       fallbackError: 'Video subtitle burn-in failed.',
       onError: () => void refreshHealth(),
       onNotify, onUnlockSound,
+      throwOnError,
       run: async (signal, elapsedSecs) => {
         const isOnline = typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
         assertFeatureOfflineReady({ featureId: 'burn_in', models: { burnIn: health.burnInSupported }, isOnline });
-        const { bilingual, useTranslation } = resolveTranslationFlags(state.hasTranslation, state.options.previewMode);
+        const defaultFlags = resolveTranslationFlags(state.hasTranslation, state.options.previewMode);
+        const sourceAudioLang = (state.detectedLanguage && state.detectedLanguage !== 'auto')
+          ? state.detectedLanguage
+          : (state.options.sourceLanguage && state.options.sourceLanguage !== 'auto' ? state.options.sourceLanguage : '');
+        const langInfo = resolvePresetLanguageInfo({
+          languageMode: overrides?.languageMode,
+          useTranslation: overrides?.useTranslation ?? defaultFlags.useTranslation,
+          bilingual: overrides?.bilingual ?? defaultFlags.bilingual,
+          detectedLanguage: sourceAudioLang,
+          translatedLanguage: state.translatedLanguage,
+          selectedTargetLanguage: state.options.targetLanguage,
+        });
+        const includeSpeaker = overrides?.includeSpeaker ?? effectiveIncludeSpeaker;
+        const audioLang = overrides?.audioLanguage ?? sourceAudioLang;
         const blob = await gateway.burnSubtitles({
           jobId: state.jobId,
           segments: state.segments,
           speakerNames: state.speakerNames,
-          includeSpeaker: effectiveIncludeSpeaker,
-          useTranslation,
-          bilingual,
+          includeSpeaker,
+          useTranslation: langInfo.useTranslation,
+          bilingual: langInfo.bilingual,
           subtitleStyle: state.options.subtitleStyle,
           videoSize: state.videoSize || undefined,
+          ...(audioLang ? { audioLanguage: audioLang } : {}),
           signal,
         });
         assertNotAborted(signal);
         markOnline();
-        downloadBlobOrText({ data: blob, mimeType: 'video/mp4', filename: buildExportName(state.videoFile, '-subtitled.mp4') });
+        const filename = overrides?.filename || formatPresetFilename(EXPORT_PRESET_IDS.VIDEO_BURNED_MP4, {
+          filenameStem: overrides?.filenameStem,
+          videoFileName: state.videoFile?.name || state.videoFileName,
+          projectTitle: state.projectTitle,
+        });
+        downloadBlobOrText({ data: blob, mimeType: 'video/mp4', filename });
+        const maxCueEnd = state.segments.reduce((m, s) => Math.max(m, Number(s?.end) || 0), 0);
+        const exportedDuration = (Number(mediaDuration) > 0 ? Number(mediaDuration) : maxCueEnd) || null;
         const summary = `Exported MP4 with burned-in subtitles in ${elapsedSecs()}s.`;
-        setState(prev => ({ ...prev, busyAction: '', status: { message: summary, error: false } }));
+        setState(prev => ({
+          ...prev,
+          exportHistory: recordPresetExport(prev.exportHistory, EXPORT_PRESET_IDS.VIDEO_BURNED_MP4, {
+            filename,
+            durationSeconds: exportedDuration,
+            languageCode: langInfo.bcp47,
+            languageLabel: langInfo.label,
+          }),
+          busyAction: '',
+          status: { message: summary, error: false },
+        }));
         onNotify?.({ kind: 'success', title: 'MP4 exported', message: summary });
       },
     });
-  }, [state, effectiveIncludeSpeaker, hasSubtitleText, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
+  }, [state, mediaDuration, effectiveIncludeSpeaker, hasSubtitleText, health.burnInSupported, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
   return { cancel, extractSubtitles, translateNow, burnVideo };
 }
@@ -771,6 +828,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     translatedLanguage: '',
     speakerNames: {},
     terminology: createEmptyProjectTerminology(),
+    exportHistory: [],
     projectId: '',
     projectTitle: '',
     revision: 1,
@@ -817,6 +875,15 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     if (ttsSpeakerId && !speakers.includes(ttsSpeakerId)) setTtsSpeakerId('');
   }, [speakers, ttsSpeakerId]);
 
+  const effectiveSourceLang = activeSourceLanguage && activeSourceLanguage !== 'auto' ? activeSourceLanguage : '';
+  const previewLanguageMeta = resolvePresetLanguageInfo({
+    useTranslation,
+    bilingual,
+    detectedLanguage: effectiveSourceLang,
+    translatedLanguage: state.translatedLanguage,
+    selectedTargetLanguage: state.options.targetLanguage,
+  });
+
   const vttUrl = useVttPreviewUrl({
     segments: state.segments,
     speakerNames: state.speakerNames,
@@ -824,6 +891,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     useTranslation,
     bilingual,
     hasSubtitleText,
+    language: previewLanguageMeta.bcp47,
   });
 
   const selectVideoFile = useCallback(file => {
@@ -853,30 +921,35 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setCurrentTime(0);
     setMediaDuration(0);
     const cur = stateRef.current;
-    if (cur.videoFile || !cur.projectId || !cur.videoFileName) bumpTranscriptEpoch();
-    setState(prev => ({
-      ...prev,
-      videoFile: file,
-      videoFileName: file.name || null,
-      videoUrl: nextUrl,
-      isAudioOnly: audioOnly,
-      jobId: '',
-      detectedLanguage: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.detectedLanguage : '',
-      videoSize: null,
-      segments: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.segments : [],
-      hasTranslation: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.hasTranslation : false,
-      translatedLanguage: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.translatedLanguage : '',
-      speakerNames: !prev.videoFile && prev.projectId && prev.videoFileName ? prev.speakerNames : {},
-      busyAction: '',
-      options: {
-        ...prev.options,
-        includeSpeaker: prev.options.detectSpeakers ? prev.options.includeSpeaker : false,
-        previewMode: prev.options.translateToKhmer && !isSameSubtitleLanguage(prev.options.sourceLanguage, prev.options.targetLanguage)
-          ? 'translated'
-          : 'original',
-      },
-      status: { message: `Loaded ${file.name}. Ready to extract subtitles.`, error: false },
-    }));
+    const isReattachingMedia = Boolean(!cur.videoFile && cur.projectId && (cur.videoFileName || cur.segments.length));
+    if (!isReattachingMedia) bumpTranscriptEpoch();
+    setState(prev => {
+      const keepExistingWork = Boolean(!prev.videoFile && prev.projectId && (prev.videoFileName || prev.segments.length));
+      return {
+        ...prev,
+        videoFile: file,
+        videoFileName: file.name || null,
+        videoUrl: nextUrl,
+        isAudioOnly: audioOnly,
+        jobId: '',
+        detectedLanguage: keepExistingWork ? prev.detectedLanguage : '',
+        videoSize: null,
+        segments: keepExistingWork ? prev.segments : [],
+        hasTranslation: keepExistingWork ? prev.hasTranslation : false,
+        translatedLanguage: keepExistingWork ? prev.translatedLanguage : '',
+        speakerNames: keepExistingWork ? prev.speakerNames : {},
+        exportHistory: keepExistingWork ? prev.exportHistory : [],
+        busyAction: '',
+        options: {
+          ...prev.options,
+          includeSpeaker: prev.options.detectSpeakers ? prev.options.includeSpeaker : false,
+          previewMode: prev.options.translateToKhmer && !isSameSubtitleLanguage(prev.options.sourceLanguage, prev.options.targetLanguage)
+            ? 'translated'
+            : 'original',
+        },
+        status: { message: `Loaded ${file.name}. Ready to extract subtitles.`, error: false },
+      };
+    });
   }, [onNotify, bumpTranscriptEpoch]);
 
   const importSubtitleFile = useCallback(async file => {
@@ -948,6 +1021,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       translatedLanguage: '',
       speakerNames: {},
       terminology: createEmptyProjectTerminology(),
+      exportHistory: [],
       projectId: '',
       projectTitle: '',
       busyAction: '',
@@ -1030,26 +1104,90 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     if (Number.isFinite(dur) && dur > 0) setMediaDuration(dur);
   }, [state.segments]);
 
-  const exportFile = useCallback(format => {
-    const hasExportableText = state.segments.some(seg => Boolean(pickSegmentText(seg, useTranslation, bilingual)));
+  const recordExportHistory = useCallback((presetId, spec = {}) => {
+    setState(prev => ({
+      ...prev,
+      exportHistory: recordPresetExport(prev.exportHistory, presetId, spec),
+    }));
+  }, []);
+
+  const exportFile = useCallback((format, overrides = null) => {
+    const throwOnError = Boolean(overrides?.throwOnError);
+    const sourceLang = (state.detectedLanguage && state.detectedLanguage !== 'auto')
+      ? state.detectedLanguage
+      : (state.options.sourceLanguage && state.options.sourceLanguage !== 'auto' ? state.options.sourceLanguage : '');
+    const langInfo = resolvePresetLanguageInfo({
+      languageMode: overrides?.languageMode,
+      useTranslation: overrides?.useTranslation ?? useTranslation,
+      bilingual: overrides?.bilingual ?? bilingual,
+      detectedLanguage: sourceLang,
+      translatedLanguage: state.translatedLanguage,
+      selectedTargetLanguage: state.options.targetLanguage,
+    });
+    const includeSpeaker = overrides?.includeSpeaker ?? effectiveIncludeSpeaker;
+    const hasExportableText = state.segments.some(seg => Boolean(pickSegmentText(seg, langInfo.useTranslation, langInfo.bilingual)));
     if (!hasExportableText) {
-      setState(prev => ({ ...prev, status: { message: 'No subtitle text to export.', error: true } }));
-      return;
+      const msg = 'No subtitle text to export.';
+      setState(prev => ({ ...prev, status: { message: msg, error: true } }));
+      if (throwOnError) throw new Error(msg);
+      return false;
     }
     const spec = {
       segments: state.segments,
       speakerNames: state.speakerNames,
-      includeSpeaker: effectiveIncludeSpeaker,
-      useTranslation,
-      bilingual,
+      includeSpeaker,
+      useTranslation: langInfo.useTranslation,
+      bilingual: langInfo.bilingual,
+      language: langInfo.bcp47,
     };
-    const payload = buildExportPayload(format, state.videoFile, spec);
+    const presetMap = { srt: EXPORT_PRESET_IDS.SUBTITLE_SRT, vtt: EXPORT_PRESET_IDS.SUBTITLE_VTT, txt: EXPORT_PRESET_IDS.SUBTITLE_TXT };
+    const presetId = presetMap[format] || EXPORT_PRESET_IDS.SUBTITLE_TXT;
+    const fallbackName = state.videoFile?.name || state.videoFileName || resolveExportFilenameStem({ projectTitle: state.projectTitle, fallback: 'video' });
+    const filenameOverride = overrides?.filename || (
+      overrides && (overrides.filenameStem || overrides.includeLanguageSuffix)
+        ? formatPresetFilename(presetId, {
+            filenameStem: overrides.filenameStem,
+            videoFileName: state.videoFile?.name || state.videoFileName,
+            projectTitle: state.projectTitle,
+            languageCode: langInfo.bcp47,
+            includeLanguageSuffix: Boolean(overrides.includeLanguageSuffix),
+          })
+        : ''
+    );
+    const payload = buildExportPayload(format, state.videoFile, spec, { fallbackName, filenameOverride });
     if (!payload.data) {
-      setState(prev => ({ ...prev, status: { message: 'No subtitle text to export.', error: true } }));
-      return;
+      const msg = 'No subtitle text to export.';
+      setState(prev => ({ ...prev, status: { message: msg, error: true } }));
+      if (throwOnError) throw new Error(msg);
+      return false;
     }
     downloadBlobOrText(payload);
-  }, [state.segments, state.speakerNames, effectiveIncludeSpeaker, state.videoFile, useTranslation, bilingual]);
+    const durationSeconds = state.segments.reduce((m, seg) => Math.max(m, Number(seg?.end) || 0), 0);
+    setState(prev => ({
+      ...prev,
+      exportHistory: recordPresetExport(prev.exportHistory, presetId, {
+        filename: payload.filename,
+        durationSeconds: durationSeconds || null,
+        languageCode: langInfo.bcp47,
+        languageLabel: langInfo.label,
+      }),
+      status: { message: `Exported ${payload.filename}.`, error: false },
+    }));
+    return true;
+  }, [
+    state.segments,
+    state.speakerNames,
+    state.videoFile,
+    state.videoFileName,
+    state.projectTitle,
+    state.detectedLanguage,
+    state.translatedLanguage,
+    state.options.sourceLanguage,
+    state.options.targetLanguage,
+    effectiveIncludeSpeaker,
+    useTranslation,
+    bilingual,
+  ]);
 
   const copyDialogue = useCallback(async () => {
     const text = buildDialogueText({
@@ -1104,6 +1242,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       translatedLanguage: payload.translatedLanguage || '',
       speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : {},
       terminology: normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology),
+      exportHistory: normalizeExportHistory(snapshot.exportHistory ?? payload.exportHistory ?? payload.subtitleOptions?.exportHistory),
       options: {
         ...prev.options,
         ...(typeof payload.subtitleOptions === 'object' && payload.subtitleOptions ? payload.subtitleOptions : {}),
@@ -1131,6 +1270,9 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       terminology: snapshot.terminology !== undefined || payload.terminology !== undefined
         ? normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology)
         : prev.terminology,
+      exportHistory: snapshot.exportHistory !== undefined || payload.exportHistory !== undefined
+        ? normalizeExportHistory(snapshot.exportHistory ?? payload.exportHistory ?? payload.subtitleOptions?.exportHistory)
+        : prev.exportHistory,
     }));
   }, []);
 
@@ -1164,6 +1306,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     id: state.projectId || undefined,
     title: state.projectTitle || state.videoFileName || state.videoFile?.name || 'Untitled project',
     videoFileName: state.videoFileName || state.videoFile?.name || null,
+    mediaDuration: Number.isFinite(Number(mediaDuration)) && Number(mediaDuration) > 0 ? Number(mediaDuration) : undefined,
     segments: state.segments,
     speakerNames: state.speakerNames,
     subtitleOptions: state.options,
@@ -1171,11 +1314,13 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     translatedLanguage: state.translatedLanguage,
     hasTranslation: state.hasTranslation,
     terminology: state.terminology,
+    exportHistory: state.exportHistory,
   }), [
     state.projectId,
     state.projectTitle,
     state.videoFileName,
     state.videoFile?.name,
+    mediaDuration,
     state.segments,
     state.speakerNames,
     state.options,
@@ -1183,6 +1328,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     state.translatedLanguage,
     state.hasTranslation,
     state.terminology,
+    state.exportHistory,
   ]);
 
   const buildSnapshot = useCallback(() => {
@@ -1200,12 +1346,14 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     deps: [
       state.segments,
       state.videoFileName,
+      mediaDuration,
       state.speakerNames,
       state.options,
       state.projectTitle,
       state.detectedLanguage,
       state.translatedLanguage,
       state.terminology,
+      state.exportHistory,
     ],
     hidden,
     projectRepository,
@@ -1243,14 +1391,16 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     sourceAsset: state.sourceAsset || null,
     segments: state.segments,
     terminology: state.terminology,
+    exportHistory: state.exportHistory,
     payload: {
       segments: state.segments,
       videoFileName: state.videoFileName,
       speakerNames: state.speakerNames,
       subtitleOptions: state.options,
       terminology: state.terminology,
+      exportHistory: state.exportHistory,
     },
-  }), [state.projectId, state.projectTitle, state.revision, state.sourceAssetId, state.sourceAsset, state.segments, state.videoFileName, state.speakerNames, state.options, state.terminology]);
+  }), [state.projectId, state.projectTitle, state.revision, state.sourceAssetId, state.sourceAsset, state.segments, state.videoFileName, state.speakerNames, state.options, state.terminology, state.exportHistory]);
 
   const recovery = useProjectRecovery({
     projectId: state.projectId,
@@ -1352,7 +1502,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
   }, [activeEffectiveTermsRef, stateRef, gateway, services, onNotify]);
 
   const asyncActions = useSubtitleAsyncActions({
-    state, stateRef, setState, setBusyMeta, setActiveSegmentId, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, effectiveTermsRef: activeEffectiveTermsRef, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
+    state, stateRef, setState, setBusyMeta, setActiveSegmentId, mediaDuration, setMediaDuration, bumpTranscriptEpoch, effectiveIncludeSpeaker, hasSubtitleText, effectiveTermsRef: activeEffectiveTermsRef, gateway, abortRef, health, refreshHealth, markOnline, onNotify, onUnlockSound,
   });
 
   return {
@@ -1377,6 +1527,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     setProjectTerminology,
     applySpellingTerminology,
     applyTranslationTerminology,
+    exportHistory: state.exportHistory,
+    recordExportHistory,
     projectRepository,
     speakers,
     effectiveIncludeSpeaker,

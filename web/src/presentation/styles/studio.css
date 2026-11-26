@@ -5753,3 +5753,280 @@ a {
 .studio-page .job-card-actions .project-delete-btn:hover {
   color: var(--error);
 }
+
+
+/* ============================================================================
+   R3-08 Export Project Presets Modal & Export History
+   ============================================================================ */
+
+.studio-page .export-project-dialog {
+  width: min(860px, 94vw);
+  max-height: min(88vh, 860px);
+}
+
+.studio-page .export-controls-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--inspector);
+}
+
+.studio-page .export-control-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.studio-page .export-control-field input,
+.studio-page .export-control-field select {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--text);
+  font: inherit;
+}
+
+.studio-page .export-control-toggles {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+}
+
+.studio-page .export-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.studio-page .export-modal-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px 18px 20px;
+}
+
+.studio-page .export-category-heading {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.studio-page .export-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.studio-page .export-preset-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--editor);
+}
+
+.studio-page .export-preset-card[data-available="false"] {
+  opacity: 0.78;
+}
+
+.studio-page .export-preset-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.studio-page .export-preset-head h4 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.studio-page .export-preset-desc {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.studio-page .export-format-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--accent-wash);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+}
+
+.studio-page .export-preset-specs {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--inspector);
+  border: 1px solid var(--line);
+}
+
+.studio-page .export-preset-spec-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.studio-page .export-preset-spec-row dt {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--quiet);
+}
+
+.studio-page .export-preset-spec-row dd {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studio-page .export-filename-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.studio-page .export-preset-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.studio-page .export-preset-blocker,
+.studio-page .export-preset-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.studio-page .export-preset-blocker {
+  background: color-mix(in srgb, var(--error) 11%, transparent);
+  color: var(--error);
+}
+
+.studio-page .export-preset-warning {
+  background: color-mix(in srgb, var(--offline) 12%, transparent);
+  color: var(--offline);
+}
+
+.studio-page .export-preset-actions {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.studio-page .export-history-section {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.studio-page .export-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.studio-page .export-section-head h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.studio-page .export-history-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.studio-page .export-history-empty {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.studio-page .export-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.studio-page .export-history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--inspector);
+}
+
+.studio-page .export-history-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.studio-page .export-history-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.studio-page .export-history-filename {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studio-page .export-history-meta span,
+.studio-page .export-history-time {
+  font-size: 11.5px;
+  color: var(--muted);
+}

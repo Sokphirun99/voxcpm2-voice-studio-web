@@ -12,6 +12,8 @@ import {
   trimClipWavToInterval,
 } from '../../domain/durationMismatch.js';
 import { SynthesisCancelledError, ValidationError } from '../../domain/errors.js';
+import { EXPORT_PRESET_IDS } from '../../domain/exportPresets.js';
+import { resolveLanguageDisplayMeta } from '../../domain/subtitleLanguages.js';
 import {
   DEFAULT_DUB_AUDIO_MODE,
   DEFAULT_TIME_ALIGNED_SUFFIX,
@@ -464,7 +466,7 @@ function useVoiceSynthesisActions(ctx) {
   return { generateSegmentVoice, generateSelectedVoices, cancelVoiceGeneration };
 }
 
-function blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify }) {
+function blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify, throwOnError = false }) {
   if (!exportMismatchReport?.hasUnresolved) return false;
   try {
     assertNoUnresolvedDurationMismatches(exportMismatchReport);
@@ -472,6 +474,7 @@ function blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify })
     const message = err?.message || 'Resolve speech duration mismatches before exporting.';
     onStatus?.({ message, error: true });
     onNotify?.({ kind: 'error', title: 'Resolve duration mismatches', message });
+    if (throwOnError) throw err;
     return true;
   }
   return false;
@@ -559,28 +562,52 @@ function resolveSafeTrimSeconds(segments, idx, mediaDuration, targetDurationSec)
 
 function useDubExportAction({
   mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration,
-  segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, abortRef,
-  dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound,
+  segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, audioLanguage, abortRef,
+  dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onExportRecorded,
 }) {
-  return useCallback(async () => {
-    if (dubBusy || voiceBusy || abortRef.current || !jobId || isAudioOnly || !mediaSubtitleGateway?.exportDubbedVideo) return;
-    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify })) return;
+  return useCallback(async (overrides = null) => {
+    const throwOnError = Boolean(overrides?.throwOnError);
+    if (dubBusy || voiceBusy || abortRef.current) {
+      if (throwOnError) throw new Error('Another voice or dubbing export is already running.');
+      return;
+    }
+    if (!jobId || isAudioOnly || !mediaSubtitleGateway?.exportDubbedVideo) {
+      if (throwOnError) throw new Error('Dubbed MP4 export requires a loaded video on the media server.');
+      return;
+    }
+    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify, throwOnError })) return;
     const clips = buildDubExportClips(segments, selectedIds, segmentClips, { spillApprovals, mediaDuration });
-    if (!clips.length) return;
+    if (!clips.length) {
+      if (throwOnError) throw new Error('No valid voice clips match the subtitle timeline.');
+      return;
+    }
     onUnlockSound?.();
     const controller = new AbortController();
     abortRef.current = controller;
     setDubBusy(true);
     const clipWord = clips.length === 1 ? 'clip' : 'clips';
+    const effectiveMode = overrides?.originalAudioMode || dubAudioMode;
+    const effectiveLang = String(overrides?.audioLanguage ?? audioLanguage ?? '').trim();
+    const cleanLang = effectiveLang && effectiveLang !== 'auto' ? effectiveLang : '';
     onStatus?.({ message: `Exporting dubbed MP4 (${clips.length} ${clipWord})…`, error: false });
     try {
       const mp4Blob = await mediaSubtitleGateway.exportDubbedVideo({
         jobId,
         clips,
-        originalAudioMode: dubAudioMode,
+        originalAudioMode: effectiveMode,
+        ...(cleanLang ? { audioLanguage: cleanLang } : {}),
         signal: controller.signal,
       });
-      triggerFileDownload(mp4Blob, buildDubDownloadFilename(videoFile));
+      const filename = overrides?.filename || buildDubDownloadFilename(videoFile);
+      triggerFileDownload(mp4Blob, filename);
+      const langMeta = resolveLanguageDisplayMeta(cleanLang);
+      const maxEnd = segments.reduce((m, s) => Math.max(m, Number(s?.end) || 0), 0);
+      onExportRecorded?.(EXPORT_PRESET_IDS.VIDEO_DUBBED_MP4, {
+        filename,
+        durationSeconds: Number(mediaDuration) || maxEnd || null,
+        languageCode: langMeta.bcp47,
+        languageLabel: langMeta.label,
+      });
       const doneMsg = `Dubbed MP4 exported (${clips.length} ${clipWord}).`;
       onStatus?.({ message: doneMsg, error: false });
       onNotify?.({ kind: 'success', title: 'Dubbed MP4 exported', message: doneMsg });
@@ -590,14 +617,15 @@ function useDubExportAction({
         return;
       }
       const message = err?.message || 'Could not export dubbed MP4. Check that the media service is running.';
-      logger?.error?.('useSubtitleVoiceover.exportDubbedVideo', err, { jobId, clipCount: clips.length, dubAudioMode });
+      logger?.error?.('useSubtitleVoiceover.exportDubbedVideo', err, { jobId, clipCount: clips.length, dubAudioMode: effectiveMode });
       onStatus?.({ message, error: true });
       onNotify?.({ kind: 'error', title: 'Dubbed MP4 export failed', message });
+      if (throwOnError) throw err;
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setDubBusy(false);
     }
-  }, [mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration, segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound]);
+  }, [mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration, segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, audioLanguage, abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onExportRecorded]);
 }
 
 /**
@@ -833,6 +861,7 @@ export function useSubtitleVoiceover({
   segments = [],
   useTranslation = false,
   videoFile = null,
+  videoFileName = '',
   jobId = '',
   isAudioOnly = false,
   voiceCatalog = null,
@@ -842,6 +871,7 @@ export function useSubtitleVoiceover({
   terminology = null,
   pronunciationSignature = '',
   speechLanguage = '',
+  audioLanguage = '',
   projectId = '',
   projectTitle = '',
   productionJobs = null,
@@ -849,7 +879,14 @@ export function useSubtitleVoiceover({
   onNotify,
   onUnlockSound,
   onEngineFailure,
+  onExportRecorded = null,
 } = {}) {
+  const effectiveNameSource = useMemo(() => {
+    if (videoFile?.name) return videoFile;
+    if (videoFileName) return { name: videoFileName };
+    if (projectTitle) return { name: projectTitle };
+    return null;
+  }, [videoFile, videoFileName, projectTitle]);
   const { synthesizeSpeech, mediaSubtitleGateway, audioMaster, logger, jobRepository = null, assetRepository = null } = useStudioServices();
   const characters = useMemo(
     () => (voiceCatalog?.characters?.length ? voiceCatalog.characters : BUILT_IN_VOICES),
@@ -1040,9 +1077,9 @@ export function useSubtitleVoiceover({
   });
 
   const exportDubbedVideo = useDubExportAction({
-    mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile, mediaDuration: effectiveTotalDuration,
-    segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, abortRef,
-    dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound,
+    mediaSubtitleGateway, logger, jobId, isAudioOnly, videoFile: effectiveNameSource, mediaDuration: effectiveTotalDuration,
+    segments, selectedIds, segmentClips, spillApprovals, exportMismatchReport, dubAudioMode, audioLanguage: audioLanguage || speechLanguage,
+    abortRef, dubBusy, voiceBusy, setDubBusy, onStatus, onNotify, onUnlockSound, onExportRecorded,
   });
 
   const canExportAlignedVoice = Boolean(alignedClip?.blob) && !exportMismatchReport.hasUnresolved;
@@ -1052,36 +1089,70 @@ export function useSubtitleVoiceover({
     const clip = segmentClips[segment?.id];
     if (!clip?.blob) return;
     const tag = String((index ?? 0) + 1).padStart(2, '0');
-    triggerFileDownload(clip.blob, buildVoiceoverDownloadFilename(videoFile, `-frame-${tag}`));
-  }, [segmentClips, videoFile]);
+    triggerFileDownload(clip.blob, buildVoiceoverDownloadFilename(effectiveNameSource, `-frame-${tag}`));
+  }, [segmentClips, effectiveNameSource]);
 
-  const downloadCombinedVoice = useCallback(() => {
-    if (!combinedClip?.blob) return;
+  const downloadCombinedVoice = useCallback((overrides = null) => {
+    const throwOnError = Boolean(overrides?.throwOnError);
+    if (!combinedClip?.blob) {
+      if (throwOnError) throw new Error('No voiceover audio is ready to export.');
+      return;
+    }
     const suffix = combinedClip.scope === 'selected' ? '-selected-voiceover' : '-voiceover';
-    triggerFileDownload(combinedClip.blob, buildVoiceoverDownloadFilename(videoFile, suffix));
-  }, [combinedClip, videoFile]);
+    const filename = overrides?.filename || buildVoiceoverDownloadFilename(effectiveNameSource, suffix);
+    triggerFileDownload(combinedClip.blob, filename);
+    const langMeta = resolveLanguageDisplayMeta(audioLanguage || speechLanguage);
+    onExportRecorded?.(EXPORT_PRESET_IDS.SUBTITLE_VOICEOVER_WAV, {
+      filename,
+      durationSeconds: combinedClip.durationSeconds ?? combinedClip.duration ?? null,
+      languageCode: langMeta.bcp47,
+      languageLabel: langMeta.label,
+    });
+  }, [combinedClip, effectiveNameSource, audioLanguage, speechLanguage, onExportRecorded]);
 
-  const downloadAlignedVoice = useCallback(async () => {
-    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify })) return;
+  const downloadAlignedVoice = useCallback(async (overrides = null) => {
+    const throwOnError = Boolean(overrides?.throwOnError);
+    if (blockIfDurationMismatched({ exportMismatchReport, onStatus, onNotify, throwOnError })) return;
+    const langMeta = resolveLanguageDisplayMeta(audioLanguage || speechLanguage);
     if (isAlignmentSettled() && alignedClip?.blob) {
       const suffix = alignedClip.scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX;
-      triggerFileDownload(alignedClip.blob, buildTimeAlignedDubDownloadFilename(videoFile, suffix));
+      const filename = overrides?.filename || buildTimeAlignedDubDownloadFilename(effectiveNameSource, suffix);
+      triggerFileDownload(alignedClip.blob, filename);
+      onExportRecorded?.(EXPORT_PRESET_IDS.SUBTITLE_ALIGNED_WAV, {
+        filename,
+        durationSeconds: alignedClip.durationSeconds ?? alignedClip.duration ?? null,
+        languageCode: langMeta.bcp47,
+        languageLabel: langMeta.label,
+      });
       return;
     }
     const { scope, matched } = collectCombinedTargetClips(segments, selectedIds, segmentClips);
-    if (!matched.length) return;
+    if (!matched.length) {
+      if (throwOnError) throw new Error('Generate voice clips before exporting aligned WAV.');
+      return;
+    }
     try {
       const fresh = await assembleTimelineAlignedVoiceover({
         segments, segmentClips, totalDuration: effectiveTotalDuration, audioMaster,
         selectedIds: scope === 'selected' ? matched.map(s => s.id) : null, spillApprovals, strictDurationCheck: true, logger,
       });
-      if (fresh?.blob) triggerFileDownload(fresh.blob, buildTimeAlignedDubDownloadFilename(videoFile, scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX));
+      if (fresh?.blob) {
+        const filename = overrides?.filename || buildTimeAlignedDubDownloadFilename(effectiveNameSource, scope === 'selected' ? '-selected-aligned-dub' : DEFAULT_TIME_ALIGNED_SUFFIX);
+        triggerFileDownload(fresh.blob, filename);
+        onExportRecorded?.(EXPORT_PRESET_IDS.SUBTITLE_ALIGNED_WAV, {
+          filename,
+          durationSeconds: fresh.durationSeconds ?? fresh.duration ?? null,
+          languageCode: langMeta.bcp47,
+          languageLabel: langMeta.label,
+        });
+      }
     } catch (err) {
       const message = err?.message || 'Could not export time-aligned WAV.';
       onStatus?.({ message, error: true });
       onNotify?.({ kind: 'error', title: 'Aligned WAV export failed', message });
+      if (throwOnError) throw err;
     }
-  }, [alignedClip, isAlignmentSettled, segments, selectedIds, segmentClips, effectiveTotalDuration, audioMaster, spillApprovals, logger, videoFile, exportMismatchReport, onStatus, onNotify]);
+  }, [alignedClip, isAlignmentSettled, segments, selectedIds, segmentClips, effectiveTotalDuration, audioMaster, spillApprovals, logger, effectiveNameSource, audioLanguage, speechLanguage, exportMismatchReport, onStatus, onNotify, onExportRecorded]);
 
   const generateSelectedVoicesTracked = useCallback(async () => {
     const targets = selectOrderedSegments(segments, selectedIds)

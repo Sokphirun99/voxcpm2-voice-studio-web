@@ -14,6 +14,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from languages import UNDETERMINED_ISO639_2, resolve_iso639_2_code
+
 logger = logging.getLogger(__name__)
 
 FFMPEG_FULL_BIN = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
@@ -197,6 +199,18 @@ def extract_audio_16k_wav(video_path: Path, wav_path: Path, ffmpeg_bin: str | No
         raise MediaProcessingError(f"Could not extract audio track from video: {detail}")
 
 
+MP4_SAFE_VIDEO_CODECS = frozenset({"h264", "hevc"})
+MP4_SAFE_PIX_FMTS = frozenset({"yuv420p", "nv12"})
+
+
+def _build_audio_language_args(audio_language: str) -> list[str]:
+    """Build FFmpeg `-metadata:s:a:0` arguments when `audio_language` resolves to a known code."""
+    iso_code = resolve_iso639_2_code(audio_language)
+    if iso_code == UNDETERMINED_ISO639_2:
+        return []
+    return ["-metadata:s:a:0", f"language={iso_code}"]
+
+
 def _run_burn_cmd(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run an FFmpeg burn-in command cleanly inside the job directory."""
     return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
@@ -207,6 +221,8 @@ def burn_ass_subtitles(
     ass_path: Path,
     output_mp4_path: Path,
     ffmpeg_bin: str | None = None,
+    *,
+    audio_language: str = "",
 ) -> None:
     """Burn styled multi-speaker ASS subtitles into MP4 preserving Portrait or Landscape aspect ratio."""
     binary = ffmpeg_bin or resolve_ffmpeg_bin()
@@ -217,19 +233,17 @@ def burn_ass_subtitles(
     w, h = probe_video_dimensions(video_path)
     hw_bitrate = "2500k" if (w * h) < 600_000 else "5000k"
     vf_arg = f"scale=trunc(iw/2)*2:trunc(ih/2)*2,ass={ass_path.name},setsar=1"
-    hw_cmd = [
-        binary, "-y", "-i", str(video_path.resolve()), "-vf", vf_arg,
-        "-c:v", "h264_videotoolbox", "-b:v", hw_bitrate, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-movflags", "+faststart", str(output_mp4_path.resolve()),
+    lang_args = _build_audio_language_args(audio_language)
+    tail = [
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", DUB_AUDIO_BITRATE, "-ar", str(DUB_SAMPLE_RATE), "-ac", "2",
+        *lang_args, "-movflags", "+faststart", str(output_mp4_path.resolve()),
     ]
+    hw_cmd = [binary, "-y", "-i", str(video_path.resolve()), "-vf", vf_arg, "-c:v", "h264_videotoolbox", "-b:v", hw_bitrate, *tail]
     proc = _run_burn_cmd(hw_cmd, ass_path.parent)
     if proc.returncode == 0 and output_mp4_path.is_file():
         return
-    sw_cmd = [
-        binary, "-y", "-i", str(video_path.resolve()), "-vf", vf_arg,
-        "-c:v", "libx264", "-crf", "21", "-preset", "fast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-movflags", "+faststart", str(output_mp4_path.resolve()),
-    ]
+    sw_cmd = [binary, "-y", "-i", str(video_path.resolve()), "-vf", vf_arg, "-c:v", "libx264", "-crf", "21", "-preset", "fast", *tail]
     sw_proc = _run_burn_cmd(sw_cmd, ass_path.parent)
     if sw_proc.returncode != 0 or not output_mp4_path.is_file():
         detail = _extract_ffmpeg_error(sw_proc.stderr or proc.stderr or "", "Subtitle burn-in failed")
@@ -388,6 +402,51 @@ def _validate_dub_inputs(
     return sorted(validated, key=lambda c: (c.start_seconds, c.end_seconds))
 
 
+def probe_video_stream_profile(video_path: Path, ffprobe_bin: str | None = None) -> tuple[str, str, int, int]:
+    """Probe `(codec_name, pix_fmt, width, height)` for the first video stream, returning empty defaults on failure."""
+    binary = ffprobe_bin or resolve_ffprobe_bin()
+    cmd = [binary, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,pix_fmt,width,height", "-of", "json", str(video_path)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        stream = (json.loads(proc.stdout).get("streams") or [{}])[0] if proc.returncode == 0 else {}
+        codec = str(stream.get("codec_name") or "").lower()
+        pix = str(stream.get("pix_fmt") or "").lower()
+        return (codec, pix, int(stream.get("width") or 0), int(stream.get("height") or 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ("", "", 0, 0)
+
+
+def _resolve_dub_video_args(source_video: Path, ffprobe_bin: str | None) -> list[str]:
+    """Choose `-c:v copy` (with `hvc1` tag for HEVC) when MP4-compatible or H.264 `yuv420p` transcoding."""
+    codec, pix_fmt, width, height = probe_video_stream_profile(source_video, ffprobe_bin)
+    if not codec:
+        return ["-map", "0:v:0", "-c:v", "copy"]
+    even_dims = width > 0 and height > 0 and (width % 2 == 0) and (height % 2 == 0)
+    if codec in MP4_SAFE_VIDEO_CODECS and pix_fmt in MP4_SAFE_PIX_FMTS and even_dims:
+        tag_args = ["-tag:v", "hvc1"] if codec == "hevc" else []
+        return ["-map", "0:v:0", "-c:v", "copy", *tag_args]
+    return [
+        "-map", "0:v:0",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+        "-c:v", "libx264", "-crf", "21", "-preset", "fast", "-pix_fmt", "yuv420p",
+    ]
+
+
+def _run_dub_ffmpeg(cmd: list[str], output_mp4: Path) -> None:
+    """Execute FFmpeg dub muxing subprocess and translate failures into `MediaProcessingError`."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        detail = _extract_ffmpeg_error(stderr, f"FFmpeg timed out after {FFMPEG_TIMEOUT_SECONDS} seconds")
+        raise MediaProcessingError(f"Could not export dubbed video: {detail}") from exc
+    except OSError as exc:
+        raise MediaProcessingError(f"Could not export dubbed video: {exc.strerror or 'FFmpeg could not be started'}") from exc
+    if proc.returncode != 0 or not output_mp4.is_file():
+        detail = _extract_ffmpeg_error(proc.stderr or "", "Dubbed MP4 export failed")
+        raise MediaProcessingError(f"Could not export dubbed video: {detail}")
+
+
 def mux_dubbed_audio(
     source_video: Path,
     clips: Sequence[DubClip],
@@ -395,11 +454,13 @@ def mux_dubbed_audio(
     original_audio_mode: str = "duck",
     ffmpeg_bin: str | None = None,
     ffprobe_bin: str | None = None,
+    *,
+    audio_language: str = "",
 ) -> Path:
-    """Mux time-aligned WAV clips onto `source_video` with stream-copied video and mixed AAC audio.
+    """Mux time-aligned WAV clips onto `source_video` with MP4-safe H.264/HEVC video and mixed AAC audio.
 
     Inputs: `source_video`, non-empty `clips` (`DubClip` sequence), destination `output_mp4`,
-    and `original_audio_mode` in `("duck", "mute", "keep")`.
+    `original_audio_mode` in `("duck", "mute", "keep")`, and optional `audio_language`.
     Outputs: resolved `output_mp4` path on success.
     Side effects: invokes parameterized FFmpeg/FFprobe subprocesses and writes `output_mp4`.
     Failure modes: raises `MediaProcessingError` on invalid inputs or FFmpeg errors.
@@ -413,27 +474,13 @@ def mux_dubbed_audio(
     cmd = [binary, "-y", "-i", str(source_video.resolve())]
     for clip in ordered:
         cmd.extend(["-i", str(clip.wav_path.resolve())])
+    video_args = _resolve_dub_video_args(source_video, ffprobe_bin)
+    lang_args = _build_audio_language_args(audio_language)
     cmd.extend([
         "-filter_complex", filter_complex,
-        "-map", "0:v:0",
-        "-map", "[aout]",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", DUB_AUDIO_BITRATE,
-        "-movflags", "+faststart",
-        "-shortest",
-        str(output_mp4.resolve()),
+        *video_args, "-map", "[aout]",
+        "-c:a", "aac", "-b:a", DUB_AUDIO_BITRATE, *lang_args,
+        "-movflags", "+faststart", "-shortest", str(output_mp4.resolve()),
     ])
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        detail = _extract_ffmpeg_error(stderr, f"FFmpeg timed out after {FFMPEG_TIMEOUT_SECONDS} seconds")
-        raise MediaProcessingError(f"Could not export dubbed video: {detail}") from exc
-    except OSError as exc:
-        detail = exc.strerror or "FFmpeg could not be started"
-        raise MediaProcessingError(f"Could not export dubbed video: {detail}") from exc
-    if proc.returncode != 0 or not output_mp4.is_file():
-        detail = _extract_ffmpeg_error(proc.stderr or "", "Dubbed MP4 export failed")
-        raise MediaProcessingError(f"Could not export dubbed video: {detail}")
+    _run_dub_ffmpeg(cmd, output_mp4)
     return output_mp4

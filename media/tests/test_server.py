@@ -931,3 +931,73 @@ def test_transcribe_and_translate_enforce_stage_separated_terminology(tmp_path: 
     )
     assert tr_res.status_code == 200
     assert tr_res.json()["segments"][0]["translatedText"] == "[khm_Khmr] VoxCPM and បញ្ញាសិប្បនិម្មិត"
+
+
+def test_burn_and_dub_apply_audio_language_metadata_safely(tmp_path: Path) -> None:
+    import json
+    from video_io import resolve_ffprobe_bin
+
+    sample_mp4 = tmp_path / "lang_sample.mp4"
+    _make_sample_mp4(sample_mp4)
+    client = _make_client(tmp_path)
+
+    with open(sample_mp4, "rb") as fh:
+        tr = client.post("/transcribe", files={"file": ("clip.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert tr.status_code == 200
+    job_id = tr.json()["jobId"]
+
+    ffprobe = resolve_ffprobe_bin()
+    if not Path(ffprobe).exists() and not shutil.which(ffprobe):
+        pytest.skip("ffprobe not installed")
+
+    burn_res = client.post(
+        "/burn",
+        json={
+            "jobId": job_id,
+            "segments": [{"id": "seg-1", "start": 0.1, "end": 1.2, "text": "សួស្តី", "speakerId": "speaker-1"}],
+            "speakerNames": {},
+            "videoSize": {"width": 640, "height": 360},
+            "audioLanguage": "khm_Khmr",
+        },
+    )
+    assert burn_res.status_code == 200, burn_res.text
+    burned_mp4 = tmp_path / "burn-lang.mp4"
+    burned_mp4.write_bytes(burn_res.content)
+    burn_probe = json.loads(
+        subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(burned_mp4)], capture_output=True, text=True, check=True).stdout
+    )
+    burn_audio = next(s for s in burn_probe["streams"] if s["codec_type"] == "audio")
+    assert (burn_audio.get("tags") or {}).get("language") == "khm"
+
+    wav_a = _make_wav_bytes(0.4)
+    dub_res = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.9, "fileIndex": 0}]),
+            "originalAudioMode": "mute",
+            "audioLanguage": "zsm_Latn",
+        },
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert dub_res.status_code == 200, dub_res.text
+    dubbed_mp4 = tmp_path / "dub-lang.mp4"
+    dubbed_mp4.write_bytes(dub_res.content)
+    dub_probe = json.loads(
+        subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(dubbed_mp4)], capture_output=True, text=True, check=True).stdout
+    )
+    dub_audio = next(s for s in dub_probe["streams"] if s["codec_type"] == "audio")
+    assert (dub_audio.get("tags") or {}).get("language") == "msa"
+
+    # Malformed or injected language input falls back safely without breaking FFmpeg
+    bad_lang_burn = client.post(
+        "/burn",
+        json={
+            "jobId": job_id,
+            "segments": [{"id": "seg-1", "start": 0.1, "end": 1.2, "text": "Hello", "speakerId": "speaker-1"}],
+            "speakerNames": {},
+            "videoSize": {"width": 640, "height": 360},
+            "audioLanguage": "km\n-invalid-flag",
+        },
+    )
+    assert bad_lang_burn.status_code == 200, bad_lang_burn.text

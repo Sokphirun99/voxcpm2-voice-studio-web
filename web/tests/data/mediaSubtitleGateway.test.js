@@ -178,3 +178,44 @@ test('both Vite dev proxy and Nginx allowlist expose /media_api/dub while blocki
   }
   assert.equal(nginxPattern.test('/media_api/admin'), false);
 });
+
+test('mediaSubtitleGateway forwards optional audioLanguage cleanly on burnSubtitles and exportDubbedVideo', async () => {
+  const calls = [];
+  const gateway = createMediaSubtitleGateway({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return new Response(new Blob(['MP4']), { status: 200, headers: { 'content-type': 'video/mp4' } });
+    },
+  });
+
+  await gateway.burnSubtitles({
+    jobId: 'abcd1234ef567890',
+    segments: [{ id: 's1', start: 0, end: 1, text: 'សួស្តី' }],
+    speakerNames: {},
+    audioLanguage: 'khm_Khmr',
+  });
+  assert.equal(JSON.parse(calls[0].init.body).audioLanguage, 'khm_Khmr');
+
+  await gateway.burnSubtitles({
+    jobId: 'abcd1234ef567890',
+    segments: [],
+    speakerNames: {},
+  });
+  assert.equal('audioLanguage' in JSON.parse(calls[1].init.body), false);
+
+  const wav = new Blob(['RIFF1111WAVE'], { type: 'audio/wav' });
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    audioLanguage: 'eng_Latn',
+    clips: [{ segmentId: 's1', start: 0, end: 1, blob: wav }],
+  });
+  assert.equal(calls[2].init.body.get('audioLanguage'), 'eng_Latn');
+
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    clips: [{ segmentId: 's1', start: 0, end: 1, blob: wav }],
+  });
+  assert.equal(calls[3].init.body.get('audioLanguage'), null);
+});

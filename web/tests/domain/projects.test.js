@@ -530,3 +530,44 @@ test('domain projects: upgradeProjectSchema handles null and corrupted legacy se
   assert.equal(upgraded.segments[2].id, 'c3');
   assert.equal(upgraded.segments[2].text, 'Valid segment');
 });
+
+test('domain projects: preserves and normalizes bounded exportHistory across snapshots, entities, and upgrades', () => {
+  const sampleHistory = [
+    {
+      id: 'exp-1',
+      presetId: 'subtitle_vtt',
+      category: 'subtitle',
+      label: 'WebVTT Subtitles (.vtt)',
+      filename: 'lesson.km.vtt',
+      format: 'vtt',
+      durationSeconds: 18.4,
+      languageCode: 'km',
+      languageLabel: 'Khmer',
+      exportedAt: '2026-11-26T00:00:00.000Z',
+    },
+  ];
+  const subSnap = createSubtitleProjectSnapshot({
+    id: '55555555-5555-5555-5555-555555555555',
+    title: 'Lesson Export',
+    videoFileName: 'lesson.mp4',
+    segments: [{ id: 's1', start: 0, end: 2, text: 'Hi' }],
+    exportHistory: sampleHistory,
+  });
+  assert.equal(subSnap.exportHistory.length, 1);
+  assert.equal(subSnap.payload.exportHistory.length, 1);
+  assert.equal(subSnap.payload.exportHistory[0].format, 'VTT');
+
+  const ttsSnap = createTtsProjectSnapshot({
+    id: '66666666-6666-6666-6666-666666666666',
+    title: 'Podcast Export',
+    script: 'Hello listeners.',
+    exportHistory: [{ filename: 'podcast-narration.wav', format: 'wav', category: 'audio' }],
+  });
+  assert.equal(ttsSnap.exportHistory.length, 1);
+  assert.equal(ttsSnap.payload.exportHistory[0].filename, 'podcast-narration.wav');
+
+  const upgraded = upgradeProjectSchema(subSnap);
+  assert.equal(upgraded.exportHistory.length, 1);
+  assert.equal(upgraded.exportHistory[0].filename, 'lesson.km.vtt');
+  assert.equal(upgraded.payload.exportHistory.length, 1);
+});

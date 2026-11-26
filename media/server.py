@@ -36,7 +36,8 @@ from languages import (
     resolve_nllb_lang_code,
 )
 from model_cache import inspect_model_readiness
-from subtitles import (    SPEAKER_ASS_COLORS,
+from subtitles import (
+    SPEAKER_ASS_COLORS,
     SubtitleSegment,
     align_even_dimensions,
     align_segments_with_speakers,
@@ -137,6 +138,7 @@ class BurnRequest(BaseModel):
     bilingual: bool = False
     subtitleStyle: SubtitleStylePayload | None = None
     videoSize: VideoSizePayload | None = None
+    audioLanguage: str = ""
 
 
 @dataclass(frozen=True)
@@ -509,9 +511,18 @@ def _validate_dub_overflow_bounds(clips: list[DubClip], source_duration: float) 
             raise HTTPException(status_code=400, detail=f"Approved overflow clip '{clip.segment_id}' collides with the next dubbed clip.")
 
 
-def _execute_dub_pipeline(job: MediaJobPaths, clips: list[DubClip], tmp_mp4: Path, original_audio_mode: str) -> Path:
+def _execute_dub_pipeline(
+    job: MediaJobPaths,
+    clips: list[DubClip],
+    tmp_mp4: Path,
+    audio_opts: tuple[str, str],
+) -> Path:
     """Mux dubbed audio clips onto `job.source_video` and atomically publish `job.dubbed_mp4`."""
-    mux_dubbed_audio(job.source_video, clips, tmp_mp4, original_audio_mode=original_audio_mode)
+    mode, audio_lang = audio_opts
+    kwargs: dict[str, Any] = {"original_audio_mode": mode}
+    if audio_lang:
+        kwargs["audio_language"] = audio_lang
+    mux_dubbed_audio(job.source_video, clips, tmp_mp4, **kwargs)
     os.replace(tmp_mp4, job.dubbed_mp4)
     return job.dubbed_mp4
 
@@ -653,7 +664,9 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
                 background_style=style.backgroundStyle,
             )
             job.ass_file.write_text(ass_content, encoding="utf-8")
-            burn_ass_subtitles(job.source_video, job.ass_file, job.burned_mp4)
+            clean_burn_lang = (payload.audioLanguage or "").strip()
+            burn_kwargs = {"audio_language": clean_burn_lang} if clean_burn_lang else {}
+            burn_ass_subtitles(job.source_video, job.ass_file, job.burned_mp4, **burn_kwargs)
             return FileResponse(path=job.burned_mp4, media_type="video/mp4", filename=f"{job.job_id}-subtitled.mp4")
         except MediaProcessingError as exc:
             _log_json(logging.ERROR, req_id, "FFmpeg burn-in failed", {"error": str(exc)})
@@ -668,12 +681,14 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
         jobId: str = Form(...),
         metadata: str = Form(...),
         originalAudioMode: str = Form("duck"),
+        audioLanguage: str = Form(""),
         files: list[UploadFile] = File(...),
     ) -> FileResponse:
         req_id = getattr(request.state, "request_id", "-")
         clean_mode = str(originalAudioMode).strip().lower()
         if clean_mode not in DUB_AUDIO_MODES:
             raise HTTPException(status_code=400, detail="originalAudioMode must be 'duck', 'mute', or 'keep'.")
+        clean_audio_lang = str(audioLanguage or "").strip()
         job = _resolve_job_safe(active_services.job_store, jobId)
         if not await asyncio.to_thread(has_video_stream, job.source_video):
             raise HTTPException(status_code=400, detail="Dubbed MP4 export is only supported for video files.")
@@ -703,7 +718,13 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
             ]
             await asyncio.to_thread(_validate_dub_overflow_bounds, dub_clips, source_duration)
             tmp_mp4 = work_dir / "dubbed.mp4"
-            out_mp4 = await asyncio.to_thread(_execute_dub_pipeline, job, dub_clips, tmp_mp4, clean_mode)
+            out_mp4 = await asyncio.to_thread(
+                _execute_dub_pipeline,
+                job,
+                dub_clips,
+                tmp_mp4,
+                (clean_mode, clean_audio_lang),
+            )
             return FileResponse(path=out_mp4, media_type="video/mp4", filename=f"{job.job_id}-dubbed.mp4")
         except HTTPException:
             raise

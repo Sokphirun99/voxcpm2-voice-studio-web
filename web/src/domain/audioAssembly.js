@@ -297,7 +297,7 @@ async function resolveAssemblyEntries(segments, assetFetcher, defaultPauseSec, a
  * @returns {Promise<{ recording: object, blob: Blob, filename: string }>} Assembled narration.
  */
 export async function assembleAudioNarration(params) {
-  const { segments, character, options = {}, assetFetcher = null, audioMaster = null, signal, projectTitle } = params || {};
+  const { segments, character, options = {}, assetFetcher = null, audioMaster = null, signal, projectTitle, filename: explicitFilename = '' } = params || {};
   const activeSegments = assertCompleteSegments(segments);
   const defaultPauseSec = typeof options.defaultPauseSeconds === 'number'
     ? options.defaultPauseSeconds
@@ -308,7 +308,10 @@ export async function assembleAudioNarration(params) {
   const { blob: finalBlob, mastered } = await applyAudioMastering({ audioMaster, blob: stitchedBlob, signal, options });
 
   const duration = await readBlobDurationSeconds(finalBlob);
-  const filename = formatNarrationExportFilename(projectTitle || options.projectTitle);
+  const cleanOverride = typeof explicitFilename === 'string' && explicitFilename.trim()
+    ? explicitFilename.trim()
+    : (typeof options.filename === 'string' && options.filename.trim() ? options.filename.trim() : '');
+  const filename = cleanOverride || formatNarrationExportFilename(projectTitle || options.projectTitle);
   const recording = createAssembledRecording({ combinedBlob: finalBlob, duration, entries, character, mastered, filename });
   return { recording, blob: finalBlob, filename };
 }

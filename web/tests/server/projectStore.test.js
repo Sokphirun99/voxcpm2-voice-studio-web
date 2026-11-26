@@ -316,3 +316,51 @@ test('projectStore filters project lists by type, kind, and status', async () =>
     assert.equal(subOnly.items[0].id, TEST_UUID_2);
   });
 });
+
+test('projectStore persists exportHistory across save, disk reload, update, and schema bounding', async () => {
+  await withTempProjectStore(async ({ store }) => {
+    await store.saveProject(TEST_UUID_1, {
+      kind: 'subtitle',
+      title: 'Documentary Cut',
+      payload: {
+        videoFileName: 'doc.mkv',
+        segments: [{ id: 's1', start: 0, end: 1.5, text: 'Hello' }],
+      },
+      exportHistory: [
+        {
+          id: 'exp-a',
+          presetId: 'subtitle_vtt',
+          category: 'subtitle',
+          label: 'WebVTT Subtitles (.vtt)',
+          filename: 'doc.km.vtt',
+          format: 'VTT',
+          durationSeconds: 1.5,
+          languageCode: 'km',
+          languageLabel: 'Khmer',
+        },
+        null,
+      ],
+    });
+
+    const loaded = await store.getProject(TEST_UUID_1);
+    assert.ok(loaded);
+    assert.equal(loaded.exportHistory.length, 1);
+    assert.equal(loaded.exportHistory[0].filename, 'doc.km.vtt');
+    assert.equal(loaded.payload.exportHistory[0].languageCode, 'km');
+
+    const overflowHistory = Array.from({ length: 65 }, (_, i) => ({
+      presetId: 'video_dubbed_mp4',
+      category: 'video',
+      filename: `take-${i}-dubbed.mp4`,
+      format: 'MP4',
+    }));
+    await store.saveProject(
+      TEST_UUID_1,
+      { ...loaded, exportHistory: overflowHistory, payload: { ...loaded.payload, exportHistory: overflowHistory } },
+      { expectedRevision: loaded.revision }
+    );
+    const reloaded = await store.getProject(TEST_UUID_1);
+    assert.equal(reloaded.exportHistory.length, 50);
+    assert.equal(reloaded.exportHistory[0].filename, 'take-0-dubbed.mp4');
+  });
+});

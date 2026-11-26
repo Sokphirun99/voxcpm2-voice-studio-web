@@ -3,6 +3,7 @@
  */
 
 import { ValidationError } from './errors.js';
+import { normalizeExportHistory } from './exportHistory.js';
 import { normalizeProjectTerminology } from './terminology.js';
 
 export const PROJECT_SCHEMA_VERSION = 1;
@@ -238,6 +239,7 @@ function validateSegmentInterval(start, end) {
 }
 
 function buildTakeEntity(id, assetId, duration, isSelected, spec) {
+  const liveBlob = spec.blob && typeof spec.blob.arrayBuffer === 'function' ? spec.blob : null;
   return Object.freeze({
     id,
     takeId: id,
@@ -246,7 +248,7 @@ function buildTakeEntity(id, assetId, duration, isSelected, spec) {
     isSelected: Boolean(isSelected),
     settings: Object.freeze({ ...(spec.settings || {}) }),
     createdAt: typeof spec.createdAt === 'string' && spec.createdAt ? spec.createdAt : new Date().toISOString(),
-    blob: spec.blob || null,
+    blob: liveBlob,
     audioUrl: typeof spec.audioUrl === 'string' ? spec.audioUrl : null,
   });
 }
@@ -334,9 +336,10 @@ function validateProjectSettings(settings) {
   return Object.freeze({ ...settings });
 }
 
-function buildProjectPayload(type, segments, settings, sourceLang, targetLang, rawPayload = null, terminology = null) {
+function buildProjectPayload(type, segments, settings, sourceLang, targetLang, rawPayload = null, terminology = null, exportHistory = null) {
   const extra = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload) ? rawPayload : {};
   const resolvedTerminology = normalizeProjectTerminology(terminology ?? extra.terminology ?? settings.terminology);
+  const resolvedExportHistory = normalizeExportHistory(exportHistory ?? extra.exportHistory ?? settings.exportHistory);
   const base = {
     ...extra,
     segments,
@@ -348,6 +351,7 @@ function buildProjectPayload(type, segments, settings, sourceLang, targetLang, r
     translatedLanguage: targetLang || extra.translatedLanguage || '',
     hasTranslation: Boolean(settings.hasTranslation || extra.hasTranslation || segments.some(s => s.translatedText)),
     terminology: resolvedTerminology,
+    exportHistory: resolvedExportHistory,
   };
   if (type === 'tts') {
     base.script = settings.script || extra.script || (segments.length ? segments.map(s => s.text).join('\n') : '');
@@ -359,7 +363,17 @@ function buildProjectPayload(type, segments, settings, sourceLang, targetLang, r
 
 function buildProjectEntity(hdr, spec, assetId, segments, settings, now) {
   const terminology = normalizeProjectTerminology(spec.terminology ?? spec.settings?.terminology ?? spec.payload?.terminology);
-  const payload = buildProjectPayload(hdr.type, segments, settings, spec.sourceLanguage || '', spec.targetLanguage || '', spec.payload, terminology);
+  const exportHistory = normalizeExportHistory(spec.exportHistory ?? spec.payload?.exportHistory ?? spec.settings?.exportHistory);
+  const payload = buildProjectPayload(
+    hdr.type,
+    segments,
+    settings,
+    spec.sourceLanguage || '',
+    spec.targetLanguage || '',
+    spec.payload,
+    terminology,
+    exportHistory
+  );
   return Object.freeze({
     schemaVersion: PROJECT_SCHEMA_VERSION,
     id: hdr.id,
@@ -375,6 +389,7 @@ function buildProjectEntity(hdr, spec, assetId, segments, settings, now) {
     segments: Object.freeze(segments),
     settings,
     terminology,
+    exportHistory,
     revision: hdr.revision,
     payload,
     createdAt: typeof spec.createdAt === 'string' && spec.createdAt ? spec.createdAt : now,
@@ -501,6 +516,7 @@ export function upgradeProjectSchema(raw) {
     segments,
     settings,
     terminology: raw.terminology ?? payload.terminology ?? settings.terminology,
+    exportHistory: raw.exportHistory ?? payload.exportHistory ?? settings.exportHistory,
     revision: Number.isInteger(raw.revision) && raw.revision >= 1 ? raw.revision : DEFAULT_REVISION,
     schemaVersion: PROJECT_SCHEMA_VERSION,
     createdAt: raw.createdAt,
@@ -568,8 +584,11 @@ export function toProjectSummary(record) {
 }
 
 function buildSubtitleSnapshotPayload(spec) {
+  const rawDur = Number(spec.mediaDuration ?? spec.payload?.mediaDuration);
+  const mediaDuration = Number.isFinite(rawDur) && rawDur > 0 ? Math.round(rawDur * 1000) / 1000 : null;
   return {
     videoFileName: typeof spec.videoFileName === 'string' && spec.videoFileName ? spec.videoFileName : null,
+    ...(mediaDuration ? { mediaDuration } : {}),
     segments: Array.isArray(spec.segments) ? spec.segments : [],
     speakerNames: typeof spec.speakerNames === 'object' && !Array.isArray(spec.speakerNames) ? spec.speakerNames : {},
     subtitleOptions: typeof spec.subtitleOptions === 'object' && !Array.isArray(spec.subtitleOptions) ? spec.subtitleOptions : {},
@@ -577,12 +596,13 @@ function buildSubtitleSnapshotPayload(spec) {
     translatedLanguage: typeof spec.translatedLanguage === 'string' ? spec.translatedLanguage : '',
     hasTranslation: Boolean(spec.hasTranslation),
     terminology: normalizeProjectTerminology(spec.terminology ?? spec.payload?.terminology),
+    exportHistory: normalizeExportHistory(spec.exportHistory ?? spec.payload?.exportHistory),
   };
 }
 
 /**
  * Builds a subtitle project snapshot for legacy workflows.
- * Inputs: `{ id, title, videoFileName, segments, speakerNames, subtitleOptions, detectedLanguage, translatedLanguage, hasTranslation, terminology, createdAt, updatedAt }`.
+ * Inputs: `{ id, title, videoFileName, segments, speakerNames, subtitleOptions, detectedLanguage, translatedLanguage, hasTranslation, terminology, exportHistory, createdAt, updatedAt }`.
  * Outputs: Legacy subtitle project snapshot.
  * Side effects: none.
  * Failure modes: Throws ValidationError on invalid title.
@@ -597,6 +617,7 @@ export function createSubtitleProjectSnapshot(spec = {}) {
     kind: 'subtitle',
     title: assertProjectTitle(spec.title),
     terminology: payload.terminology,
+    exportHistory: payload.exportHistory,
     payload,
     createdAt: spec.createdAt || now,
     updatedAt: spec.updatedAt || now,
@@ -618,12 +639,13 @@ function buildTtsSnapshotPayload(spec) {
     segments,
     ...(sourceLanguage ? { detectedLanguage: sourceLanguage } : {}),
     terminology: normalizeProjectTerminology(spec.terminology ?? spec.payload?.terminology),
+    exportHistory: normalizeExportHistory(spec.exportHistory ?? spec.payload?.exportHistory),
   };
 }
 
 /**
- * Builds a TTS project snapshot storing script text, voice id, segments, terminology overrides, and synthesis options.
- * Inputs: `{ id, title, script, voiceId, segments, ttsOptions, sourceLanguage, terminology, createdAt, updatedAt }`.
+ * Builds a TTS project snapshot storing script text, voice id, segments, terminology overrides, export history, and synthesis options.
+ * Inputs: `{ id, title, script, voiceId, segments, ttsOptions, sourceLanguage, terminology, exportHistory, createdAt, updatedAt }`.
  * Outputs: Complete TTS project snapshot.
  * Side effects: none.
  * Failure modes: Throws ValidationError on invalid title.
@@ -641,6 +663,7 @@ export function createTtsProjectSnapshot(spec = {}) {
     ...(payload.detectedLanguage ? { sourceLanguage: payload.detectedLanguage } : {}),
     segments: payload.segments,
     terminology: payload.terminology,
+    exportHistory: payload.exportHistory,
     payload,
     createdAt: spec.createdAt || now,
     updatedAt: spec.updatedAt || now,

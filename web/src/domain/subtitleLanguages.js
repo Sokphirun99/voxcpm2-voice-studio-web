@@ -418,6 +418,9 @@ export const TARGET_LANGUAGE_OPTIONS = Object.freeze(
 );
 
 const TARGET_BY_ID = new Map(TARGET_LANGUAGE_OPTIONS.map(opt => [opt.id.toLowerCase(), opt]));
+const SOURCE_BY_ID = new Map(SOURCE_LANGUAGE_OPTIONS.map(opt => [opt.id.toLowerCase(), opt]));
+const BCP47_PATTERN = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
+const UNDETERMINED_LANGS = new Set(['auto', 'und']);
 
 /**
  * Normalizes any ISO-639-1, locale, or FLORES-200 code into a canonical NLLB-200 target code.
@@ -489,4 +492,65 @@ export function groupLanguageOptions(options, popularIds) {
     .filter(opt => !popularSet.has(opt.id))
     .sort((a, b) => a.label.localeCompare(b.label));
   return { popular, others };
+}
+
+function formatBcp47Subtags(parts) {
+  const head = parts[0].toLowerCase();
+  const tail = parts.slice(1).map(tag => {
+    if (tag.length === 4 && /^[a-zA-Z]+$/.test(tag)) {
+      return tag[0].toUpperCase() + tag.slice(1).toLowerCase();
+    }
+    if (tag.length === 2 && /^[a-zA-Z]+$/.test(tag)) return tag.toUpperCase();
+    return tag.toLowerCase();
+  });
+  return [head, ...tail].join('-');
+}
+
+/**
+ * Resolves a Whisper, NLLB-200, or locale tag into a sanitized BCP-47 tag (or `''` when invalid/undetermined).
+ * Inputs: `code` language string.
+ * Outputs: Sanitized BCP-47 string (`'km'`, `'en-US'`, `'zh-Hans'`, etc.) or `''`.
+ * Side effects: none.
+ * Failure modes: rejects control characters, whitespace, `'auto'`, `'und'`, and unknown tags with `''`.
+ * @param {string} [code=''] - Raw language code.
+ * @returns {string} Sanitized BCP-47 tag or empty string.
+ */
+export function resolveBcp47LanguageTag(code = '') {
+  const raw = String(code || '').trim();
+  if (!raw || /[\r\n\t\0\s]/.test(raw)) return '';
+  const lowered = raw.toLowerCase();
+  if (UNDETERMINED_LANGS.has(lowered)) return '';
+  const directTarget = TARGET_BY_ID.get(lowered);
+  if (directTarget) return directTarget.bcp47;
+  const candidate = raw.replace(/_/g, '-');
+  if (!BCP47_PATTERN.test(candidate)) return '';
+  const parts = candidate.split('-');
+  const base = parts[0].toLowerCase();
+  if (parts.length === 1) {
+    if (ISO_TO_NLLB[base]) return TARGET_BY_ID.get(ISO_TO_NLLB[base].toLowerCase())?.bcp47 || base;
+    return SOURCE_BY_ID.has(base) ? base : '';
+  }
+  const hasKnownBase = Boolean(ISO_TO_NLLB[candidate.toLowerCase()] || ISO_TO_NLLB[base] || SOURCE_BY_ID.has(base));
+  return hasKnownBase ? formatBcp47Subtags(parts) : '';
+}
+
+/**
+ * Resolves a compact human-readable `{ bcp47, label }` summary for export previews and metadata.
+ * Inputs: `code` language string.
+ * Outputs: `{ bcp47: string, label: string }`.
+ * Side effects: none.
+ * Failure modes: falls back to `{ bcp47: '', label: 'Undetermined' }` on unknown/empty input.
+ * @param {string} [code=''] - Raw language code.
+ * @returns {{ bcp47: string, label: string }} Resolved display language metadata.
+ */
+export function resolveLanguageDisplayMeta(code = '') {
+  const bcp47 = resolveBcp47LanguageTag(code);
+  if (!bcp47) return { bcp47: '', label: 'Undetermined' };
+  const rawLower = String(code || '').trim().toLowerCase();
+  const target = TARGET_BY_ID.get(rawLower) || TARGET_BY_ID.get((ISO_TO_NLLB[bcp47.toLowerCase()] || '').toLowerCase());
+  if (target) return { bcp47, label: target.shortLabel || target.label };
+  const base = bcp47.split('-')[0].toLowerCase();
+  const src = SOURCE_BY_ID.get(base);
+  if (src) return { bcp47, label: src.label };
+  return { bcp47, label: bcp47.toUpperCase() };
 }
