@@ -53,6 +53,13 @@ import {
   resolveExportFilenameStem,
   resolvePresetLanguageInfo,
 } from '../../domain/exportPresets.js';
+import {
+  SUBTITLE_VOICEOVER_PAUSE_MS,
+  attachSubtitleClipTake,
+  clearSubtitleSegmentTakes,
+  normalizeSpillApprovalsMap,
+  normalizeSubtitleVoiceoverGapMs,
+} from '../../domain/subtitleTts.js';
 import { assertFeatureOfflineReady } from '../../domain/offlineReadiness.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import {
@@ -82,7 +89,37 @@ const DEFAULT_OPTIONS = Object.freeze({
   dubAudioMode: VIDEO_AUDIO_MODES.DUCK,
   dubSubtitleMode: DEFAULT_DUB_SUBTITLE_MODE,
   dubMixSettings: DEFAULT_DUB_MIX_SETTINGS,
+  voiceId: '',
+  voiceoverPauseMs: SUBTITLE_VOICEOVER_PAUSE_MS,
+  spillApprovals: Object.freeze({}),
 });
+
+function normalizeRestoredSubtitleOptions(rawOpts, baseOpts) {
+  const src = rawOpts && typeof rawOpts === 'object' ? rawOpts : {};
+  return {
+    ...baseOpts,
+    ...src,
+    dubAudioMode: normalizeVideoAudioMode(src.dubAudioMode, baseOpts.dubAudioMode),
+    dubSubtitleMode: normalizeVideoSubtitleMode(src.dubSubtitleMode, baseOpts.dubSubtitleMode),
+    dubMixSettings: normalizeDubMixSettings(src.dubMixSettings ?? baseOpts.dubMixSettings),
+    voiceId: typeof src.voiceId === 'string' ? src.voiceId : baseOpts.voiceId,
+    voiceoverPauseMs: src.voiceoverPauseMs !== undefined
+      ? normalizeSubtitleVoiceoverGapMs(src.voiceoverPauseMs)
+      : baseOpts.voiceoverPauseMs,
+    spillApprovals: src.spillApprovals !== undefined
+      ? normalizeSpillApprovalsMap(src.spillApprovals)
+      : baseOpts.spillApprovals,
+  };
+}
+
+function mergeTranslatedCueList(prevSegments, resSegments) {
+  if (!Array.isArray(resSegments)) return prevSegments;
+  const byId = new Map((prevSegments || []).map(seg => [seg?.id, seg]));
+  return resSegments.map(item => {
+    const existing = item?.id ? byId.get(item.id) : null;
+    return existing ? { ...existing, ...item } : item;
+  });
+}
 
 function formatElapsedSec(startedAt) {
   return ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -422,6 +459,7 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
       targetLanguage: nextTargetOption,
       includeSpeaker: nextIncludeSpeaker,
       previewMode: hasTranslated ? 'translated' : 'original',
+      spillApprovals: DEFAULT_OPTIONS.spillApprovals,
     },
     busyAction: '',
     status: { message: buildExtractSummary(segments.length, speakerCount, elapsed, res.verificationSummary), error: false },
@@ -551,7 +589,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         markOnline();
         const summary = `Translated dialogue lines to ${targetMeta.shortLabel} in ${elapsedSecs()}s.`;
         setState(prev => {
-          const nextSegments = Array.isArray(res.segments) ? res.segments : prev.segments;
+          const nextSegments = mergeTranslatedCueList(prev.segments, res.segments);
           return {
             ...prev,
             segments: nextSegments,
@@ -797,6 +835,20 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
     return { matchCount: result.matchCount, segmentCount: result.segmentCount };
   }, [segments, setState, useTranslation]);
 
+  const attachSegmentVoiceTake = useCallback((segId, clipSpec) => {
+    setState(prev => {
+      const nextSegments = attachSubtitleClipTake(prev.segments, segId, clipSpec);
+      return nextSegments === prev.segments ? prev : { ...prev, segments: nextSegments };
+    });
+  }, [setState]);
+
+  const clearSegmentVoiceTakes = useCallback(segId => {
+    setState(prev => {
+      const nextSegments = clearSubtitleSegmentTakes(prev.segments, segId);
+      return nextSegments === prev.segments ? prev : { ...prev, segments: nextSegments };
+    });
+  }, [setState]);
+
   return {
     updateSegment,
     deleteSegment,
@@ -813,6 +865,8 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
     dismissSegmentSuggestion,
     countMatches,
     findAndReplace,
+    attachSegmentVoiceTake,
+    clearSegmentVoiceTakes,
   };
 }
 
@@ -973,6 +1027,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
           ...prev.options,
           includeSpeaker: (keepExistingWork || prev.options.detectSpeakers) ? prev.options.includeSpeaker : false,
           previewMode: keepExistingWork ? prev.options.previewMode : defaultPreview,
+          spillApprovals: keepExistingWork ? prev.options.spillApprovals : DEFAULT_OPTIONS.spillApprovals,
         },
         status: { message: `Loaded ${file.name}. Ready to extract subtitles.`, error: false },
       };
@@ -1007,7 +1062,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
         hasTranslation: false,
         translatedLanguage: '',
         speakerNames,
-        options: { ...prev.options, previewMode: 'original' },
+        options: { ...prev.options, previewMode: 'original', spillApprovals: DEFAULT_OPTIONS.spillApprovals },
         status: { message: `Imported ${segments.length} subtitle cues from ${file.name}.`, error: false },
       }));
       onNotify?.({
@@ -1054,6 +1109,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       projectId: '',
       projectTitle: '',
       busyAction: '',
+      options: { ...prev.options, spillApprovals: DEFAULT_OPTIONS.spillApprovals },
       status: { message: '', error: false },
     }));
   }, [bumpTranscriptEpoch]);
@@ -1283,16 +1339,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : {},
       terminology: normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology),
       exportHistory: normalizeExportHistory(snapshot.exportHistory ?? payload.exportHistory ?? payload.subtitleOptions?.exportHistory),
-      options: (() => {
-        const rawOpts = typeof payload.subtitleOptions === 'object' && payload.subtitleOptions ? payload.subtitleOptions : {};
-        return {
-          ...prev.options,
-          ...rawOpts,
-          dubAudioMode: normalizeVideoAudioMode(rawOpts.dubAudioMode, prev.options.dubAudioMode),
-          dubSubtitleMode: normalizeVideoSubtitleMode(rawOpts.dubSubtitleMode, prev.options.dubSubtitleMode),
-          dubMixSettings: normalizeDubMixSettings(rawOpts.dubMixSettings ?? prev.options.dubMixSettings),
-        };
-      })(),
+      options: normalizeRestoredSubtitleOptions(payload.subtitleOptions, prev.options),
       status: { message: `Project loaded: ${title}`, error: false },
     }));
   }, [bumpTranscriptEpoch]);
@@ -1315,13 +1362,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
         hasTranslation: payload.hasTranslation !== undefined ? Boolean(payload.hasTranslation) : prev.hasTranslation,
         translatedLanguage: payload.translatedLanguage || prev.translatedLanguage,
         speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : prev.speakerNames,
-        options: rawOpts ? {
-          ...prev.options,
-          ...rawOpts,
-          dubAudioMode: normalizeVideoAudioMode(rawOpts.dubAudioMode, prev.options.dubAudioMode),
-          dubSubtitleMode: normalizeVideoSubtitleMode(rawOpts.dubSubtitleMode, prev.options.dubSubtitleMode),
-          dubMixSettings: normalizeDubMixSettings(rawOpts.dubMixSettings ?? prev.options.dubMixSettings),
-        } : prev.options,
+        options: rawOpts ? normalizeRestoredSubtitleOptions(rawOpts, prev.options) : prev.options,
         terminology: snapshot.terminology !== undefined || payload.terminology !== undefined
           ? normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology)
           : prev.terminology,

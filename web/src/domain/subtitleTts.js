@@ -3,6 +3,7 @@
  */
 
 import { SynthesisError } from './errors.js';
+import { createSegmentTake } from './projects.js';
 import { assertMatchingWaveFormats, assertPcmFormat } from './audioAssembly.js';
 import {
   DURATION_MISMATCH_TOLERANCE_SEC,
@@ -448,4 +449,140 @@ export async function assembleTimelineAlignedVoiceover(spec = {}) {
     blob, duration: finalFrame / baseInfo.sampleRate, clipCount: targets.length,
     warnings, mismatches: mismatchReport.unresolved, sampleRate: baseInfo.sampleRate, mastered,
   };
+}
+
+export const MAX_SUBTITLE_SEGMENT_TAKES = 10;
+
+function buildSubtitleTakeSettings(clipSpec) {
+  return Object.freeze({
+    text: typeof clipSpec.text === 'string' ? clipSpec.text : '',
+    voiceId: clipSpec.characterId || '',
+    characterName: clipSpec.characterName || '',
+    signature: typeof clipSpec.signature === 'string' ? clipSpec.signature : '',
+    seed: clipSpec.seed ?? null,
+    ...(clipSpec.preTrimAssetId ? { preTrimAssetId: clipSpec.preTrimAssetId } : {}),
+    ...(Number.isFinite(clipSpec.preTrimDuration) && clipSpec.preTrimDuration > 0 ? { preTrimDuration: clipSpec.preTrimDuration } : {}),
+  });
+}
+
+function buildSelectedSubtitleTake(segmentId, clipSpec) {
+  const duration = Number.isFinite(clipSpec.durationSeconds) && clipSpec.durationSeconds > 0
+    ? clipSpec.durationSeconds
+    : null;
+  return createSegmentTake({
+    id: clipSpec.takeId || `take-${segmentId}-${Date.now()}`,
+    audioAssetId: clipSpec.audioAssetId,
+    duration,
+    isSelected: true,
+    settings: buildSubtitleTakeSettings(clipSpec),
+  });
+}
+
+/**
+ * Extracts the active persisted audio take specification from a subtitle segment.
+ * Inputs: subtitle `segment` object.
+ * Outputs: Frozen `{ takeId, audioAssetId, durationSeconds, text, characterId, characterName, signature, seed, preTrimAssetId, preTrimDuration }` or `null`.
+ * Side effects: none.
+ * Failure modes: returns `null` when no take with a durable `audioAssetId` exists.
+ * @param {object|null|undefined} segment - Subtitle cue record.
+ * @returns {Readonly<object>|null} Active take metadata or null.
+ */
+export function extractActiveSubtitleTakeSpec(segment) {
+  const takes = Array.isArray(segment?.takes) ? segment.takes : [];
+  if (!takes.length) return null;
+  const active = takes.find(item => item?.isSelected) || takes[takes.length - 1];
+  if (!active?.audioAssetId) return null;
+  const settings = active.settings || {};
+  return Object.freeze({
+    takeId: active.id || active.takeId || '',
+    audioAssetId: active.audioAssetId,
+    durationSeconds: Number.isFinite(active.duration) && active.duration > 0 ? active.duration : null,
+    text: typeof settings.text === 'string' ? settings.text : '',
+    characterId: settings.voiceId || segment.voiceId || '',
+    characterName: settings.characterName || '',
+    signature: typeof settings.signature === 'string' ? settings.signature : '',
+    seed: settings.seed ?? null,
+    preTrimAssetId: settings.preTrimAssetId || null,
+    preTrimDuration: Number.isFinite(settings.preTrimDuration) && settings.preTrimDuration > 0 ? settings.preTrimDuration : null,
+  });
+}
+
+/**
+ * Attaches a persisted voiceover `SegmentTake` onto a subtitle segment immutably and idempotently.
+ * Inputs: `segments` array, target `segmentId`, and `clipSpec` (`{ audioAssetId, takeId, text, characterId, characterName, signature, durationSeconds, seed, preTrimAssetId, preTrimDuration }`).
+ * Outputs: Updated segments array (returns original reference if idempotent or invalid).
+ * Side effects: none.
+ * Failure modes: returns input segments untouched when `segmentId`, `audioAssetId`, or matching cue is missing.
+ * @param {Array<object>} segments - Subtitle segments array.
+ * @param {string} segmentId - Target cue id.
+ * @param {object} [clipSpec={}] - Persisted take metadata.
+ * @returns {Array<object>} Updated segments array.
+ */
+export function attachSubtitleClipTake(segments, segmentId, clipSpec = {}) {
+  if (!Array.isArray(segments) || !segmentId || !clipSpec?.audioAssetId) return Array.isArray(segments) ? segments : [];
+  const idx = segments.findIndex(seg => seg?.id === segmentId);
+  if (idx < 0) return segments;
+  const target = segments[idx];
+  const nextVoiceId = clipSpec.characterId || target.voiceId || null;
+  const currentSpec = extractActiveSubtitleTakeSpec(target);
+  const sameAsset = currentSpec?.audioAssetId === clipSpec.audioAssetId && currentSpec?.preTrimAssetId === (clipSpec.preTrimAssetId || null);
+  if (sameAsset && (target.voiceId || null) === nextVoiceId) return segments;
+  const existingTakes = Array.isArray(target.takes) ? target.takes : [];
+  const prior = existingTakes.slice(-(MAX_SUBTITLE_SEGMENT_TAKES - 1)).map(t => Object.freeze({ ...t, isSelected: false, blob: null }));
+  const nextTake = buildSelectedSubtitleTake(segmentId, clipSpec);
+  const updated = Object.freeze({ ...target, voiceId: nextVoiceId, status: 'ready', takes: Object.freeze([...prior, nextTake]) });
+  return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+}
+
+/**
+ * Clears all persisted voiceover takes from a subtitle segment when its clip is removed.
+ * Inputs: `segments` array and target `segmentId`.
+ * Outputs: Updated segments array with empty `takes` on the target cue.
+ * Side effects: none.
+ * Failure modes: returns input segments unchanged if target has no takes or does not exist.
+ * @param {Array<object>} segments - Subtitle segments array.
+ * @param {string} segmentId - Target cue id.
+ * @returns {Array<object>} Updated segments array.
+ */
+export function clearSubtitleSegmentTakes(segments, segmentId) {
+  if (!Array.isArray(segments) || !segmentId) return Array.isArray(segments) ? segments : [];
+  const idx = segments.findIndex(seg => seg?.id === segmentId);
+  if (idx < 0) return segments;
+  const target = segments[idx];
+  if (!Array.isArray(target.takes) || target.takes.length === 0) return segments;
+  const updated = Object.freeze({ ...target, takes: Object.freeze([]), status: 'draft' });
+  return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+}
+
+function isValidSpillApprovalEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const start = Number(entry.cueStart);
+  const end = Number(entry.cueEnd);
+  const clipDur = Number(entry.clipDuration);
+  return typeof entry.segmentId === 'string' && Boolean(entry.segmentId)
+    && Number.isFinite(start) && start >= 0
+    && Number.isFinite(end) && end >= start
+    && Number.isFinite(clipDur) && clipDur > 0
+    && typeof entry.clipSignature === 'string';
+}
+
+/**
+ * Validates and normalizes persisted R3-05 speech spill approvals into an immutable lookup map.
+ * Inputs: `rawApprovals` candidate record.
+ * Outputs: Frozen `Record<string, object>` containing only valid spill approval records.
+ * Side effects: none.
+ * Failure modes: returns empty frozen object for non-object or malformed inputs.
+ * @param {unknown} rawApprovals - Raw spill approval map.
+ * @returns {Readonly<Record<string, object>>} Normalized spill approvals.
+ */
+export function normalizeSpillApprovalsMap(rawApprovals) {
+  if (!rawApprovals || typeof rawApprovals !== 'object' || Array.isArray(rawApprovals)) {
+    return Object.freeze({});
+  }
+  const clean = {};
+  for (const [segId, entry] of Object.entries(rawApprovals)) {
+    if (!segId || typeof segId !== 'string' || !isValidSpillApprovalEntry(entry)) continue;
+    clean[segId] = Object.freeze({ ...entry });
+  }
+  return Object.freeze(clean);
 }

@@ -1003,7 +1003,7 @@ export function splitSubtitleSegment(segments, segId, { ratio = 0.5, nextId } = 
   if (!textB && !trB) return list;
   const freshId = nextId || buildUniqueSegmentId(list, seg.id);
   const first = { ...seg, end: splitTime, text: textA || seg.text, translatedText: trA };
-  const second = { ...seg, id: freshId, start: splitTime, text: textB, translatedText: trB };
+  const second = { ...seg, id: freshId, start: splitTime, text: textB, translatedText: trB, ...(Array.isArray(seg.takes) ? { takes: [] } : {}) };
   return [...list.slice(0, idx), first, second, ...list.slice(idx + 1)];
 }
 

@@ -16,7 +16,11 @@ import {
   summarizeJobs,
 } from '../../domain/productionJobs.js';
 import { attachTakeToSegment, computeSegmentStatus, getSegmentActiveTake } from '../../domain/projectSegments.js';
-import { buildSubtitleSynthesisCommand } from '../../domain/subtitleTts.js';
+import {
+  attachSubtitleClipTake,
+  buildSubtitleSynthesisCommand,
+  extractActiveSubtitleTakeSpec,
+} from '../../domain/subtitleTts.js';
 import {
   EXPORT_PRESET_IDS,
   VIDEO_AUDIO_MODES,
@@ -312,12 +316,48 @@ async function executeTtsBatchItem({ job, item, signal, deps, sessionAnchors, se
   };
 }
 
+async function findExistingSubtitleProjectTake({ deps, job, item, signature }) {
+  if ((job.attempt || 1) <= 1 || !job.projectId || !item.segmentId || !deps.projectRepository?.getProject) return null;
+  try {
+    const project = await deps.projectRepository.getProject(job.projectId);
+    const segs = Array.isArray(project?.segments) ? project.segments : (project?.payload?.segments || []);
+    const projSeg = segs.find(seg => seg?.id === item.segmentId);
+    const spec = extractActiveSubtitleTakeSpec(projSeg);
+    if (!spec?.audioAssetId) return null;
+    if (signature && spec.signature && spec.signature !== signature) return null;
+    return {
+      outputAssetId: spec.audioAssetId,
+      takeId: spec.takeId || null,
+      durationSeconds: spec.durationSeconds,
+      seed: spec.seed,
+      artifact: buildAudioArtifact({
+        item, assetId: spec.audioAssetId, takeId: spec.takeId || null, durationSeconds: spec.durationSeconds, blob: null,
+      }),
+    };
+  } catch (err) {
+    deps.logger?.debug?.('useProductionJobs.findExistingSubtitleProjectTake', err?.message || 'Could not inspect subtitle project take');
+    return null;
+  }
+}
+
+async function attachSubtitleTakeToProject(deps, { projectId, segmentId, clipSpec }) {
+  if (!deps.projectRepository || !projectId || !segmentId || !clipSpec?.audioAssetId) return;
+  await saveProjectMutationWithRetry(deps.projectRepository, projectId, project => {
+    const segs = Array.isArray(project.segments) ? project.segments : (project.payload?.segments || []);
+    const nextSegments = attachSubtitleClipTake(segs, segmentId, clipSpec);
+    if (nextSegments === segs) return project;
+    return { ...project, segments: nextSegments, payload: { ...(project.payload || {}), segments: nextSegments } };
+  });
+}
+
 async function executeSubtitleVoiceItem({ job, item, signal, deps, sessionAnchors, sessionUploads }) {
   if (!deps.synthesizeSpeech?.execute) {
     throw new ValidationError('Speech synthesis service is unavailable.', 'synthesizeSpeech', 'SYNTHESIS_UNAVAILABLE');
   }
   const itemMeta = item.metadata || {};
   const jobMeta = job.metadata || {};
+  const reusable = await findExistingSubtitleProjectTake({ deps, job, item, signature: item.inputSignature || itemMeta.signature || '' });
+  if (reusable) return reusable;
   const { character, anchor } = await resolveVoiceAndAnchor(itemMeta.voiceId || jobMeta.voiceId, deps, sessionAnchors);
   const command = buildSubtitleSynthesisCommand({
     text: itemMeta.text || '',
@@ -336,10 +376,22 @@ async function executeSubtitleVoiceItem({ job, item, signal, deps, sessionAnchor
   if (signal.aborted) throw new SynthesisCancelledError();
   if (result?.uploadedFileData) sessionUploads?.set(character.id, result.uploadedFileData);
   await captureSessionAnchor({ deps, character, anchor, recording: result.recording, sessionAnchors });
+  const segmentId = item.segmentId || item.itemId;
   const outputAssetId = await persistItemWavAsset(deps, {
-    blob: result.recording.blob, segmentId: item.segmentId || item.itemId, seed: result.recording.seed, projectId: job.projectId,
+    blob: result.recording.blob, segmentId, seed: result.recording.seed, projectId: job.projectId,
   });
   const durationSeconds = await resolveBlobDurationSeconds(result.recording.blob, result.recording.audioDurationSeconds);
+  const clipSpec = {
+    takeId: result.recording.id,
+    audioAssetId: outputAssetId,
+    text: itemMeta.text || '',
+    characterId: character.id,
+    characterName: character.name,
+    signature: item.inputSignature || itemMeta.signature || '',
+    durationSeconds,
+    seed: result.recording.seed ?? null,
+  };
+  await attachSubtitleTakeToProject(deps, { projectId: job.projectId, segmentId, clipSpec });
   return {
     outputAssetId,
     takeId: result.recording.id,

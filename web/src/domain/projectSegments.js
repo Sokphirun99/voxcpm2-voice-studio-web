@@ -222,6 +222,7 @@ export function createEditableSegment(spec = {}) {
   const rawSegment = createProjectSegment({
     id,
     text,
+    translatedText: typeof spec.translatedText === 'string' ? spec.translatedText : '',
     start: spec.start ?? null,
     end: spec.end ?? null,
     speaker: spec.speaker ?? null,

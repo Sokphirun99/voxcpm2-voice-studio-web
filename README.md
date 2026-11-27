@@ -12,12 +12,13 @@ Offline Apple Silicon **Text-to-Speech** and **Multilingual Video-to-Subtitle St
 
 ## Highlights
 
-- **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, `-16 LUFS` FFmpeg mastering, and on-demand / optional auto Whisper Khmer round-trip word QA (`seanghay/whisper-small-khmer-v2`).
-- **Video to Subtitle (`media/` + `web/`):**
+- **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, `-16 LUFS` FFmpeg mastering, structured segment editing with per-segment take history/comparison, project-scoped pronunciation overrides, and on-demand / optional auto Whisper Khmer round-trip word QA (`seanghay/whisper-small-khmer-v2`).
+- **Video to Subtitle & Dubbing (`media/` + `web/`):**
   - **101 source languages** (`Auto-detect` + all 100 Whisper languages via `mlx-community/whisper-large-v3-turbo`, plus `seanghay/Qwen3-ASR-0.6B-Khmer` for Khmer with automatic selective fallback and optional full double-check via `seanghay/whisper-small-khmer-v2`).
   - **202 offline translation targets** (all Meta NLLB-200 FLORES-200 languages, any-to-any including Khmer → any language and RTL support).
-  - Optional offline speaker diarization (`sherpa-onnx` Pyannote + 3D-Speaker), live VTT preview, inline timing/split/merge/find-replace editing, and `libass` burned-in MP4 export.
-- **Inline & Batch Subtitle Frame Text-to-Speech:** Select individual or multiple subtitle frames, pick any Voice Studio character, generate & play WAV voice clips per frame, and download a combined stitched WAV voiceover right below the subtitle list.
+  - Optional offline speaker diarization (`sherpa-onnx` Pyannote + 3D-Speaker), live VTT preview, synchronized cue timeline, timing/overlap/duration-mismatch validation & direct remedies, split/merge/find-replace editing, and stage-separated project terminology (`spelling`, `translation`, `proper_noun`, `pronunciation`).
+  - **Time-Aligned Voiceover & Dubbed MP4 Export:** Per-frame and tracked batch WAV synthesis with durable asset storage, timeline-aligned WAV stitching (`48 kHz`), export preset verification (WAV/SRT/VTT/TXT/MP4), explicit original/replacement/duck/mix audio modes with gain/ducking controls, and none/burned ASS/soft `mov_text` subtitle modes.
+- **Projects, Batch Jobs & Recovery (`web/`):** Persistent file-backed projects with autosave, crash-draft & asset recovery, bounded background batch job queue with cancel/retry/restart recovery, offline readiness & model diagnostics, and storage schema migration with automatic pre-migration backup.
 
 ## Repository Layout
 

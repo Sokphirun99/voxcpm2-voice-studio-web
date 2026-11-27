@@ -971,6 +971,9 @@ export function VideoSubtitleWorkspace({
   const onChangeDubAudioMode = React.useCallback(next => handleUpdateOption('dubAudioMode', next), [handleUpdateOption]);
   const onChangeDubSubtitleMode = React.useCallback(next => handleUpdateOption('dubSubtitleMode', next), [handleUpdateOption]);
   const onChangeDubMixSettings = React.useCallback(next => handleUpdateOption('dubMixSettings', next), [handleUpdateOption]);
+  const onChangeVoiceId = React.useCallback(next => handleUpdateOption('voiceId', next), [handleUpdateOption]);
+  const onChangePauseGapMs = React.useCallback(next => handleUpdateOption('voiceoverPauseMs', next), [handleUpdateOption]);
+  const onChangeSpillApprovals = React.useCallback(next => handleUpdateOption('spillApprovals', next), [handleUpdateOption]);
   const voice = useSubtitleVoiceover({
     segments: state.segments,
     useTranslation: ctrl.useTranslation,
@@ -995,6 +998,14 @@ export function VideoSubtitleWorkspace({
     onChangeDubSubtitleMode,
     dubMixSettingsProp: state.options.dubMixSettings,
     onChangeDubMixSettings,
+    selectedVoiceIdProp: state.options.voiceId || undefined,
+    onChangeSelectedVoiceId: onChangeVoiceId,
+    pauseGapMsProp: state.options.voiceoverPauseMs,
+    onChangePauseGapMs,
+    spillApprovalsProp: state.options.spillApprovals,
+    onChangeSpillApprovals,
+    onAttachSegmentTake: ctrl.attachSegmentVoiceTake,
+    onClearSegmentTakes: ctrl.clearSegmentVoiceTakes,
     projectId: activeProjectId,
     projectTitle: activeProjectTitle,
     productionJobs,
