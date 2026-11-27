@@ -632,6 +632,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         if (!latest) return;
         const snapshot = await projectRepository.getProject(latest.id);
         if (!active || !snapshot || receivedExternalScriptRef.current || scriptValueRef.current.trim() || projectIdRef.current) return;
+        projectIdRef.current = snapshot.id;
         setProjectId(snapshot.id);
         setProjectTitle(snapshot.title);
         setProjectRevision(snapshot.revision || 1);
@@ -1077,6 +1078,16 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
         }
         setProjectRevision(updatedProject.revision || 1);
         setSegments(prev => mergeUpdatedTakesIntoSegments(prev, normalizedSegs));
+      },
+      detachDeletedProject: deletedId => {
+        const currentId = projectIdRef.current || autosave.getProjectId?.() || '';
+        if (!deletedId || deletedId !== currentId) return;
+        projectIdRef.current = '';
+        autosave.resetProject('', 1);
+        setProjectId('');
+        setProjectTitle('');
+        setProjectRevision(1);
+        recovery.discardDraft?.();
       },
       autosave,
     };

@@ -96,11 +96,18 @@ async function withViteSsr(run) {
 test('resolveProjectType, resolveProjectStatus, and resolveProjectTitle handle edge cases correctly', async () => {
   await withViteSsr(async vite => {
     const {
+      resolveProjectId,
       resolveProjectType,
       resolveProjectStatus,
       resolveProjectTitle,
       formatProjectTimestamp,
     } = await vite.ssrLoadModule('/src/presentation/hooks/useProjects.js');
+
+    assert.equal(resolveProjectId('11111111-1111-4111-8111-111111111111'), '11111111-1111-4111-8111-111111111111');
+    assert.equal(resolveProjectId({ id: ' 22222222-2222-4222-8222-222222222222 ' }), '22222222-2222-4222-8222-222222222222');
+    assert.equal(resolveProjectId(null), '');
+    assert.equal(resolveProjectId({ type: 'click', preventDefault() {}, currentTarget: {} }), '');
+    assert.equal(resolveProjectId({ id: 'event-element-id', nativeEvent: {} }), '');
 
     assert.equal(resolveProjectType(null), 'tts');
     assert.equal(resolveProjectType({}), 'tts');
@@ -447,5 +454,265 @@ test('ProjectsWorkspace renders error banner when error state is active', async 
 
     assert.ok(html.includes('id="projects-search-input"'));
     assert.ok(html.includes('No projects found'));
+  });
+});
+
+function matchesMiniSelector(node, sel) {
+  if (sel.startsWith('#')) return node.id === sel.slice(1);
+  if (sel.startsWith('.')) return String(node.className || '').split(/\s+/).includes(sel.slice(1));
+  return node.tagName === sel.toUpperCase();
+}
+
+function walkQuerySelectorAll(root, sel, out = []) {
+  for (const child of root.childNodes) {
+    if (child.nodeType !== 1) continue;
+    if (matchesMiniSelector(child, sel)) out.push(child);
+    walkQuerySelectorAll(child, sel, out);
+  }
+  return out;
+}
+
+function createMountedTestDom() {
+  class MiniNode {
+    constructor(nodeType, nodeName) {
+      this.nodeType = nodeType;
+      this.nodeName = nodeName;
+      this.childNodes = [];
+      this.parentNode = null;
+      this.style = { setProperty(k, v) { this[k] = v; }, removeProperty(k) { delete this[k]; } };
+      this.attributes = new Map();
+      this.listeners = new Map();
+    }
+    get ownerDocument() { return globalThis.document; }
+    get children() { return this.childNodes.filter(n => n.nodeType === 1); }
+    get firstChild() { return this.childNodes[0] || null; }
+    get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+    get nextSibling() {
+      if (!this.parentNode) return null;
+      const idx = this.parentNode.childNodes.indexOf(this);
+      return this.parentNode.childNodes[idx + 1] || null;
+    }
+    get textContent() { return this.childNodes.map(c => c.textContent).join(''); }
+    set textContent(v) { this.childNodes = v ? [new MiniText(String(v))] : []; }
+    appendChild(c) {
+      if (c.nodeType === 11) { [...c.childNodes].forEach(x => this.appendChild(x)); return c; }
+      if (c.parentNode) c.parentNode.removeChild(c);
+      c.parentNode = this;
+      this.childNodes.push(c);
+      return c;
+    }
+    insertBefore(c, r) {
+      if (!r) return this.appendChild(c);
+      if (c.nodeType === 11) { [...c.childNodes].forEach(x => this.insertBefore(x, r)); return c; }
+      if (c.parentNode) c.parentNode.removeChild(c);
+      const idx = this.childNodes.indexOf(r);
+      if (idx === -1) return this.appendChild(c);
+      c.parentNode = this;
+      this.childNodes.splice(idx, 0, c);
+      return c;
+    }
+    removeChild(c) {
+      const idx = this.childNodes.indexOf(c);
+      if (idx !== -1) { this.childNodes.splice(idx, 1); c.parentNode = null; }
+      return c;
+    }
+    setAttribute(k, v) {
+      this.attributes.set(k, String(v));
+      if (k === 'id') this.id = String(v);
+      if (k === 'class') this.className = String(v);
+      if (k.startsWith('on')) this[k] = () => {};
+    }
+    getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+    removeAttribute(k) {
+      this.attributes.delete(k);
+      if (k === 'id') this.id = '';
+    }
+    hasAttribute(k) { return this.attributes.has(k); }
+    addEventListener(type, fn, capture) {
+      const key = `${capture ? 'cap' : 'bub'}:${type}`;
+      if (!this.listeners.has(key)) this.listeners.set(key, []);
+      this.listeners.get(key).push(fn);
+    }
+    removeEventListener(type, fn, capture) {
+      const key = `${capture ? 'cap' : 'bub'}:${type}`;
+      const list = this.listeners.get(key);
+      if (list) this.listeners.set(key, list.filter(item => item !== fn));
+    }
+    dispatchEvent(event) {
+      event.target = event.target || this;
+      event.stopPropagation = event.stopPropagation || (() => {});
+      event.preventDefault = event.preventDefault || (() => {});
+      const path = [];
+      for (let cur = this; cur; cur = cur.parentNode) path.push(cur);
+      for (let i = path.length - 1; i >= 0; i--) {
+        event.currentTarget = path[i];
+        for (const fn of path[i].listeners.get(`cap:${event.type}`) || []) fn(event);
+      }
+      for (let i = 0; i < path.length; i++) {
+        event.currentTarget = path[i];
+        for (const fn of path[i].listeners.get(`bub:${event.type}`) || []) fn(event);
+      }
+      event.currentTarget = null;
+      return true;
+    }
+    closest(sel) {
+      for (let cur = this; cur; cur = cur.parentNode) {
+        if (cur.nodeType === 1 && matchesMiniSelector(cur, sel)) return cur;
+      }
+      return null;
+    }
+    focus() { globalThis.document.activeElement = this; }
+    showModal() { this.open = true; this.setAttribute('open', ''); }
+    close() { this.open = false; this.removeAttribute('open'); }
+    querySelectorAll(sel) { return walkQuerySelectorAll(this, sel); }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  }
+  class MiniText extends MiniNode {
+    constructor(text) { super(3, '#text'); this.data = text; }
+    get textContent() { return this.data; }
+    set textContent(v) { this.data = String(v); }
+    get nodeValue() { return this.data; }
+    set nodeValue(v) { this.data = String(v); }
+  }
+  class MiniElement extends MiniNode {
+    constructor(tag) {
+      super(1, tag.toUpperCase());
+      this.tagName = tag.toUpperCase();
+      this._value = '';
+      this._defaultValue = '';
+      this._dirtyValue = false;
+    }
+    get options() { return this.querySelectorAll('option'); }
+    get length() { return this.tagName === 'SELECT' ? this.options.length : 0; }
+    get defaultValue() { return this._defaultValue; }
+    set defaultValue(v) {
+      this._defaultValue = String(v);
+      if (!this._dirtyValue) this._value = this._defaultValue;
+    }
+    get value() { return this._value; }
+    set value(v) {
+      this._value = v == null ? '' : String(v);
+      this._dirtyValue = true;
+    }
+  }
+  class HTMLIFrameElement {}
+  const prev = {
+    window: globalThis.window,
+    document: globalThis.document,
+    HTMLIFrameElement: globalThis.HTMLIFrameElement,
+    IS_REACT_ACT_ENVIRONMENT: globalThis.IS_REACT_ACT_ENVIRONMENT,
+  };
+  const win = { HTMLIFrameElement, navigator: { userAgent: 'Node' }, matchMedia: () => ({ addEventListener() {}, removeEventListener() {} }) };
+  const body = new MiniElement('body');
+  const docEl = new MiniElement('html');
+  docEl.appendChild(new MiniElement('head'));
+  docEl.appendChild(body);
+  const doc = {
+    nodeType: 9,
+    defaultView: win,
+    activeElement: null,
+    head: docEl.firstChild,
+    body,
+    documentElement: docEl,
+    createElement: t => new MiniElement(t),
+    createElementNS: (_ns, t) => new MiniElement(t),
+    createTextNode: t => new MiniText(t),
+    createDocumentFragment: () => new MiniNode(11, '#df'),
+    createComment: t => new MiniNode(8, '#c'),
+    getElementById: id => docEl.querySelector(`#${id}`),
+    querySelector: sel => docEl.querySelector(sel),
+    querySelectorAll: sel => docEl.querySelectorAll(sel),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  win.document = doc;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  globalThis.window = win;
+  globalThis.document = doc;
+  globalThis.HTMLIFrameElement = HTMLIFrameElement;
+  return { doc, restore() { Object.assign(globalThis, prev); } };
+}
+
+test('mounted ProjectsWorkspace deletes project by UUID on real button click and hides background error banner while modal is open', async () => {
+  const dom = createMountedTestDom();
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+
+  await withViteSsr(async vite => {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { ProjectsWorkspace } = await vite.ssrLoadModule('/src/presentation/components/ProjectsWorkspace.jsx');
+
+    const firstId = '11111111-1111-4111-8111-111111111111';
+    const secondId = '22222222-2222-4222-8222-222222222222';
+    const baseRepo = createMockProjectRepository([
+      { id: firstId, title: 'Khmer Draft One', type: 'tts', status: 'draft', updatedAt: '2026-11-27T14:04:00.000Z' },
+      { id: secondId, title: 'Khmer Draft Two', type: 'tts', status: 'draft', updatedAt: '2026-11-27T14:04:00.000Z' },
+    ]);
+    const deletedArgs = [];
+    const callbackIds = [];
+    let shouldFailDelete = true;
+    const repo = {
+      ...baseRepo,
+      deleteProject: async id => {
+        deletedArgs.push(id);
+        if (shouldFailDelete) throw new Error('Simulated delete failure');
+        return baseRepo.deleteProject(id);
+      },
+    };
+    const stubServices = { projectRepository: repo, logger: { debug() {}, warn() {}, error() {} } };
+    const container = dom.doc.createElement('div');
+    dom.doc.body.appendChild(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(
+          React.createElement(
+            StudioProvider,
+            { services: stubServices },
+            React.createElement(ProjectsWorkspace, {
+              projectRepository: repo,
+              onDeleteProject: id => callbackIds.push(id),
+            })
+          )
+        );
+      });
+
+      assert.equal(container.querySelectorAll('.project-card').length, 2);
+      const deleteTrigger = container.querySelector(`#project-delete-${firstId}`);
+      assert.ok(deleteTrigger);
+
+      await act(async () => {
+        deleteTrigger.dispatchEvent({ type: 'click', bubbles: true });
+      });
+
+      const confirmBtn = container.querySelector('#delete-project-confirm-btn');
+      assert.ok(confirmBtn);
+
+      await act(async () => {
+        confirmBtn.dispatchEvent({ type: 'click', bubbles: true });
+      });
+
+      assert.equal(deletedArgs[0], firstId);
+      assert.equal(typeof deletedArgs[0], 'string');
+      const modalError = container.querySelector('#delete-project-modal')?.querySelector('.project-modal-error');
+      assert.ok(modalError);
+      assert.match(modalError.textContent, /Simulated delete failure/);
+      assert.equal(container.querySelector('.projects-error-banner'), null);
+
+      shouldFailDelete = false;
+      await act(async () => {
+        confirmBtn.dispatchEvent({ type: 'click', bubbles: true });
+      });
+
+      assert.equal(deletedArgs[1], firstId);
+      assert.deepEqual(callbackIds, [firstId]);
+      assert.equal(container.querySelectorAll('.project-card').length, 1);
+      assert.equal(container.querySelector(`#project-title-${firstId}`), null);
+      assert.ok(container.querySelector(`#project-title-${secondId}`));
+    } finally {
+      await act(async () => { root.unmount(); });
+      dom.restore();
+    }
   });
 });

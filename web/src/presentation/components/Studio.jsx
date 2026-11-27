@@ -210,6 +210,14 @@ export function Studio() {
   const handleOpenProject = useCallback(project => {
     void openWorkspaceProject({ project, repo: services?.projectRepository, logger: services?.logger, ttsRef, subtitlesRef, setActiveWorkspace });
   }, [services, setActiveWorkspace]);
+  const handleDeleteProject = useCallback(deletedId => {
+    if (!deletedId) return;
+    if (getLastActiveProject({ logger: services?.logger })?.projectId === deletedId) {
+      clearLastActiveProject({ logger: services?.logger });
+    }
+    ttsRef.current?.detachDeletedProject?.(deletedId);
+    subtitlesRef.current?.detachDeletedProject?.(deletedId);
+  }, [services]);
   const handleOpenProjectById = useCallback(async projectId => {
     if (!projectId || !services?.projectRepository) return;
     try {
@@ -298,6 +306,7 @@ export function Studio() {
         <ProjectsWorkspace
           hidden={activeWorkspace !== 'projects'}
           onOpenProject={handleOpenProject}
+          onDeleteProject={handleDeleteProject}
           onNotify={notifications.notify}
           projectRepository={services?.projectRepository}
           globalTerminology={globalTerminology}

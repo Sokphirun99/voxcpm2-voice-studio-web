@@ -211,13 +211,33 @@ function useDuplicateProjectHandler({ repo, loadProjects, onNotify, logger, setB
   }, [repo, loadProjects, onNotify, logger, setBusy, setError]);
 }
 
-function useDeleteProjectHandler({ repo, loadProjects, onNotify, logger, setBusy, setError, setDeleteTarget }) {
-  return useCallback(async projectId => {
-    if (!projectId || !repo) return false;
+/**
+ * Extracts a normalized non-empty project UUID string while ignoring DOM/React event objects.
+ * Inputs: projectOrId (string, project record with string id, event object, or null/undefined).
+ * Outputs: trimmed string project id or empty string when invalid.
+ * Side effects: none.
+ * Failure modes: returns empty string for non-strings, synthetic events, or missing id fields.
+ * @param {string|object|null|undefined} projectOrId - Project id string or entity record.
+ * @returns {string} Trimmed project identifier or empty string.
+ */
+export function resolveProjectId(projectOrId) {
+  if (typeof projectOrId === 'string') return projectOrId.trim();
+  if (!projectOrId || typeof projectOrId !== 'object') return '';
+  if (typeof projectOrId.preventDefault === 'function' || 'nativeEvent' in projectOrId || 'currentTarget' in projectOrId) {
+    return '';
+  }
+  return typeof projectOrId.id === 'string' ? projectOrId.id.trim() : '';
+}
+
+function useDeleteProjectHandler({ repo, loadProjects, onDeleteProject, onNotify, logger, setBusy, setError, setDeleteTarget }) {
+  return useCallback(async projectOrId => {
+    const resolvedId = resolveProjectId(projectOrId);
+    if (!resolvedId || !repo) return false;
     setBusy(true);
     try {
-      await repo.deleteProject(projectId);
+      await repo.deleteProject(resolvedId);
       setDeleteTarget(null);
+      onDeleteProject?.(resolvedId);
       await loadProjects();
       onNotify?.({ kind: 'success', title: 'Project deleted', message: 'Project removed successfully.' });
       return true;
@@ -226,7 +246,7 @@ function useDeleteProjectHandler({ repo, loadProjects, onNotify, logger, setBusy
       logger?.error?.('useProjects.deleteProject', error);
       return false;
     } finally { setBusy(false); }
-  }, [repo, loadProjects, onNotify, logger, setBusy, setError, setDeleteTarget]);
+  }, [repo, loadProjects, onDeleteProject, onNotify, logger, setBusy, setError, setDeleteTarget]);
 }
 
 function useOpenProjectHandler({ repo, onOpenProject, logger, setError }) {
@@ -274,30 +294,43 @@ function buildProjectsController({ list, modals, actions, busy, filterState }) {
     openRenameModal: modals.openRenameModal, closeRenameModal: modals.closeRenameModal,
     openDeleteModal: modals.openDeleteModal, closeDeleteModal: modals.closeDeleteModal,
     createProject: actions.create, renameProject: actions.rename, duplicateProject: actions.duplicate, deleteProject: actions.remove,
-    confirmDelete: targetId => actions.remove(targetId || modals.deleteTarget?.id), openProject: actions.open,
+    confirmDelete: targetOrEvent => {
+      const explicitId = resolveProjectId(targetOrEvent);
+      return actions.remove(explicitId || resolveProjectId(modals.deleteTarget));
+    },
+    openProject: actions.open,
   };
+}
+
+function useRefreshOnShow(hidden, loadProjects) {
+  const prevHiddenRef = useRef(Boolean(hidden));
+  useEffect(() => {
+    if (prevHiddenRef.current && !hidden) void loadProjects();
+    prevHiddenRef.current = Boolean(hidden);
+  }, [hidden, loadProjects]);
 }
 
 /**
  * Presentation hook managing Voice Studio project listing, filtering, search, and CRUD lifecycle.
- * Inputs: `{ onOpenProject, onNotify, projectRepository, initialProjects, logger }`.
+ * Inputs: `{ hidden, onOpenProject, onDeleteProject, onNotify, projectRepository, initialProjects, logger }`.
  * Outputs: Project state bundle with query actions, modal toggles, and mutation triggers.
- * Side effects: queries project repository on mount and filter changes; triggers toasts on mutations.
+ * Side effects: queries project repository on mount, filter changes, and workspace reveal; notifies parent on delete.
  * Failure modes: captures errors into error state and logs diagnostic traces.
  * @param {object} [options] - Hook options.
  * @returns {object} Projects controller bundle.
  */
-export function useProjects({ onOpenProject, onNotify, projectRepository: customRepo, initialProjects = [], logger: customLogger } = {}) {
+export function useProjects({ hidden = false, onOpenProject, onDeleteProject, onNotify, projectRepository: customRepo, initialProjects = [], logger: customLogger } = {}) {
   const { repo, logger } = resolveContextServices(customRepo, customLogger);
   const [filterType, setFilterType] = useState(PROJECT_FILTER_ALL);
   const [searchQuery, setSearchQuery] = useState('');
   const [busy, setBusy] = useState(false);
   const list = useProjectListState({ repo, filterType, searchQuery, logger, initialProjects });
+  useRefreshOnShow(hidden, list.loadProjects);
   const modals = useProjectModalState(list.setError);
   const create = useCreateProjectHandler({ repo, loadProjects: list.loadProjects, onNotify, logger, setBusy, setError: list.setError, setCreateModalOpen: modals.setCreateModalOpen });
   const rename = useRenameProjectHandler({ repo, loadProjects: list.loadProjects, onNotify, logger, setBusy, setError: list.setError, setRenameTarget: modals.setRenameTarget });
   const duplicate = useDuplicateProjectHandler({ repo, loadProjects: list.loadProjects, onNotify, logger, setBusy, setError: list.setError });
-  const remove = useDeleteProjectHandler({ repo, loadProjects: list.loadProjects, onNotify, logger, setBusy, setError: list.setError, setDeleteTarget: modals.setDeleteTarget });
+  const remove = useDeleteProjectHandler({ repo, loadProjects: list.loadProjects, onDeleteProject, onNotify, logger, setBusy, setError: list.setError, setDeleteTarget: modals.setDeleteTarget });
   const open = useOpenProjectHandler({ repo, onOpenProject, logger, setError: list.setError });
 
   return buildProjectsController({

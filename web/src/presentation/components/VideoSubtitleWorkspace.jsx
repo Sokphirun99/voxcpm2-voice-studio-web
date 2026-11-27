@@ -1040,6 +1040,13 @@ export function VideoSubtitleWorkspace({
         if (job.projectId && currentId && job.projectId !== currentId) return;
         return voice.hydrateClipsFromJob?.(job);
       },
+      detachDeletedProject: deletedId => {
+        const currentId = activeProjectIdRef.current || ctrl.autosave?.getProjectId?.() || '';
+        if (!deletedId || deletedId !== currentId) return;
+        activeProjectIdRef.current = '';
+        ctrl.autosave?.resetProject?.('', 1);
+        ctrl.clearWorkspace?.();
+      },
       autosave: ctrl.autosave,
     };
   }

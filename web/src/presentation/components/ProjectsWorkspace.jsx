@@ -384,7 +384,7 @@ function DeleteModalActions({ busy, onClose, onConfirm }) {
   return (
     <div className="project-modal-actions">
       <button type="button" id="delete-project-cancel-btn" className="button subtle-button" autoFocus onClick={onClose} disabled={busy}>Cancel</button>
-      <button type="button" id="delete-project-confirm-btn" className="button button-danger" onClick={onConfirm} disabled={busy}>
+      <button type="button" id="delete-project-confirm-btn" className="button button-danger" onClick={() => { void onConfirm(); }} disabled={busy}>
         {busy ? 'Deleting…' : 'Delete project'}
       </button>
     </div>
@@ -430,9 +430,10 @@ function ProjectsErrorBanner({ error, onDismiss }) {
 }
 
 function ProjectsBannerAndContent({ api }) {
+  const hasOpenModal = Boolean(api.createModalOpen || api.renameTarget || api.deleteTarget);
   return (
     <>
-      <ProjectsErrorBanner error={api.error} onDismiss={() => api.setError(null)} />
+      <ProjectsErrorBanner error={hasOpenModal ? null : api.error} onDismiss={() => api.setError(null)} />
       <ProjectsContent
         loading={api.loading}
         projects={api.projects}
@@ -448,15 +449,23 @@ function ProjectsBannerAndContent({ api }) {
 
 /**
  * Renders the top-level Projects workspace panel.
- * Inputs: `{ hidden, onOpenProject, onNotify, projectRepository, initialProjects }`.
+ * Inputs: `{ hidden, onOpenProject, onDeleteProject, onNotify, projectRepository, initialProjects, globalTerminology }`.
  * Outputs: `<div className="workspace-panel projects-workspace">` container.
- * Side effects: loads and mutates project resources via injected project repository.
- * Failure modes: displays errors inside status banner without crashing.
- * @param {object} props - Workspace props.
+ * Side effects: loads and mutates project resources via injected project repository; refreshes when shown.
+ * Failure modes: displays errors inside status banner or active modal alert without crashing.
+ * @param {object} [props] - Workspace props.
  * @returns {React.ReactElement} Projects workspace component.
  */
-export function ProjectsWorkspace({ hidden = false, onOpenProject, onNotify, projectRepository, initialProjects = [], globalTerminology = null }) {
-  const api = useProjects({ onOpenProject, onNotify, projectRepository, initialProjects });
+export function ProjectsWorkspace({
+  hidden = false,
+  onOpenProject,
+  onDeleteProject,
+  onNotify,
+  projectRepository,
+  initialProjects = [],
+  globalTerminology = null,
+} = {}) {
+  const api = useProjects({ hidden, onOpenProject, onDeleteProject, onNotify, projectRepository, initialProjects });
   const services = useStudioServices();
   const [terminologyOpen, setTerminologyOpen] = useState(false);
   const terminologyCtrl = useTerminology({
