@@ -2,15 +2,23 @@
  * @fileoverview Top-level Voice Studio shell coordinating top-level function workspaces and shared Character Domain state.
  */
 
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
+import { clearLastActiveProject, getLastActiveProject, saveLastActiveProject } from '../../data/projectRecoveryStorage.js';
+import { useStudioServices } from '../StudioContext.jsx';
 import { useAppVersionCheck } from '../hooks/useAppVersionCheck.js';
 import { useCharacterActions } from '../hooks/useCharacterActions.js';
 import { useEngineStatus } from '../hooks/useEngineStatus.js';
 import { useNotifications } from '../hooks/useNotifications.js';
+import { useOfflineReadiness } from '../hooks/useOfflineReadiness.js';
+import { useProductionJobs } from '../hooks/useProductionJobs.js';
+import { useGlobalTerminology } from '../hooks/useTerminology.js';
 import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
+import { BatchJobsWorkspace } from './BatchJobsWorkspace.jsx';
 import { Icon } from './Icon.jsx';
+import { ModelsSetupWorkspace } from './ModelsSetupWorkspace.jsx';
+import { ProjectsWorkspace } from './ProjectsWorkspace.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
 import { TextToSpeechWorkspace, buildVoiceActions, clearCharacterLockedSeed, finalizeCharacterGeneration } from './TextToSpeechWorkspace.jsx';
 import { ToastRegion } from './ToastRegion.jsx';
@@ -101,6 +109,68 @@ function useSharedCharacterCatalog({ ttsRef, onNotify, onUnlockSound }) {
   return { library, anchorApi, activeCharacter, activeAnchor, lockedSeeds, setLockedSeeds, actions };
 }
 
+async function resolveProjectSnapshot(project, repo, logger) {
+  if (!project) return null;
+  if (!repo || project.payload || project.segments) return project;
+  try {
+    const fetched = await repo.getProject(project.id);
+    return fetched || project;
+  } catch (error) {
+    logger?.error?.('Studio.resolveProjectSnapshot', error, { projectId: project.id });
+    return project;
+  }
+}
+
+async function flushWorkspaceBeforeProjectSwitch(ttsRef, subtitlesRef) {
+  const saves = [];
+  if (ttsRef.current?.autosave?.isDirty) saves.push(ttsRef.current.autosave.saveNow());
+  if (subtitlesRef.current?.autosave?.isDirty) saves.push(subtitlesRef.current.autosave.saveNow());
+  if (saves.length > 0) await Promise.all(saves);
+}
+
+async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRef, setActiveWorkspace }) {
+  if (!project) return;
+  await flushWorkspaceBeforeProjectSwitch(ttsRef, subtitlesRef);
+  const snapshot = await resolveProjectSnapshot(project, repo, logger);
+  const type = snapshot?.type || (snapshot?.kind === 'subtitle' ? 'subtitles' : 'tts');
+  if (snapshot?.id) saveLastActiveProject({ projectId: snapshot.id, workspace: type, logger });
+  if (type === 'tts') {
+    ttsRef.current?.loadProject?.(snapshot);
+    setActiveWorkspace('tts');
+    ttsRef.current?.focusScript?.();
+    return;
+  }
+  subtitlesRef.current?.loadProject?.(snapshot);
+  setActiveWorkspace('subtitles');
+}
+
+function useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace }) {
+  useEffect(() => {
+    let mounted = true;
+    const restoreActive = async () => {
+      const record = getLastActiveProject({ logger: services?.logger });
+      if (!record?.projectId || !services?.projectRepository) return;
+      try {
+        const project = await services.projectRepository.getProject(record.projectId);
+        if (!mounted || !project) return;
+        await openWorkspaceProject({
+          project,
+          repo: services.projectRepository,
+          logger: services.logger,
+          ttsRef,
+          subtitlesRef,
+          setActiveWorkspace,
+        });
+      } catch (err) {
+        services?.logger?.error?.('Studio.restoreLastActiveProject', err, { projectId: record.projectId });
+        clearLastActiveProject({ logger: services?.logger });
+      }
+    };
+    void restoreActive();
+    return () => { mounted = false; };
+  }, [services, ttsRef, subtitlesRef, setActiveWorkspace]);
+}
+
 /**
  * Coordinates the top-level Voice Studio function workspaces (`Text to speech`, `Video to subtitle`) and shared character data.
  * Inputs: none (consumes Studio services via hooks).
@@ -111,11 +181,22 @@ function useSharedCharacterCatalog({ ttsRef, onNotify, onUnlockSound }) {
  */
 export function Studio() {
   const ttsRef = useRef(null);
-  const [activeWorkspace, setActiveWorkspace] = useState('tts');
+  const subtitlesRef = useRef(null);
+  const [activeWorkspace, setActiveWorkspace] = useState(() => {
+    const initial = getLastActiveProject();
+    return initial?.workspace === 'subtitles' ? 'subtitles' : 'tts';
+  });
   const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false, libraryOpen: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
   const notifications = useNotifications();
+  const services = useStudioServices();
+  const globalTerminology = useGlobalTerminology({
+    terminologyRepository: services?.terminologyRepository,
+    glossaryRepository: services?.glossaryRepository,
+    logger: services?.logger,
+  });
+  useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace });
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
   }, []);
@@ -126,14 +207,63 @@ export function Studio() {
     setExternalScript(script);
     selectWorkspace('tts', setActiveWorkspace, ttsRef);
   }, []);
+  const handleOpenProject = useCallback(project => {
+    void openWorkspaceProject({ project, repo: services?.projectRepository, logger: services?.logger, ttsRef, subtitlesRef, setActiveWorkspace });
+  }, [services, setActiveWorkspace]);
+  const handleDeleteProject = useCallback(deletedId => {
+    if (!deletedId) return;
+    if (getLastActiveProject({ logger: services?.logger })?.projectId === deletedId) {
+      clearLastActiveProject({ logger: services?.logger });
+    }
+    ttsRef.current?.detachDeletedProject?.(deletedId);
+    subtitlesRef.current?.detachDeletedProject?.(deletedId);
+  }, [services]);
+  const handleOpenProjectById = useCallback(async projectId => {
+    if (!projectId || !services?.projectRepository) return;
+    try {
+      const project = await services.projectRepository.getProject(projectId);
+      if (!project) {
+        notifications.notify({ kind: 'error', title: 'Project not found', message: 'This batch job project was deleted or is unavailable.' });
+        return;
+      }
+      await openWorkspaceProject({ project, repo: services.projectRepository, logger: services.logger, ttsRef, subtitlesRef, setActiveWorkspace });
+    } catch (err) {
+      services?.logger?.error?.('Studio.handleOpenProjectById', err, { projectId });
+      notifications.notify({ kind: 'error', title: 'Could not open project', message: err?.message || 'Project failed to load.' });
+    }
+  }, [services, setActiveWorkspace, notifications]);
+  const syncProjectFromJob = useCallback(async job => {
+    if (!job) return;
+    if (job.type === 'subtitle_voiceover') {
+      void subtitlesRef.current?.syncVoiceoverJob?.(job);
+    }
+    if (!job.projectId || !services?.projectRepository) return;
+    try {
+      const updatedProject = await services.projectRepository.getProject(job.projectId);
+      if (!updatedProject) return;
+      ttsRef.current?.reloadProjectIfActive?.(job.projectId, updatedProject);
+      subtitlesRef.current?.reloadProjectIfActive?.(job.projectId, updatedProject);
+    } catch (err) {
+      services?.logger?.error?.('Studio.syncProjectFromJob', err, { projectId: job.projectId, jobId: job.id });
+    }
+  }, [services]);
+  const productionJobs = useProductionJobs({
+    onNotify: notifications.notify,
+    onJobCompleted: job => { void syncProjectFromJob(job); },
+    onProjectUpdated: job => { void syncProjectFromJob(job); },
+  });
   const handleConsumeExternalScript = useCallback(() => setExternalScript(''), []);
   const [, refreshEngine, engineMeta] = useEngineStatus();
+  const { readiness: offlineReadiness } = useOfflineReadiness({ gateway: services?.diagnosticsGateway });
+  const handleSelectModels = useCallback(() => {
+    selectWorkspace('models', setActiveWorkspace, ttsRef);
+  }, []);
   const catalog = useSharedCharacterCatalog({
     ttsRef,
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
   });
-  const canAutoReload = !ttsState.libraryOpen && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo;
+  const canAutoReload = !ttsState.libraryOpen && !ttsState.busy && !ttsState.hasScript && !subtitleState.busy && !subtitleState.hasVideo && !(productionJobs.summary.active > 0);
   const versionCheck = useAppVersionCheck({ canAutoReload });
   const ttsNotices = <WorkspaceNotices engineMeta={engineMeta} refreshEngine={refreshEngine} versionCheck={versionCheck} />;
   const updateBanner = <UpdateBanner visible={versionCheck.updateAvailable} onReload={versionCheck.reloadNow} />;
@@ -146,9 +276,13 @@ export function Studio() {
     setLockedSeeds: catalog.setLockedSeeds,
     characterActions: catalog.actions,
     refreshEngine,
+    offlineReadiness,
+    onSelectModels: handleSelectModels,
     onTtsStateChange: handleTtsStateChange,
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
+    globalTerminology,
+    productionJobs,
   };
 
   const subtitleVoiceCatalog = useMemo(() => ({
@@ -164,21 +298,45 @@ export function Studio() {
         activeWorkspace={activeWorkspace}
         workspaces={DEFAULT_WORKSPACES}
         onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
+        jobsBadgeCount={productionJobs.badgeCount}
         soundMuted={notifications.soundMuted}
         onToggleSoundMuted={notifications.toggleSoundMuted}
       />
       <main className="studio-workspace">
+        <ProjectsWorkspace
+          hidden={activeWorkspace !== 'projects'}
+          onOpenProject={handleOpenProject}
+          onDeleteProject={handleDeleteProject}
+          onNotify={notifications.notify}
+          projectRepository={services?.projectRepository}
+          globalTerminology={globalTerminology}
+        />
         <TextToSpeechWorkspace shared={sharedTts} notices={ttsNotices} hidden={activeWorkspace !== 'tts'} actionsRef={ttsRef}
           externalScript={externalScript} onConsumeExternalScript={handleConsumeExternalScript} />
         <VideoSubtitleWorkspace
           notices={updateBanner}
           hidden={activeWorkspace !== 'subtitles'}
           voiceCatalog={subtitleVoiceCatalog}
+          globalTerminology={globalTerminology}
+          productionJobs={productionJobs}
+          actionsRef={subtitlesRef}
           onRefreshEngine={refreshEngine}
           onSendToTts={handleSendToTts}
           onStateChange={handleSubtitleStateChange}
           onNotify={notifications.notify}
           onUnlockSound={notifications.unlockSound}
+          offlineReadiness={offlineReadiness}
+          onSelectModels={handleSelectModels}
+        />
+        <BatchJobsWorkspace
+          hidden={activeWorkspace !== 'jobs'}
+          controller={productionJobs}
+          onOpenProjectById={handleOpenProjectById}
+          onNotify={notifications.notify}
+        />
+        <ModelsSetupWorkspace
+          hidden={activeWorkspace !== 'models'}
+          diagnosticsGateway={services?.diagnosticsGateway}
         />
       </main>
       <ToastRegion toasts={notifications.toasts} onDismiss={notifications.dismiss} />

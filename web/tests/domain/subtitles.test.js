@@ -33,6 +33,8 @@ import {
   parseVtt,
   pickDefaultTargetLanguage,
   replaceTextInSegments,
+  resolveBcp47LanguageTag,
+  resolveLanguageDisplayMeta,
   resolveSpeakerLabel,
   resolveTargetLanguageMeta,
   splitSubtitleSegment,
@@ -308,4 +310,38 @@ test('multilingual subtitle language catalog exposes all 100 Whisper sources, al
   const groupedTgt = groupLanguageOptions(TARGET_LANGUAGE_OPTIONS, POPULAR_TARGET_LANGUAGE_IDS);
   assert.equal(groupedTgt.popular.length, POPULAR_TARGET_LANGUAGE_IDS.length);
   assert.equal(groupedTgt.popular.length + groupedTgt.others.length, TARGET_LANGUAGE_OPTIONS.length);
+});
+
+test('buildVtt emits sanitized BCP-47 header when language is known and escapes cue timing arrows', () => {
+  assert.equal(resolveBcp47LanguageTag('khm_Khmr'), 'km');
+  assert.equal(resolveBcp47LanguageTag('zho_Hans'), 'zh-Hans');
+  assert.equal(resolveBcp47LanguageTag('en-US'), 'en-US');
+  assert.equal(resolveBcp47LanguageTag('auto'), '');
+  assert.equal(resolveBcp47LanguageTag('km\nInjected: bad'), '');
+  assert.deepEqual(resolveLanguageDisplayMeta('khm_Khmr'), { bcp47: 'km', label: 'Khmer' });
+
+  const segs = [{ id: 's1', start: 0.2, end: 1.8, speakerId: 'speaker-1', text: 'Step 1 --> Step 2' }];
+  const kmVtt = buildVtt({ segments: segs, includeSpeaker: false, language: 'khm_Khmr' });
+  assert.equal(kmVtt, 'WEBVTT\nKind: subtitles\nLanguage: km\n\n00:00:00.200 --> 00:00:01.800\nStep 1 → Step 2\n');
+
+  const safeFallbackVtt = buildVtt({ segments: segs, includeSpeaker: false, language: 'km\nEvil: 1' });
+  assert.equal(safeFallbackVtt, 'WEBVTT\n\n00:00:00.200 --> 00:00:01.800\nStep 1 → Step 2\n');
+
+  const srt = buildSrt({ segments: segs, includeSpeaker: false });
+  assert.equal(srt, '1\n00:00:00,200 --> 00:00:01,800\nStep 1 → Step 2\n');
+});
+
+test('buildSrt and buildVtt sanitize speaker names containing timing arrows or blank lines', () => {
+  const segs = [{ id: 's1', start: 0.2, end: 1.8, speakerId: 'speaker-1', text: 'Hello\n\nWorld' }];
+  const names = { 'speaker-1': 'Host --> Guest\n\n2' };
+  const vtt = buildVtt({ segments: segs, speakerNames: names, includeSpeaker: true, language: 'en' });
+  assert.ok(vtt.includes('Host → Guest\n2: Hello\nWorld\n'));
+  assert.equal(vtt.includes('--> World'), false);
+  assert.equal(vtt.includes('Host -->'), false);
+  assert.equal(vtt.includes('\n\nWorld'), false);
+
+  const srt = buildSrt({ segments: segs, speakerNames: names, includeSpeaker: true });
+  assert.ok(srt.includes('[Host → Guest\n2] Hello\nWorld\n'));
+  assert.equal(srt.includes('Host -->'), false);
+  assert.equal(srt.includes('\n\nWorld'), false);
 });

@@ -9,6 +9,11 @@ import threading
 from typing import Any, Mapping, Sequence
 import unicodedata
 
+from khmer_orthography import (
+    format_khmer_translation,
+    join_translated_sentences,
+    split_source_sentences,
+)
 from languages import (
     ISO_TO_NLLB,
     SUPPORTED_NLLB_CODES,
@@ -474,17 +479,33 @@ class LocalTranslator:
         decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
         return [sanitize_repetitive_translation(out.strip()) for out in decoded]
 
+    def _translate_flat_sentences(self, sentences: Sequence[str], src_code: str, tgt_code: str) -> list[str]:
+        """Translate flattened sentences in bounded batches and apply repetition + Khmer prose cleanup."""
+        is_khmer = tgt_code == "khm_Khmr"
+        results: list[str] = []
+        for start in range(0, len(sentences), DEFAULT_BATCH_SIZE):
+            batch = sentences[start : start + DEFAULT_BATCH_SIZE]
+            for tr_text in self._translate_batch(batch, src_code, tgt_code):
+                cleaned = sanitize_repetitive_translation(tr_text)
+                results.append(format_khmer_translation(cleaned) if is_khmer else cleaned)
+        return results
+
     def translate_lines(self, lines: Sequence[str], source_lang: str, target_lang: str = "km") -> list[str]:
         """Translate `lines` from `source_lang` to any NLLB-200 `target_lang`, returning a same-length list."""
         src_code = resolve_nllb_lang_code(source_lang)
         tgt_code = resolve_nllb_lang_code(target_lang, strict=True)
         if src_code == tgt_code:
             return [(line or "").strip() for line in lines]
-        results = [""] * len(lines)
-        non_empty = [(idx, cleaned) for idx, text in enumerate(lines) if (cleaned := normalize_source_repeats(text))]
-        for start in range(0, len(non_empty), DEFAULT_BATCH_SIZE):
-            chunk = non_empty[start : start + DEFAULT_BATCH_SIZE]
-            translated = self._translate_batch([item[1] for item in chunk], src_code, tgt_code)
-            for (orig_idx, _), tr_text in zip(chunk, translated):
-                results[orig_idx] = sanitize_repetitive_translation(tr_text)
+        line_parts = [split_source_sentences(normalize_source_repeats(text)) for text in lines]
+        flat_sentences = [sent for parts in line_parts for sent in parts]
+        if not flat_sentences:
+            return [""] * len(lines)
+        flat_translated = self._translate_flat_sentences(flat_sentences, src_code, tgt_code)
+        is_khmer = tgt_code == "khm_Khmr"
+        results: list[str] = []
+        cursor = 0
+        for parts in line_parts:
+            count = len(parts)
+            results.append(join_translated_sentences(parts, flat_translated[cursor : cursor + count], is_khmer) if count else "")
+            cursor += count
         return results

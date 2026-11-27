@@ -2,7 +2,7 @@
  * @fileoverview Selection toolbar and bottom combined voiceover player for generating VoxCPM2 speech directly from subtitle frames.
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import { Blocks } from 'loading-dev';
 import { formatTime } from '../../domain/audioValidation.js';
 import {
@@ -12,6 +12,18 @@ import {
   SUBTITLE_VOICEOVER_PAUSE_MS,
   formatSubtitleVoiceoverGapLabel,
 } from '../../domain/subtitleTts.js';
+import {
+  DEFAULT_DUB_MIX_SETTINGS,
+  DEFAULT_DUB_SUBTITLE_MODE,
+  DUB_MIX_BOUNDS,
+  VIDEO_AUDIO_MODES,
+  VIDEO_SUBTITLE_MODES,
+  VIDEO_SUBTITLE_MODE_OPTIONS,
+  formatGainDbLabel,
+  formatGainPercentLabel,
+  hasCustomDubMixSettings,
+  normalizeDubMixSettings,
+} from '../../domain/videoDubExport.js';
 import { Icon } from './Icon.jsx';
 
 const VOICE_SPINNER_SIZE_PX = 14;
@@ -138,15 +150,97 @@ export function SubtitleVoiceToolbar({
   );
 }
 
-function resolveDubDisabledReason({ isAudioOnly, hasJobId }) {
+function resolveDubDisabledReason({ isAudioOnly, hasJobId, hasAudioStream = true, burnInSupported = true, dubAudioMode, dubSubtitleMode, unresolvedMismatchCount = 0 }) {
   if (isAudioOnly) return 'Upload a video file to export a dubbed MP4.';
   if (!hasJobId) return 'Extract subtitles from a video first to export a dubbed MP4.';
+  if (dubAudioMode !== VIDEO_AUDIO_MODES.REPLACE && hasAudioStream === false) {
+    return 'Source video has no original audio track; select Mute original instead.';
+  }
+  if (dubSubtitleMode === VIDEO_SUBTITLE_MODES.BURNED && burnInSupported === false) {
+    return 'Installed FFmpeg lacks libass support for burning captions.';
+  }
+  if (dubAudioMode !== VIDEO_AUDIO_MODES.ORIGINAL && unresolvedMismatchCount > 0) {
+    const word = unresolvedMismatchCount === 1 ? 'mismatch' : 'mismatches';
+    return `Resolve ${unresolvedMismatchCount} speech duration ${word} before exporting dubbed MP4.`;
+  }
   return undefined;
 }
 
-function SubtitleDubExportBar({ dubAudioMode, dubBusy, disabled, disabledReason, onChangeDubAudioMode, onExportDub }) {
+function DubGainSlider({ id, label, valueText, field, value, disabled, onChange }) {
+  const spec = DUB_MIX_BOUNDS[field];
   return (
-    <div className="subtitle-voice-dub-row">
+    <label className="subtitle-dub-gain-field" htmlFor={id} data-disabled={disabled ? 'true' : undefined}>
+      <span className="subtitle-dub-gain-head">
+        <span>{label}</span>
+        <strong>{valueText}</strong>
+      </span>
+      <input
+        id={id}
+        type="range"
+        min={spec.min}
+        max={spec.max}
+        step={spec.step}
+        value={value}
+        disabled={disabled}
+        onChange={e => onChange?.(field, Number(e.target.value))}
+      />
+    </label>
+  );
+}
+
+function SubtitleDubMixPanel({ open, dubAudioMode, mix, controlsDisabled, onUpdateMix, onResetMix }) {
+  const isCustom = hasCustomDubMixSettings(mix);
+  const duckText = `${formatGainPercentLabel(mix.duckVolume)} (${formatGainDbLabel(mix.duckVolume)})`;
+  return (
+    <div className="subtitle-dub-mix-panel" id="subtitle-dub-mix-panel" hidden={!open}>
+      <div className="subtitle-dub-mix-grid">
+        <DubGainSlider
+          id="subtitle-mix-orig-volume"
+          label="Original audio"
+          valueText={dubAudioMode === VIDEO_AUDIO_MODES.REPLACE ? 'Muted' : formatGainPercentLabel(mix.originalVolume)}
+          field="originalVolume"
+          value={mix.originalVolume}
+          disabled={controlsDisabled || dubAudioMode === VIDEO_AUDIO_MODES.REPLACE}
+          onChange={onUpdateMix}
+        />
+        <DubGainSlider
+          id="subtitle-mix-dub-volume"
+          label="Dubbed voice"
+          valueText={dubAudioMode === VIDEO_AUDIO_MODES.ORIGINAL ? 'Excluded' : formatGainPercentLabel(mix.dubVolume)}
+          field="dubVolume"
+          value={mix.dubVolume}
+          disabled={controlsDisabled || dubAudioMode === VIDEO_AUDIO_MODES.ORIGINAL}
+          onChange={onUpdateMix}
+        />
+        <DubGainSlider
+          id="subtitle-mix-duck-volume"
+          label="Ducking floor"
+          valueText={dubAudioMode === VIDEO_AUDIO_MODES.DUCK ? duckText : 'Off'}
+          field="duckVolume"
+          value={mix.duckVolume}
+          disabled={controlsDisabled || dubAudioMode !== VIDEO_AUDIO_MODES.DUCK}
+          onChange={onUpdateMix}
+        />
+      </div>
+      <div className="subtitle-dub-mix-foot">
+        <button
+          type="button"
+          id="subtitle-mix-reset-btn"
+          className="button subtle-button subtitle-cue-btn"
+          disabled={controlsDisabled || !isCustom}
+          onClick={onResetMix}
+        >
+          Reset mix
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SubtitleDubModeSelects({ dubAudioMode, dubSubtitleMode, duckVolume, controlsDisabled, onChangeDubAudioMode, onChangeDubSubtitleMode }) {
+  const duckOptionLabel = `Duck (${formatGainDbLabel(duckVolume)})`;
+  return (
+    <div className="subtitle-voice-dub-selects">
       <div className="subtitle-voice-dub-mode">
         <label className="subtitle-dub-label" htmlFor="subtitle-dub-audio-mode">Original audio</label>
         <div className="select-field select-field--plain subtitle-voice-dub-select-wrap">
@@ -154,88 +248,316 @@ function SubtitleDubExportBar({ dubAudioMode, dubBusy, disabled, disabledReason,
             id="subtitle-dub-audio-mode"
             aria-label="Original audio"
             value={dubAudioMode}
-            disabled={disabled}
+            disabled={controlsDisabled}
             onChange={e => onChangeDubAudioMode?.(e.target.value)}
           >
             {DUB_AUDIO_MODE_OPTIONS.map(opt => (
+              <option key={opt.id} value={opt.id}>{opt.id === VIDEO_AUDIO_MODES.DUCK ? duckOptionLabel : opt.label}</option>
+            ))}
+            {dubAudioMode === VIDEO_AUDIO_MODES.ORIGINAL && (
+              <option value={VIDEO_AUDIO_MODES.ORIGINAL}>Original only</option>
+            )}
+          </select>
+          <Icon name="chevron_down" className="select-chevron" />
+        </div>
+      </div>
+      <div className="subtitle-voice-dub-mode">
+        <label className="subtitle-dub-label" htmlFor="subtitle-dub-subtitle-mode">Subtitles</label>
+        <div className="select-field select-field--plain subtitle-voice-dub-select-wrap">
+          <select
+            id="subtitle-dub-subtitle-mode"
+            aria-label="Video subtitles"
+            value={dubSubtitleMode}
+            disabled={controlsDisabled}
+            onChange={e => onChangeDubSubtitleMode?.(e.target.value)}
+          >
+            {VIDEO_SUBTITLE_MODE_OPTIONS.map(opt => (
               <option key={opt.id} value={opt.id}>{opt.label}</option>
             ))}
           </select>
           <Icon name="chevron_down" className="select-chevron" />
         </div>
       </div>
+    </div>
+  );
+}
+
+function SubtitleDubExportBar({
+  dubAudioMode,
+  dubSubtitleMode,
+  dubMixSettings,
+  dubBusy,
+  controlsDisabled,
+  exportDisabled,
+  disabledReason,
+  onChangeDubAudioMode,
+  onChangeDubSubtitleMode,
+  onUpdateMix,
+  onResetMix,
+  onExportDub,
+}) {
+  const [mixOpen, setMixOpen] = useState(false);
+  const mix = normalizeDubMixSettings(dubMixSettings);
+  const isCustomMix = hasCustomDubMixSettings(mix);
+  const btnText = dubBusy
+    ? 'Exporting MP4…'
+    : (dubAudioMode === VIDEO_AUDIO_MODES.ORIGINAL ? 'Export video MP4' : 'Export dubbed MP4');
+  return (
+    <div className="subtitle-voice-dub-section">
+      <div className="subtitle-voice-dub-row">
+        <SubtitleDubModeSelects
+          dubAudioMode={dubAudioMode}
+          dubSubtitleMode={dubSubtitleMode}
+          duckVolume={mix.duckVolume}
+          controlsDisabled={controlsDisabled}
+          onChangeDubAudioMode={onChangeDubAudioMode}
+          onChangeDubSubtitleMode={onChangeDubSubtitleMode}
+        />
+        <div className="subtitle-voice-dub-actions">
+          <button
+            type="button"
+            id="subtitle-dub-mix-toggle"
+            className="button subtle-button subtitle-voice-btn"
+            aria-expanded={mixOpen}
+            aria-controls="subtitle-dub-mix-panel"
+            disabled={controlsDisabled}
+            onClick={() => setMixOpen(v => !v)}
+          >
+            <span>{isCustomMix ? 'Mix & ducking (custom)' : 'Mix & ducking'}</span>
+          </button>
+          <button
+            type="button"
+            id="subtitle-export-dub-btn"
+            className="button button-primary subtitle-voice-btn"
+            disabled={exportDisabled}
+            title={disabledReason}
+            onClick={onExportDub}
+          >
+            {dubBusy ? <Blocks size={VOICE_SPINNER_SIZE_PX} className="generate-spinner" /> : <Icon name="arrow_down_to_line" />}
+            <span>{btnText}</span>
+          </button>
+        </div>
+      </div>
+      <SubtitleDubMixPanel
+        open={mixOpen}
+        dubAudioMode={dubAudioMode}
+        mix={mix}
+        controlsDisabled={controlsDisabled}
+        onUpdateMix={onUpdateMix}
+        onResetMix={onResetMix}
+      />
+    </div>
+  );
+}
+
+function SubtitleVoiceModeToggle({ mode, onChangeMode }) {
+  return (
+    <div className="subtitle-voice-mode-toggle" role="group" aria-label="Playback mode">
       <button
         type="button"
-        id="subtitle-export-dub-btn"
-        className="button button-primary subtitle-voice-btn"
-        disabled={disabled}
-        title={disabledReason}
-        onClick={onExportDub}
+        id="subtitle-mode-aligned-btn"
+        className={mode === 'aligned' ? 'subtitle-voice-mode-tab is-active' : 'subtitle-voice-mode-tab'}
+        aria-pressed={mode === 'aligned'}
+        onClick={() => onChangeMode('aligned')}
       >
-        {dubBusy ? <Blocks size={VOICE_SPINNER_SIZE_PX} className="generate-spinner" /> : <Icon name="arrow_down_to_line" />}
-        <span>{dubBusy ? 'Exporting dubbed MP4…' : 'Export dubbed MP4'}</span>
+        Time-aligned dub
       </button>
+      <button
+        type="button"
+        id="subtitle-mode-sequential-btn"
+        className={mode === 'sequential' ? 'subtitle-voice-mode-tab is-active' : 'subtitle-voice-mode-tab'}
+        aria-pressed={mode === 'sequential'}
+        onClick={() => onChangeMode('sequential')}
+      >
+        Sequential voice
+      </button>
+    </div>
+  );
+}
+
+function formatVoiceHeaderMeta(activeClip) {
+  const durationLabel = activeClip.durationSeconds ? formatTime(activeClip.durationSeconds) : '';
+  const gapLabel = activeClip.count >= 2 && activeClip.pauseGapMs != null
+    ? `${formatSubtitleVoiceoverGapLabel(activeClip.pauseGapMs)} gap` : '';
+  return [activeClip.characterName, durationLabel, gapLabel].filter(Boolean).join(' · ');
+}
+
+function SubtitleVoiceHeaderCopy({ activeClip, unresolvedMismatchCount = 0 }) {
+  const frameWord = activeClip.count === 1 ? 'frame' : 'frames';
+  const scope = activeClip.scope === 'selected' ? 'Selected voiceover' : 'Generated voiceover';
+  const scopeLabel = `${scope} · ${activeClip.count} ${frameWord}`;
+  const metaLabel = formatVoiceHeaderMeta(activeClip);
+  const warnTitle = activeClip.warnings?.map(w => w.message).join('\n') || '';
+  return (
+    <div className="subtitle-voice-output-copy">
+      <strong><Icon name="waveform" /><span>{scopeLabel}</span></strong>
+      {metaLabel && <span>{metaLabel}</span>}
+      {unresolvedMismatchCount > 0 && (
+        <span className="subtitle-voice-mismatch-pill">
+          {unresolvedMismatchCount} duration {unresolvedMismatchCount === 1 ? 'mismatch' : 'mismatches'}
+        </span>
+      )}
+      {unresolvedMismatchCount === 0 && activeClip.warnings?.length > 0 && (
+        <span className="subtitle-voice-warn-pill" title={warnTitle}>
+          {activeClip.warnings.length} clamped to fit
+        </span>
+      )}
+    </div>
+  );
+}
+
+function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAligned, hasAligned, canExportAligned = hasAligned }) {
+  const alignedDisabled = busy || dubBusy || !canExportAligned;
+  const alignedTitle = !canExportAligned
+    ? 'Resolve speech duration mismatches before exporting time-aligned WAV'
+    : 'Export synchronized time-aligned WAV ready for video editors';
+  return (
+    <div className="subtitle-voice-download-group">
+      <button
+        type="button"
+        id="subtitle-download-voice-btn"
+        className="button button-secondary subtitle-voice-btn"
+        disabled={busy || dubBusy}
+        onClick={onDownload}
+      >
+        <Icon name="arrow_down_to_line" />
+        <span>Download voice (.wav)</span>
+      </button>
+      {hasAligned && onDownloadAligned && (
+        <button
+          type="button"
+          id="subtitle-download-aligned-voice-btn"
+          className="button button-primary subtitle-voice-btn"
+          disabled={alignedDisabled}
+          title={alignedTitle}
+          onClick={onDownloadAligned}
+        >
+          <Icon name="waveform" />
+          <span>Time-aligned dub WAV</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SubtitleVoiceCardHeader({ activeClip, hasAligned, mode, onChangeMode, actionsProps, unresolvedMismatchCount = 0 }) {
+  return (
+    <div className="subtitle-voice-output-head">
+      <SubtitleVoiceHeaderCopy activeClip={activeClip} unresolvedMismatchCount={unresolvedMismatchCount} />
+      {hasAligned && <SubtitleVoiceModeToggle mode={mode} onChangeMode={onChangeMode} />}
+      <SubtitleVoiceDownloadActions {...actionsProps} hasAligned={hasAligned} />
+    </div>
+  );
+}
+
+function DurationMismatchExportBanner({ durationMismatches, busy, onJumpToMismatch, onFixSafeMismatches }) {
+  if (!durationMismatches?.hasUnresolved) return null;
+  const { unresolved, unresolvedCount } = durationMismatches;
+  const hasSafeExtend = unresolved.some(item => item.remedies?.canExtendCue);
+  const word = unresolvedCount === 1 ? 'mismatch' : 'mismatches';
+  return (
+    <div className="subtitle-mismatch-export-banner" role="alert">
+      <div className="subtitle-mismatch-banner-head">
+        <Icon name="alert_circle" className="subtitle-validation-icon" />
+        <div className="subtitle-mismatch-banner-copy">
+          <strong>Resolve {unresolvedCount} speech duration {word} before final dub export</strong>
+          <span>Speech exceeds allocated subtitle intervals — choose an explicit remedy on each cue rather than silent trimming.</span>
+        </div>
+        {hasSafeExtend && onFixSafeMismatches && (
+          <button type="button" id="subtitle-fix-safe-mismatches-btn" className="button subtle-button subtitle-validation-fix-btn"
+            disabled={busy} onClick={onFixSafeMismatches}>Extend safe cues</button>
+        )}
+      </div>
+      <div className="subtitle-mismatch-chip-list">
+        {unresolved.map(item => (
+          <button key={item.segmentId} type="button" className="button subtle-button subtitle-mismatch-jump-chip"
+            title={item.message} onClick={() => onJumpToMismatch?.(item.segmentId)}>
+            Cue #{item.cueNumber} (+{item.excessDuration.toFixed(2)}s)
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
 
 /**
  * Renders the combined generated voiceover audio player, WAV download bar, and dubbed MP4 export controls directly below the subtitle list.
- * Inputs: `{ combinedClip, busy, dubAudioMode, dubBusy, canExportDub, isAudioOnly, hasJobId, onDownload, onChangeDubAudioMode, onExportDub }`.
+ * Inputs: `{ combinedClip, alignedClip, durationMismatches, canExportAlignedVoice, busy, dubAudioMode, dubBusy, canExportDub, isAudioOnly, hasJobId, onDownload, onDownloadAligned, onChangeDubAudioMode, onExportDub, onJumpToMismatch, onFixSafeMismatches }`.
  * Outputs: `<section id="subtitle-voice-output">` or null when no voice clips exist yet.
  * Side effects: plays audio via native HTML5 `<audio>`, downloads `.wav`, or exports time-aligned dubbed `.mp4`.
- * Failure modes: returns null cleanly before any frame voice is generated; disables dubbing for audio-only or missing `jobId`.
+ * Failure modes: returns null cleanly before any frame voice is generated; disables dubbing for audio-only, missing `jobId`, or unresolved duration mismatches.
  * @param {object} props - Output card props.
  * @returns {React.ReactElement|null} Combined voiceover output card or null.
  */
 export function SubtitleVoiceOutputCard({
   combinedClip,
+  alignedClip = null,
+  durationMismatches = null,
+  canExportAlignedVoice,
   busy = false,
   dubAudioMode = DEFAULT_DUB_AUDIO_MODE,
+  dubSubtitleMode = DEFAULT_DUB_SUBTITLE_MODE,
+  dubMixSettings = DEFAULT_DUB_MIX_SETTINGS,
   dubBusy = false,
   canExportDub = false,
   isAudioOnly = false,
   hasJobId = false,
+  hasAudioStream = true,
+  burnInSupported = true,
   onDownload,
+  onDownloadAligned,
   onChangeDubAudioMode,
+  onChangeDubSubtitleMode = null,
+  onUpdateDubMixSetting = null,
+  onResetDubMixSettings = null,
   onExportDub,
+  onJumpToMismatch = null,
+  onFixSafeMismatches = null,
 }) {
-  if (!combinedClip?.url) return null;
-  const frameWord = combinedClip.count === 1 ? 'frame' : 'frames';
-  const scopeLabel = combinedClip.scope === 'selected' ? `Selected voiceover · ${combinedClip.count} ${frameWord}` : `Generated voiceover · ${combinedClip.count} ${frameWord}`;
-  const durationLabel = combinedClip.durationSeconds ? formatTime(combinedClip.durationSeconds) : '';
-  const gapLabel = combinedClip.count >= 2 && combinedClip.pauseGapMs != null
-    ? `${formatSubtitleVoiceoverGapLabel(combinedClip.pauseGapMs)} gap`
-    : '';
-  const metaParts = [combinedClip.characterName, durationLabel, gapLabel].filter(Boolean).join(' · ');
-  const dubDisabled = busy || dubBusy || !canExportDub;
-  const dubDisabledReason = !canExportDub ? resolveDubDisabledReason({ isAudioOnly, hasJobId }) : undefined;
+  const [mode, setMode] = useState('sequential');
+  const hasCombined = Boolean(combinedClip?.url);
+  const hasAligned = Boolean(alignedClip?.url);
+  const effectiveMode = (mode === 'aligned' && hasAligned) || (!hasCombined && hasAligned) ? 'aligned' : 'sequential';
+  const activeClip = effectiveMode === 'aligned' ? alignedClip : combinedClip;
+  if (!activeClip?.url) return null;
+  const unresolvedMismatchCount = durationMismatches?.unresolvedCount || 0;
+  const canExportAligned = canExportAlignedVoice ?? (hasAligned && unresolvedMismatchCount === 0);
+  const controlsDisabled = busy || dubBusy;
+  const mismatchBlocksDub = dubAudioMode !== VIDEO_AUDIO_MODES.ORIGINAL && unresolvedMismatchCount > 0;
+  const dubDisabled = controlsDisabled || !canExportDub || mismatchBlocksDub;
+  const dubDisabledReason = dubDisabled ? resolveDubDisabledReason({
+    isAudioOnly, hasJobId, hasAudioStream, burnInSupported, dubAudioMode, dubSubtitleMode, unresolvedMismatchCount,
+  }) : undefined;
 
   return (
     <section id="subtitle-voice-output" className="subtitle-voice-output" aria-label="Generated subtitle voiceover">
-      <div className="subtitle-voice-output-head">
-        <div className="subtitle-voice-output-copy">
-          <strong><Icon name="waveform" /><span>{scopeLabel}</span></strong>
-          {metaParts ? <span>{metaParts}</span> : null}
-        </div>
-        <button
-          type="button"
-          id="subtitle-download-voice-btn"
-          className="button button-secondary subtitle-voice-btn"
-          disabled={busy || dubBusy}
-          onClick={onDownload}
-        >
-          <Icon name="arrow_down_to_line" />
-          <span>Download voice (.wav)</span>
-        </button>
-      </div>
-      <audio controls className="subtitle-voice-audio" src={combinedClip.url} preload="metadata" />
+      <SubtitleVoiceCardHeader
+        activeClip={activeClip}
+        hasAligned={hasAligned}
+        mode={effectiveMode}
+        onChangeMode={setMode}
+        unresolvedMismatchCount={unresolvedMismatchCount}
+        actionsProps={{ busy, dubBusy, onDownload, onDownloadAligned, canExportAligned }}
+      />
+      <DurationMismatchExportBanner
+        durationMismatches={durationMismatches}
+        busy={busy || dubBusy}
+        onJumpToMismatch={onJumpToMismatch}
+        onFixSafeMismatches={onFixSafeMismatches}
+      />
+      <audio key={activeClip.url} controls className="subtitle-voice-audio" src={activeClip.url} preload="metadata" />
       <SubtitleDubExportBar
         dubAudioMode={dubAudioMode}
+        dubSubtitleMode={dubSubtitleMode}
+        dubMixSettings={dubMixSettings}
         dubBusy={dubBusy}
-        disabled={dubDisabled}
+        controlsDisabled={controlsDisabled}
+        exportDisabled={dubDisabled}
         disabledReason={dubDisabledReason}
         onChangeDubAudioMode={onChangeDubAudioMode}
+        onChangeDubSubtitleMode={onChangeDubSubtitleMode}
+        onUpdateMix={onUpdateDubMixSetting}
+        onResetMix={onResetDubMixSettings}
         onExportDub={onExportDub}
       />
     </section>

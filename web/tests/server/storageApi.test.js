@@ -407,9 +407,38 @@ test('storage API creates, lists, gets, updates, and soft-deletes subtitle proje
     });
     assert.equal(updateRes.status, 200);
     assert.equal(updateRes.json().data.project.title, 'News Clip Subtitles (revised)');
+    assert.equal(updateRes.json().data.project.revision, 2);
     const createdAtBefore = createRes.json().data.project.createdAt;
     assert.equal(updateRes.json().data.project.createdAt, createdAtBefore);
     assert.notEqual(updateRes.json().data.project.updatedAt, createRes.json().data.project.updatedAt);
+
+    // Stale expectedRevision returns HTTP 409 Conflict
+    const staleRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=1`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'subtitle',
+        title: 'Stale attempt',
+        payload: {},
+      }),
+    });
+    assert.equal(staleRes.status, 409);
+    assert.equal(staleRes.json().error.code, 'REVISION_CONFLICT');
+
+    // Matching expectedRevision succeeds
+    const matchRes = await invokeApp(handler, {
+      method: 'PUT',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=2`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'subtitle',
+        title: 'News Clip Subtitles (revised)',
+        payload: { videoFileName: 'news.mp4', segments: [], speakerNames: {}, subtitleOptions: {} },
+      }),
+    });
+    assert.equal(matchRes.status, 200);
+    assert.equal(matchRes.json().data.project.revision, 3);
 
     // Restart persistence: new store against same dataDir
     const restartedStore = createStorageStore({ dataDir });
@@ -418,8 +447,19 @@ test('storage API creates, lists, gets, updates, and soft-deletes subtitle proje
     assert.equal(persisted.title, 'News Clip Subtitles (revised)');
     assert.equal(persisted.createdAt, createdAtBefore);
 
-    // Soft-delete
-    const delRes = await invokeApp(handler, { method: 'DELETE', urlPath: `/api/v1/projects/${projectId}` });
+    // Stale expectedRevision on DELETE returns HTTP 409 Conflict
+    const staleDel = await invokeApp(handler, {
+      method: 'DELETE',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=1`,
+    });
+    assert.equal(staleDel.status, 409);
+    assert.equal(staleDel.json().error.code, 'REVISION_CONFLICT');
+
+    // Matching expectedRevision on Soft-delete succeeds
+    const delRes = await invokeApp(handler, {
+      method: 'DELETE',
+      urlPath: `/api/v1/projects/${projectId}?expectedRevision=3`,
+    });
     assert.equal(delRes.status, 200);
     assert.equal(delRes.json().data.deleted, true);
 
@@ -647,4 +687,132 @@ test('storage API reports a corrupt glossary as 500 and lets a valid PUT repair 
     assert.equal(repaired.status, 200);
     assert.equal((await invokeApp(handler, { urlPath: '/api/v1/glossary' })).json().data.rules[0].replacement, 'fixed');
   });
+});
+
+function putTerminology(handler, payload, headers = { 'content-type': 'application/json' }) {
+  return invokeApp(handler, {
+    method: 'PUT',
+    urlPath: '/api/v1/terminology',
+    headers,
+    body: typeof payload === 'string' ? payload : JSON.stringify(payload),
+  });
+}
+
+test('storage API persists reusable terminology atomically in terminology.json, handles concurrency, validation, corruption repair, and project overrides', async () => {
+  await withStorageHandler(async ({ handler, dataDir }) => {
+    const empty = await invokeApp(handler, { urlPath: '/api/v1/terminology' });
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.json().data.terms, []);
+
+    const sampleTerms = [
+      { id: 't1', category: 'spelling', status: 'approved', term: 'Phnom Penh', variants: ['Pnom Penh'] },
+      { id: 't2', category: 'name', status: 'approved', term: 'VoxCPM', preserveInTranslation: true, pronunciation: 'វ៉ុក' },
+    ];
+    const saved = await putTerminology(handler, { terms: sampleTerms });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json().data.terms.length, 2);
+
+    const restartedStore = createStorageStore({ dataDir });
+    const restartedHandler = createStorageHttpApp({ store: restartedStore, audioMaster: createAudioMaster() });
+    const reloaded = await invokeApp(restartedHandler, { urlPath: '/api/v1/terminology' });
+    assert.equal(reloaded.status, 200);
+    assert.equal(reloaded.json().data.terms[1].pronunciation, 'វ៉ុក');
+
+    // Concurrent terminology writes stay atomic without .tmp remnants
+    const concurrent = await Promise.all(Array.from({ length: 6 }, (_, idx) => putTerminology(handler, {
+      terms: [{ id: 'c1', category: 'spelling', status: 'approved', term: `Term-${idx}`, variants: [] }],
+    })));
+    assert.ok(concurrent.every(res => res.status === 200));
+    assert.deepEqual((await readdir(dataDir)).filter(name => name.endsWith('.tmp')), []);
+
+    // Bad payload shapes -> 400, semantic -> 422, verb -> 405
+    const badShape = await putTerminology(handler, { terms: [], unknown: true });
+    assert.equal(badShape.status, 400);
+    const badSemantic = await putTerminology(handler, {
+      terms: [{ category: 'translation', status: 'approved', term: 'AI', translation: '' }],
+    });
+    assert.equal(badSemantic.status, 422);
+    assert.equal(badSemantic.json().error.code, 'EMPTY_TERMINOLOGY_TRANSLATION');
+    const badMethod = await invokeApp(handler, { method: 'DELETE', urlPath: '/api/v1/terminology' });
+    assert.equal(badMethod.status, 405);
+
+    // Corrupt terminology.json reports 500 and is cleanly repaired by PUT
+    await writeFile(path.join(dataDir, 'terminology.json'), '{"terms": [');
+    assert.equal((await invokeApp(handler, { urlPath: '/api/v1/terminology' })).status, 500);
+    assert.equal((await putTerminology(handler, { terms: sampleTerms })).status, 200);
+
+    // Project overrides persist and duplicate cleanly alongside terminology.json
+    const projectId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const createdProj = await invokeApp(handler, {
+      method: 'POST',
+      urlPath: '/api/v1/projects',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: projectId,
+        kind: 'subtitle',
+        title: 'Project With Overrides',
+        payload: { segments: [], speakerNames: {}, subtitleOptions: {} },
+        terminology: {
+          overrides: { t2: { pronunciation: 'custom-proj-pron' } },
+          projectTerms: [{ id: 'p1', category: 'spelling', status: 'approved', term: 'CustomCo', variants: ['Custom Co'] }],
+        },
+      }),
+    });
+    assert.equal(createdProj.status, 201);
+    assert.equal(createdProj.json().data.project.terminology.overrides.t2.pronunciation, 'custom-proj-pron');
+    assert.equal(createdProj.json().data.project.terminology.projectTerms[0].term, 'CustomCo');
+
+    const dupProj = await invokeApp(handler, {
+      method: 'POST',
+      urlPath: `/api/v1/projects/${projectId}/duplicate`,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Copy Overrides' }),
+    });
+    assert.equal(dupProj.status, 201);
+    assert.equal(dupProj.json().data.project.terminology.overrides.t2.pronunciation, 'custom-proj-pron');
+    assert.equal(dupProj.json().data.project.terminology.projectTerms.length, 1);
+
+    // Verify storage backup & integrity include terminology.json cleanly
+    const integrity = await restartedStore.verifyIntegrity();
+    assert.equal(integrity.valid, true);
+  });
+});
+
+
+import { verifyStorageIntegrity as verifyTermStorageIntegrity } from '../../server/storageMigration.js';
+
+test('verifyStorageIntegrity rejects malformed or invalid terminology.json documents', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'voxcpm-term-integ-'));
+  try {
+    await writeFile(path.join(dir, 'terminology.json'), JSON.stringify({}), 'utf8');
+    let report = await verifyTermStorageIntegrity({ dataDir: dir });
+    assert.equal(report.valid, false);
+    assert.ok(report.issues.some(msg => msg.includes('Terminology corruption')));
+
+    await writeFile(path.join(dir, 'terminology.json'), JSON.stringify({ schemaVersion: 1, terms: null }), 'utf8');
+    report = await verifyTermStorageIntegrity({ dataDir: dir });
+    assert.equal(report.valid, false);
+
+    await writeFile(
+      path.join(dir, 'terminology.json'),
+      JSON.stringify({ schemaVersion: 1, terms: [{ id: 'bad', category: 'invalid-cat', term: 'x' }] }),
+      'utf8'
+    );
+    report = await verifyTermStorageIntegrity({ dataDir: dir });
+    assert.equal(report.valid, false);
+
+    await writeFile(
+      path.join(dir, 'terminology.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        updatedAt: new Date().toISOString(),
+        terms: [{ id: 't1', category: 'spelling', term: 'VoxCPM2', variants: ['voxcpm'], status: 'approved' }],
+      }),
+      'utf8'
+    );
+    report = await verifyTermStorageIntegrity({ dataDir: dir });
+    assert.equal(report.valid, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

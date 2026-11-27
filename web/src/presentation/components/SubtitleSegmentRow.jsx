@@ -7,16 +7,21 @@ import { Blocks } from 'loading-dev';
 import { formatTime } from '../../domain/audioValidation.js';
 import { formatVerifyReasonLabel } from '../../domain/speechVerification.js';
 import {
+  MIN_CUE_DURATION_SEC,
   MIN_SPLIT_GAP_SEC,
+  TIMING_NUDGE_COARSE_SEC,
+  TIMING_NUDGE_FINE_SEC,
+  autoBreakLongLine,
   formatEditableTimestamp,
   formatShortClock,
   getSpeakerColor,
   parseEditableTimestamp,
   resolveSpeakerLabel,
+  roundToMs,
+  validateCueInterval,
 } from '../../domain/subtitles.js';
 import { Icon } from './Icon.jsx';
 
-const TIMING_NUDGE_SEC = 0.2;
 const CUE_VOICE_SPINNER_PX = 12;
 
 function SpeakerBadgeSelect({ speakerId, speakers, speakerNames, busy, onChangeSpeaker }) {
@@ -39,116 +44,296 @@ function SpeakerBadgeSelect({ speakerId, speakers, speakerNames, busy, onChangeS
   );
 }
 
-function resolveTimingCommit(field, raw, segment) {
+function checkCurrentTimingValid(segment, mediaDuration) {
+  return validateCueInterval({
+    start: segment.start,
+    end: segment.end,
+    minDuration: MIN_CUE_DURATION_SEC,
+    maxDuration: mediaDuration,
+  }).valid;
+}
+
+function resolveCandidateTiming(field, parsed, segment) {
+  if (field === 'start') {
+    return { start: Math.max(0, parsed), end: segment.end };
+  }
+  const minEnd = roundToMs(segment.start + MIN_SPLIT_GAP_SEC);
+  return { start: segment.start, end: Math.max(minEnd, parsed) };
+}
+
+function resolveTimingCommit(field, raw, segment, mediaDuration = null) {
   const currentVal = field === 'start' ? segment.start : segment.end;
-  const isAlreadyValid = Number(segment.end) >= Number(segment.start) + MIN_SPLIT_GAP_SEC;
-  if (raw === formatEditableTimestamp(currentVal) && isAlreadyValid) {
+  if (raw === formatEditableTimestamp(currentVal) && checkCurrentTimingValid(segment, mediaDuration)) {
     return { valid: true, unchanged: true };
   }
   const parsed = parseEditableTimestamp(raw);
-  if (parsed === null) {
+  const cand = parsed !== null ? resolveCandidateTiming(field, parsed, segment) : null;
+  const check = cand ? validateCueInterval({ start: cand.start, end: cand.end, minDuration: MIN_CUE_DURATION_SEC, maxDuration: mediaDuration }) : null;
+  if (!cand || !check?.valid) {
     return {
       valid: false,
+      error: check?.error || 'Invalid timestamp format. Use MM:SS.mmm or SS.s.',
+      code: check?.code || 'INVALID_FORMAT',
       startDraft: formatEditableTimestamp(segment.start),
       endDraft: formatEditableTimestamp(segment.end),
     };
   }
-  if (field === 'start') {
-    const nextStart = Math.max(0, parsed);
-    return { valid: true, unchanged: false, patch: { start: nextStart }, startDraft: formatEditableTimestamp(nextStart) };
-  }
-  const clampedEnd = Math.round(Math.max(segment.start + MIN_SPLIT_GAP_SEC, parsed) * 1000) / 1000;
-  return { valid: true, unchanged: false, patch: { end: clampedEnd }, endDraft: formatEditableTimestamp(clampedEnd) };
+  const patch = field === 'start' ? { start: roundToMs(cand.start) } : { end: roundToMs(cand.end) };
+  return { valid: true, unchanged: false, patch, startDraft: formatEditableTimestamp(cand.start), endDraft: formatEditableTimestamp(cand.end) };
 }
 
-function TimingInlineEditor({ segment, busy, onUpdateTiming }) {
+function parseSecondsInput(raw) {
+  const cleaned = String(raw || '').replace(/s$/i, '').trim();
+  const parsed = parseFloat(cleaned);
+  return Number.isFinite(parsed) ? roundToMs(parsed) : null;
+}
+
+function resolveDurationCommit(raw, segment, mediaDuration = null) {
+  const parsed = parseSecondsInput(raw);
+  if (parsed === null || parsed < MIN_CUE_DURATION_SEC) {
+    return { valid: false, error: `Duration must be at least ${MIN_CUE_DURATION_SEC}s.` };
+  }
+  const candidateEnd = roundToMs(segment.start + parsed);
+  const check = validateCueInterval({
+    start: segment.start,
+    end: candidateEnd,
+    minDuration: MIN_CUE_DURATION_SEC,
+    maxDuration: mediaDuration,
+  });
+  if (!check.valid) return { valid: false, error: check.error, code: check.code };
+  return { valid: true, patch: { end: candidateEnd } };
+}
+
+function resolvePauseCommit(raw) {
+  const parsed = parseSecondsInput(raw);
+  if (parsed === null || parsed < 0) {
+    return { valid: false, error: 'Pause must be a non-negative number of seconds.' };
+  }
+  return { valid: true, pauseSec: roundToMs(parsed) };
+}
+
+function computeCueOverlapAmount(segA, segB) {
+  if (!segA || !segB) return 0;
+  const start = Math.max(roundToMs(segA.start), roundToMs(segB.start));
+  const end = Math.min(roundToMs(segA.end), roundToMs(segB.end));
+  return end > start ? roundToMs(end - start) : 0;
+}
+
+function computeOverlapWarning(segment, prevSegment, nextSegment) {
+  const prevDiff = computeCueOverlapAmount(prevSegment, segment);
+  if (prevDiff > 0) return `Overlaps previous cue by ${prevDiff.toFixed(2)}s`;
+  const nextDiff = computeCueOverlapAmount(segment, nextSegment);
+  if (nextDiff > 0) return `Overlaps next cue by ${nextDiff.toFixed(2)}s`;
+  return '';
+}
+
+function TimingInputField({ label, ariaLabel, value, disabled, onChange, onBlur, onKeyDown, className = '' }) {
+  const inputClass = ['subtitle-timing-input', className].filter(Boolean).join(' ');
+  return (
+    <label className="subtitle-timing-field">
+      <span>{label}</span>
+      <input
+        type="text"
+        className={inputClass}
+        aria-label={ariaLabel}
+        value={value}
+        disabled={disabled}
+        onChange={onChange}
+        onBlur={onBlur}
+        onKeyDown={onKeyDown}
+      />
+    </label>
+  );
+}
+
+function TimingNudgeButtons({ busy, onNudge }) {
+  return (
+    <div className="subtitle-timing-nudges">
+      <button type="button" className="button subtle-button subtitle-nudge-btn" disabled={busy}
+        title="Shift cue earlier by 0.2s" onClick={() => onNudge(-TIMING_NUDGE_COARSE_SEC)}>-0.2s</button>
+      <button type="button" className="button subtle-button subtitle-nudge-btn" disabled={busy}
+        title="Shift cue later by 0.2s" onClick={() => onNudge(TIMING_NUDGE_COARSE_SEC)}>+0.2s</button>
+      <button type="button" className="button subtle-button subtitle-nudge-btn subtitle-nudge-fine" disabled={busy}
+        title="Fine shift earlier by 50ms" onClick={() => onNudge(-TIMING_NUDGE_FINE_SEC)}>-0.05s</button>
+      <button type="button" className="button subtle-button subtitle-nudge-btn subtitle-nudge-fine" disabled={busy}
+        title="Fine shift later by 50ms" onClick={() => onNudge(TIMING_NUDGE_FINE_SEC)}>+0.05s</button>
+    </div>
+  );
+}
+
+function TimingFeedback({ error, overlapNotice, onFixOverlap }) {
+  if (!error && !overlapNotice) return null;
+  return (
+    <div className="subtitle-timing-feedback-row">
+      {error && <span className="subtitle-timing-feedback subtitle-timing-error" role="alert">{error}</span>}
+      {!error && overlapNotice && (
+        <span className="subtitle-timing-feedback subtitle-timing-warning" role="status">
+          <span>{overlapNotice}</span>
+          {onFixOverlap && (
+            <button type="button" className="button subtle-button subtitle-fix-overlap-btn" onClick={onFixOverlap}>
+              Fix
+            </button>
+          )}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function formatDurationDraft(start, end) {
+  return `${Math.max(0, roundToMs(end - start)).toFixed(2)}s`;
+}
+
+function formatPauseDraft(seg, nextSeg) {
+  if (!nextSeg) return '0.00s';
+  return `${roundToMs(nextSeg.start - seg.end).toFixed(2)}s`;
+}
+
+function useTimingDrafts(segment, nextSegment) {
   const [startDraft, setStartDraft] = useState(() => formatEditableTimestamp(segment.start));
   const [endDraft, setEndDraft] = useState(() => formatEditableTimestamp(segment.end));
-  const cancellingFieldRef = useRef('');
+  const [durDraft, setDurDraft] = useState(() => formatDurationDraft(segment.start, segment.end));
+  const [pauseDraft, setPauseDraft] = useState(() => formatPauseDraft(segment, nextSegment));
+  const [error, setError] = useState('');
 
   useEffect(() => {
     setStartDraft(formatEditableTimestamp(segment.start));
     setEndDraft(formatEditableTimestamp(segment.end));
-  }, [segment.start, segment.end]);
+    setDurDraft(formatDurationDraft(segment.start, segment.end));
+    setPauseDraft(formatPauseDraft(segment, nextSegment));
+    setError('');
+  }, [segment.id, segment.start, segment.end, nextSegment?.id, nextSegment?.start]);
 
-  const commitTiming = (field, raw) => {
-    const outcome = resolveTimingCommit(field, raw, segment);
-    if (outcome.unchanged) return;
-    if (!outcome.valid) {
-      setStartDraft(outcome.startDraft);
-      setEndDraft(outcome.endDraft);
-      return;
-    }
-    if (outcome.startDraft !== undefined) setStartDraft(outcome.startDraft);
-    if (outcome.endDraft !== undefined) setEndDraft(outcome.endDraft);
+  return { startDraft, setStartDraft, endDraft, setEndDraft, durDraft, setDurDraft, pauseDraft, setPauseDraft, error, setError };
+}
+
+function handleNudgeTiming(segment, delta, onUpdateTiming) {
+  const clampedDelta = delta < 0 ? Math.max(delta, -segment.start) : delta;
+  const nextStart = Math.max(0, roundToMs(segment.start + clampedDelta));
+  const nextEnd = Math.max(roundToMs(nextStart + MIN_SPLIT_GAP_SEC), roundToMs(segment.end + clampedDelta));
+  onUpdateTiming(segment.id, { start: nextStart, end: nextEnd });
+}
+
+function fixOverlapWithPrev(segment, prevSegment, onUpdateTiming) {
+  const minStart = roundToMs(prevSegment.end);
+  const minEnd = Math.max(roundToMs(minStart + MIN_SPLIT_GAP_SEC), segment.end);
+  onUpdateTiming(segment.id, { start: minStart, end: minEnd });
+}
+
+function fixOverlapWithNext(segment, nextSegment, onUpdateTiming) {
+  const maxEnd = roundToMs(nextSegment.start);
+  const minStart = Math.min(segment.start, Math.max(0, roundToMs(maxEnd - MIN_SPLIT_GAP_SEC)));
+  onUpdateTiming(segment.id, { start: minStart, end: maxEnd });
+}
+
+function handleFixOverlapAction(segment, neighbors, onUpdateTiming) {
+  const { prevSegment = null, nextSegment = null, conflictingId = null } = neighbors || {};
+  if (conflictingId && nextSegment?.id === conflictingId) return fixOverlapWithNext(segment, nextSegment, onUpdateTiming);
+  if (conflictingId && prevSegment?.id === conflictingId) return fixOverlapWithPrev(segment, prevSegment, onUpdateTiming);
+  if (prevSegment && roundToMs(prevSegment.end) > roundToMs(segment.start)) {
+    return fixOverlapWithPrev(segment, prevSegment, onUpdateTiming);
+  }
+  if (nextSegment && roundToMs(segment.end) > roundToMs(nextSegment.start)) {
+    return fixOverlapWithNext(segment, nextSegment, onUpdateTiming);
+  }
+}
+
+function commitMetricField(field, raw, context) {
+  const { segment, mediaDuration, drafts, onUpdateTiming, onUpdatePause } = context;
+  if (field === 'duration') {
+    const outcome = resolveDurationCommit(raw, segment, mediaDuration);
+    if (!outcome.valid) return drafts.setError(outcome.error);
+    drafts.setError('');
+    return onUpdateTiming(segment.id, outcome.patch);
+  }
+  const outcome = resolvePauseCommit(raw);
+  if (!outcome.valid) return drafts.setError(outcome.error);
+  drafts.setError('');
+  return onUpdatePause?.(segment.id, outcome.pauseSec);
+}
+
+function executeTimingCommit(params) {
+  const { field, raw, segment, mediaDuration, drafts, onUpdateTiming } = params;
+  try {
+    if (field === 'duration' || field === 'pause') return commitMetricField(field, raw, params);
+    const outcome = resolveTimingCommit(field, raw, segment, mediaDuration);
+    if (outcome.unchanged) return drafts.setError('');
+    if (outcome.startDraft !== undefined) drafts.setStartDraft(outcome.startDraft);
+    if (outcome.endDraft !== undefined) drafts.setEndDraft(outcome.endDraft);
+    if (!outcome.valid) return drafts.setError(outcome.error || 'Invalid timestamp.');
+    drafts.setError('');
     onUpdateTiming(segment.id, outcome.patch);
-  };
+  } catch (err) {
+    drafts.setError(err?.message || 'Failed to update timing.');
+  }
+}
 
-  const nudge = delta => {
-    const clampedDelta = delta < 0 ? Math.max(delta, -segment.start) : delta;
-    onUpdateTiming(segment.id, {
-      start: Math.max(0, segment.start + clampedDelta),
-      end: Math.max(MIN_SPLIT_GAP_SEC, segment.end + clampedDelta),
-    });
-  };
+function handleTimingKeyDown({ field, draft, e, cancellingRef, drafts, segment, onCommit }) {
+  if (e.key === 'Enter') {
+    cancellingRef.current = '';
+    onCommit(field, draft);
+  } else if (e.key === 'Escape') {
+    cancellingRef.current = field;
+    drafts.setStartDraft(formatEditableTimestamp(segment.start));
+    drafts.setEndDraft(formatEditableTimestamp(segment.end));
+    drafts.setError('');
+    e.currentTarget.blur?.();
+  }
+}
 
-  const handleKeyDown = (field, draft, e) => {
-    if (e.key === 'Enter') {
-      cancellingFieldRef.current = '';
-      commitTiming(field, draft);
-      return;
-    }
-    if (e.key === 'Escape') {
-      cancellingFieldRef.current = field;
-      setStartDraft(formatEditableTimestamp(segment.start));
-      setEndDraft(formatEditableTimestamp(segment.end));
-      e.currentTarget.blur?.();
-    }
-  };
+function TimingFieldsInputs({ drafts, cancellingRef, busy, nextSegment, canPause, onBlur, onKeyDown }) {
+  return (
+    <>
+      <TimingInputField label="Start" ariaLabel="Start timestamp" value={drafts.startDraft} disabled={busy}
+        onChange={e => { cancellingRef.current = ''; drafts.setStartDraft(e.target.value); }}
+        onBlur={() => onBlur('start', drafts.startDraft)} onKeyDown={e => onKeyDown('start', drafts.startDraft, e)} />
+      <TimingInputField label="End" ariaLabel="End timestamp" value={drafts.endDraft} disabled={busy}
+        onChange={e => { cancellingRef.current = ''; drafts.setEndDraft(e.target.value); }}
+        onBlur={() => onBlur('end', drafts.endDraft)} onKeyDown={e => onKeyDown('end', drafts.endDraft, e)} />
+      <TimingInputField label="Duration" ariaLabel="Cue duration" value={drafts.durDraft} disabled={busy} className="subtitle-timing-dur-input"
+        onChange={e => { cancellingRef.current = ''; drafts.setDurDraft(e.target.value); }}
+        onBlur={() => onBlur('duration', drafts.durDraft)} onKeyDown={e => onKeyDown('duration', drafts.durDraft, e)} />
+      {nextSegment && (
+        <TimingInputField label="Pause" ariaLabel="Pause to next cue" value={drafts.pauseDraft} disabled={busy || !canPause} className="subtitle-timing-pause-input"
+          onChange={e => { cancellingRef.current = ''; drafts.setPauseDraft(e.target.value); }}
+          onBlur={() => onBlur('pause', drafts.pauseDraft)} onKeyDown={e => onKeyDown('pause', drafts.pauseDraft, e)} />
+      )}
+    </>
+  );
+}
 
-  const handleBlur = (field, draft) => {
-    if (cancellingFieldRef.current === field) {
-      cancellingFieldRef.current = '';
-      return;
-    }
-    cancellingFieldRef.current = '';
-    commitTiming(field, draft);
+export function TimingInlineEditor({
+  segment,
+  prevSegment = null,
+  nextSegment = null,
+  mediaDuration = null,
+  busy = false,
+  onUpdateTiming,
+  onUpdatePause = null,
+}) {
+  const drafts = useTimingDrafts(segment, nextSegment);
+  const cancellingRef = useRef('');
+  const overlapNotice = computeOverlapWarning(segment, prevSegment, nextSegment);
+
+  const onCommit = (field, raw) => {
+    executeTimingCommit({ field, raw, segment, mediaDuration, drafts, onUpdateTiming, onUpdatePause });
+  };
+  const onKeyDown = (field, draft, e) => {
+    handleTimingKeyDown({ field, draft, e, cancellingRef, drafts, segment, onCommit });
+  };
+  const onBlur = (field, draft) => {
+    if (cancellingRef.current === field) { cancellingRef.current = ''; return; }
+    cancellingRef.current = '';
+    onCommit(field, draft);
   };
 
   return (
     <div className="subtitle-timing-bar">
-      <label className="subtitle-timing-field">
-        <span>Start</span>
-        <input
-          type="text"
-          className="subtitle-timing-input"
-          aria-label="Start timestamp"
-          value={startDraft}
-          disabled={busy}
-          onFocus={() => { cancellingFieldRef.current = ''; }}
-          onChange={e => { cancellingFieldRef.current = ''; setStartDraft(e.target.value); }}
-          onBlur={() => handleBlur('start', startDraft)}
-          onKeyDown={e => handleKeyDown('start', startDraft, e)}
-        />
-      </label>
-      <label className="subtitle-timing-field">
-        <span>End</span>
-        <input
-          type="text"
-          className="subtitle-timing-input"
-          aria-label="End timestamp"
-          value={endDraft}
-          disabled={busy}
-          onFocus={() => { cancellingFieldRef.current = ''; }}
-          onChange={e => { cancellingFieldRef.current = ''; setEndDraft(e.target.value); }}
-          onBlur={() => handleBlur('end', endDraft)}
-          onKeyDown={e => handleKeyDown('end', endDraft, e)}
-        />
-      </label>
-      <button type="button" className="button subtle-button subtitle-nudge-btn" disabled={busy}
-        title="Shift cue earlier by 0.2s" onClick={() => nudge(-TIMING_NUDGE_SEC)}>-0.2s</button>
-      <button type="button" className="button subtle-button subtitle-nudge-btn" disabled={busy}
-        title="Shift cue later by 0.2s" onClick={() => nudge(TIMING_NUDGE_SEC)}>+0.2s</button>
+      <TimingFieldsInputs drafts={drafts} cancellingRef={cancellingRef} busy={busy} nextSegment={nextSegment}
+        canPause={Boolean(onUpdatePause)} onBlur={onBlur} onKeyDown={onKeyDown} />
+      <TimingNudgeButtons busy={busy} onNudge={delta => handleNudgeTiming(segment, delta, onUpdateTiming)} />
+      <TimingFeedback error={drafts.error} overlapNotice={overlapNotice}
+        onFixOverlap={() => handleFixOverlapAction(segment, { prevSegment, nextSegment }, onUpdateTiming)} />
     </div>
   );
 }
@@ -235,9 +420,43 @@ function computeSplitRatio(textareaEl, textLength) {
   return pos / textLength;
 }
 
+function CueClipStatusBadges({ voiceClip, mismatch, isVoiceStale, disabled, onRevokeSpill, onUndoTrimVoice }) {
+  return (
+    <>
+      {isVoiceStale ? <span className="subtitle-cue-stale-badge" title="Text or voice changed since generation">Edited</span> : null}
+      {mismatch && !mismatch.isResolved ? (
+        <span className="subtitle-cue-mismatch-badge" title={mismatch.message}>
+          +{mismatch.excessDuration.toFixed(2)}s over {mismatch.allocatedDuration.toFixed(2)}s
+        </span>
+      ) : null}
+      {mismatch?.isSpillApproved ? (
+        <>
+          <span className="subtitle-cue-spill-badge" title="Speech approved to finish into trailing pause">
+            Spill +{mismatch.intervalExcess.toFixed(2)}s
+          </span>
+          {onRevokeSpill && (
+            <button type="button" className="button subtle-button subtitle-cue-btn subtitle-cue-undo-spill-btn"
+              disabled={disabled} onClick={onRevokeSpill}>Undo spill</button>
+          )}
+        </>
+      ) : null}
+      {voiceClip?.preTrimClip ? (
+        <>
+          <span className="subtitle-cue-trimmed-badge" title="Audio clip explicitly trimmed to fit interval">Trimmed</span>
+          {onUndoTrimVoice && (
+            <button type="button" className="button subtle-button subtitle-cue-btn subtitle-cue-undo-trim-btn"
+              disabled={disabled} onClick={onUndoTrimVoice}>Undo trim</button>
+          )}
+        </>
+      ) : null}
+    </>
+  );
+}
+
 function SegmentVoiceBar({
   hasText,
   voiceClip,
+  mismatch = null,
   isVoiceStale,
   isGeneratingVoice,
   isPlayingVoice,
@@ -245,6 +464,9 @@ function SegmentVoiceBar({
   onGenerateVoice,
   onTogglePlayVoice,
   onDownloadVoice,
+  onRemoveVoice = null,
+  onRevokeSpill = null,
+  onUndoTrimVoice = null,
 }) {
   if (!onGenerateVoice) return null;
   const generateLabel = isGeneratingVoice ? 'Generating…' : voiceClip ? 'Regenerate' : 'Generate voice';
@@ -276,7 +498,14 @@ function SegmentVoiceBar({
             <span>{isPlayingVoice ? 'Pause' : 'Play'}</span>
           </button>
           {clipMeta ? <span className="subtitle-cue-voice-meta">{clipMeta}</span> : null}
-          {isVoiceStale ? <span className="subtitle-cue-stale-badge" title="Text or voice changed since generation">Edited</span> : null}
+          <CueClipStatusBadges
+            voiceClip={voiceClip}
+            mismatch={mismatch}
+            isVoiceStale={isVoiceStale}
+            disabled={disabled}
+            onRevokeSpill={onRevokeSpill}
+            onUndoTrimVoice={onUndoTrimVoice}
+          />
           <button
             type="button"
             className="button subtle-button subtitle-cue-btn"
@@ -286,6 +515,18 @@ function SegmentVoiceBar({
           >
             <Icon name="arrow_down_to_line" />
           </button>
+          {onRemoveVoice && (
+            <button
+              type="button"
+              className="button subtle-button subtitle-cue-btn subtitle-cue-remove-voice-btn"
+              aria-label="Remove frame voice"
+              title="Remove generated voice clip from this cue"
+              disabled={disabled}
+              onClick={onRemoveVoice}
+            >
+              <Icon name="trash" />
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -317,6 +558,128 @@ function SegmentVerificationBanner({ segment, busy, onApply, onDismiss }) {
   );
 }
 
+const REMEDY_ACTION_LABELS = Object.freeze({
+  resolve_overlap: 'Fix overlap',
+  split_line: 'Wrap line',
+  split_segment: 'Split cue',
+  focus_text: 'Type text',
+  focus_translation: 'Type text',
+  adjust_timing: 'Adjust timing',
+  extend_duration: 'Adjust timing',
+  assign_voice: 'Assign voice',
+  extend_cue: 'Extend cue',
+  extend_and_shift: 'Extend & shift',
+  shift_start_earlier: 'Start earlier',
+  allow_spill: 'Allow spill',
+  trim_clip: 'Trim audio',
+  regenerate_clip: 'Regenerate',
+  remove_clip: 'Remove voice',
+  edit_text: 'Edit text',
+  apply_terminology_spelling: 'Apply spelling',
+  apply_terminology_translation: 'Apply translation term',
+});
+
+function resolveRemedyLabel(issue) {
+  return REMEDY_ACTION_LABELS[issue.remedyAction] || 'Fix';
+}
+
+function MismatchRemedyButtons({ issue, remedies, busy, onTriggerRemedy }) {
+  return (
+    <div className="subtitle-validation-remedies" role="group" aria-label="Duration mismatch remedies">
+      {remedies.map(rem => (
+        <button
+          key={rem.action}
+          type="button"
+          data-remedy-action={rem.action}
+          className="button subtle-button subtitle-validation-fix-btn"
+          title={rem.title}
+          disabled={busy}
+          onClick={() => onTriggerRemedy(issue, rem.action)}
+        >
+          {rem.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ValidationAlertPill({ issue, onTriggerRemedy, busy }) {
+  const isError = issue.severity === 'error';
+  const multiRemedies = issue.type === 'speech_exceeds_interval' && Array.isArray(issue.metadata?.availableRemedies) && issue.metadata.availableRemedies.length > 0
+    ? issue.metadata.availableRemedies : null;
+  const pillClass = `subtitle-validation-pill is-${isError ? 'error' : 'warning'}${multiRemedies ? ' has-multi-remedies' : ''}`;
+  const iconName = isError ? 'alert_circle' : 'warning';
+  return (
+    <div className={pillClass} role={isError ? 'alert' : 'status'} title={issue.remedyHint || issue.message}>
+      <Icon name={iconName} className="subtitle-validation-icon" />
+      <span className="subtitle-validation-msg">{issue.message}</span>
+      {onTriggerRemedy && multiRemedies ? (
+        <MismatchRemedyButtons issue={issue} remedies={multiRemedies} busy={busy} onTriggerRemedy={onTriggerRemedy} />
+      ) : onTriggerRemedy ? (
+        <button type="button" className="button subtle-button subtitle-validation-fix-btn" disabled={busy} onClick={() => onTriggerRemedy(issue)}>
+          {resolveRemedyLabel(issue)}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function SegmentValidationAlerts({ issues = [], onTriggerRemedy, busy = false }) {
+  if (!issues.length) return null;
+  return (
+    <div className="subtitle-segment-validation-alerts" role="group" aria-label="Cue validation issues">
+      {issues.map(issue => (
+        <ValidationAlertPill key={issue.id || issue.type} issue={issue} onTriggerRemedy={onTriggerRemedy} busy={busy} />
+      ))}
+    </div>
+  );
+}
+
+function executeMismatchRemedy(action, issue, context) {
+  const { segment, voiceClip, onExtendToSpeech, onExtendAndShift, onShiftStartEarlier, onAllowSpill, onTrimVoice, onRemoveVoice, onGenerateVoice, textarea } = context;
+  const clipDur = issue.metadata?.clipDuration ?? voiceClip?.durationSeconds ?? 0;
+  if (action === 'extend_cue') return onExtendToSpeech?.(segment.id, clipDur);
+  if (action === 'extend_and_shift') return onExtendAndShift?.(segment.id, clipDur);
+  if (action === 'shift_start_earlier') return onShiftStartEarlier?.(segment.id, clipDur);
+  if (action === 'allow_spill') return onAllowSpill?.(segment.id);
+  if (action === 'trim_clip') return onTrimVoice?.(segment.id, issue.metadata?.remedies?.trimTargetDuration);
+  if (action === 'regenerate_clip') return onGenerateVoice?.(segment);
+  if (action === 'remove_clip') return onRemoveVoice?.(segment.id);
+  if (action === 'edit_text') return textarea?.focus();
+  return undefined;
+}
+
+function executeRemedyAction(issue, actionOverride, context) {
+  const { segment, prevSegment, nextSegment, onUpdateTiming, activeText, onUpdate, useTranslation, onSplit, textarea, onOpenTiming, onAssignVoice, onApplyTerminologySpelling, onApplyTerminologyTranslation } = context;
+  const action = actionOverride || issue.remedyAction;
+  if (action === 'apply_terminology_spelling') return onApplyTerminologySpelling?.(segment.id);
+  if (action === 'apply_terminology_translation') return onApplyTerminologyTranslation?.(segment.id);
+  if (action === 'resolve_overlap') {
+    return handleFixOverlapAction(segment, { prevSegment, nextSegment, conflictingId: issue.metadata?.conflictingSegmentId }, onUpdateTiming);
+  }
+  if (action === 'split_line') {
+    const wrapped = autoBreakLongLine(activeText);
+    return onUpdate?.(segment.id, useTranslation ? { translatedText: wrapped } : { text: wrapped });
+  }
+  if (action === 'split_segment') return onSplit?.(segment.id, computeSplitRatio(textarea, activeText.length));
+  if (action === 'focus_text' || action === 'focus_translation') return textarea?.focus();
+  if (action === 'adjust_timing' || action === 'extend_duration') return onOpenTiming();
+  if (action === 'assign_voice') return onAssignVoice?.(segment.id);
+  return executeMismatchRemedy(action, issue, context);
+}
+
+function resolveRowClass(isActive, isSelected, validationIssues) {
+  const hasError = validationIssues.some(iss => iss.severity === 'error');
+  const hasWarning = !hasError && validationIssues.some(iss => iss.severity === 'warning');
+  return [
+    'subtitle-segment-row',
+    isActive ? 'is-active' : '',
+    isSelected ? 'is-selected' : '',
+    hasError ? 'has-validation-error' : '',
+    hasWarning ? 'has-validation-warning' : '',
+  ].filter(Boolean).join(' ');
+}
+
 /**
  * Renders one editable subtitle cue card with selection checkbox, optional speaker badge, playback sync, timing/split/merge/delete, bilingual reference, Whisper second-opinion suggestion, and inline TTS voice bar.
  * @param {object} props - Segment row props.
@@ -324,6 +687,9 @@ function SegmentVerificationBanner({ segment, busy, onApply, onDismiss }) {
  */
 export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   segment,
+  prevSegment = null,
+  nextSegment = null,
+  mediaDuration = null,
   speakers,
   speakerNames,
   useTranslation = false,
@@ -333,6 +699,8 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   isActive = false,
   isSelected = false,
   canMergeNext = false,
+  validationIssues = [],
+  mismatch = null,
   busy = false,
   voiceClip = null,
   isVoiceStale = false,
@@ -343,6 +711,15 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   onSeek,
   onUpdate,
   onUpdateTiming,
+  onUpdatePause = null,
+  onExtendToSpeech = null,
+  onExtendAndShift = null,
+  onShiftStartEarlier = null,
+  onAllowSpill = null,
+  onRevokeSpill = null,
+  onTrimVoice = null,
+  onUndoTrimVoice = null,
+  onRemoveVoice = null,
   onSplit,
   onMergeNext,
   onDelete,
@@ -351,6 +728,9 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   onGenerateVoice,
   onTogglePlayVoice,
   onDownloadVoice,
+  onAssignVoice = null,
+  onApplyTerminologySpelling = null,
+  onApplyTerminologyTranslation = null,
 }) {
   const rowRef = useRef(null);
   const textareaRef = useRef(null);
@@ -367,14 +747,37 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   const showSourceRef = Boolean(
     useTranslation && segment.text?.trim() && segment.text.trim() !== (segment.translatedText || '').trim()
   );
-  const rowClass = [
-    'subtitle-segment-row',
-    isActive ? 'is-active' : '',
-    isSelected ? 'is-selected' : '',
-  ].filter(Boolean).join(' ');
+  const rowClass = resolveRowClass(isActive, isSelected, validationIssues);
   const targetShortLabel = targetLangMeta?.shortLabel || 'Khmer';
   const isKhmerDisplay = useTranslation ? (targetLangMeta ? Boolean(targetLangMeta.isKhmer) : true) : sourceLanguage === 'km';
   const activeLang = useTranslation ? (targetLangMeta?.bcp47 || 'km') : (sourceLanguage && sourceLanguage !== 'auto' ? sourceLanguage : undefined);
+
+  const handleTriggerRemedy = (issue, actionOverride = '') => {
+    if (!issue) return;
+    executeRemedyAction(issue, actionOverride, {
+      segment,
+      prevSegment,
+      nextSegment,
+      voiceClip,
+      onUpdateTiming,
+      onExtendToSpeech,
+      onExtendAndShift,
+      onShiftStartEarlier,
+      onAllowSpill,
+      onTrimVoice,
+      onRemoveVoice,
+      onGenerateVoice,
+      activeText,
+      onUpdate,
+      useTranslation,
+      onSplit,
+      textarea: textareaRef.current,
+      onOpenTiming: () => setShowTimingEditor(true),
+      onAssignVoice,
+      onApplyTerminologySpelling,
+      onApplyTerminologyTranslation,
+    });
+  };
 
   return (
     <article
@@ -401,7 +804,22 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
         onMergeNext={() => onMergeNext?.(segment.id)}
         onDelete={() => onDelete?.(segment.id)}
       />
-      {showTimingEditor && <TimingInlineEditor segment={segment} busy={busy} onUpdateTiming={onUpdateTiming} />}
+      <SegmentValidationAlerts
+        issues={validationIssues}
+        onTriggerRemedy={handleTriggerRemedy}
+        busy={busy}
+      />
+      {showTimingEditor && (
+        <TimingInlineEditor
+          segment={segment}
+          prevSegment={prevSegment}
+          nextSegment={nextSegment}
+          mediaDuration={mediaDuration}
+          busy={busy}
+          onUpdateTiming={onUpdateTiming}
+          onUpdatePause={onUpdatePause}
+        />
+      )}
       {showSourceRef && <p className="subtitle-source-ref" dir="auto">{segment.text}</p>}
       <textarea
         ref={textareaRef}
@@ -425,6 +843,7 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
       <SegmentVoiceBar
         hasText={Boolean(activeText.trim())}
         voiceClip={voiceClip}
+        mismatch={mismatch}
         isVoiceStale={isVoiceStale}
         isGeneratingVoice={isGeneratingVoice}
         isPlayingVoice={isPlayingVoice}
@@ -432,6 +851,9 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
         onGenerateVoice={onGenerateVoice ? () => onGenerateVoice(segment) : null}
         onTogglePlayVoice={onTogglePlayVoice ? () => onTogglePlayVoice(segment.id) : null}
         onDownloadVoice={onDownloadVoice ? () => onDownloadVoice(segment) : null}
+        onRemoveVoice={onRemoveVoice ? () => onRemoveVoice(segment.id) : null}
+        onRevokeSpill={onRevokeSpill ? () => onRevokeSpill(segment.id) : null}
+        onUndoTrimVoice={onUndoTrimVoice ? () => onUndoTrimVoice(segment.id) : null}
       />
     </article>
   );

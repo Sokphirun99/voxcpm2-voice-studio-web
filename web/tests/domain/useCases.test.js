@@ -10,8 +10,11 @@ import {
 import { segmentSingleSpeakerScript } from '../../src/domain/scriptSegmentation.js';
 import { BUILT_IN_VOICES } from '../../src/domain/voiceLibrary.js';
 import { inspectWavBuffer, readWavDurationSeconds, replaceChunkAndRestitch } from '../../src/domain/wavCodec.js';
+import { createEditableSegment } from '../../src/domain/projectSegments.js';
+import { createSegmentTake } from '../../src/domain/projects.js';
 
 const CHAR_NISA = BUILT_IN_VOICES[0];
+const CHAR_KIRI = BUILT_IN_VOICES[1];
 
 function createMemoryRepository(initialEntries = []) {
   let saved = [...initialEntries];
@@ -646,3 +649,362 @@ test('synthesizeSpeech splits at inline [pause ...] markers without sending lite
   assert.deepEqual(updated.recording.chunks.map(chunk => chunk.pauseAfterMs), [500, 800, null]);
   assert.equal(readWavDurationSeconds(await updated.recording.blob.arrayBuffer()), expectedSeconds);
 });
+
+test('synthesizeSegment synthesizes only target segment and reuses cache semantics', async () => {
+  let gatewayCalls = 0;
+  const calls = [];
+  const rawBlob = makePcmWavBlob(new Array(4800).fill(500));
+  const cacheStore = new Map();
+
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: {
+      async uploadReferenceAudio() { return { path: '/tmp/test.wav' }; },
+      async synthesize(params) {
+        gatewayCalls += 1;
+        calls.push(params);
+        return { blob: rawBlob, seed: 77 };
+      },
+    },
+    synthesisCache: {
+      async computeKey(spec) { return `cache-${spec.characterId}-${spec.text}`; },
+      async getCachedAudio(key) { return cacheStore.get(key) || null; },
+      async putCachedAudio(key, blob, meta) { cacheStore.set(key, { blob, ...meta }); },
+    },
+    seedGenerator: () => 77,
+  });
+
+  // Rejection on empty segment
+  await assert.rejects(
+    () => useCase.synthesizeSegment({ segment: { id: 's1', text: '   ' }, character: CHAR_NISA }),
+    ValidationError
+  );
+
+  // First call: cache miss, synthesizes exactly this segment
+  const res1 = await useCase.synthesizeSegment({
+    segment: { id: 's1', text: 'ជំរាបសួរ' },
+    character: CHAR_NISA,
+    options: { guidance: 2, steps: 10, masterAudio: false },
+  });
+  assert.equal(gatewayCalls, 1);
+  assert.equal(calls[0].text, 'ជំរាបសួរ');
+  assert.equal(res1.recording.fromCache, false);
+  assert.equal(res1.recording.transcript, 'ជំរាបសួរ');
+
+  // Second call with same text: cache hit, zero new gateway calls
+  const res2 = await useCase.synthesizeSegment({
+    segment: { id: 's1', text: 'ជំរាបសួរ' },
+    character: CHAR_NISA,
+    options: { guidance: 2, steps: 10, masterAudio: false },
+  });
+  assert.equal(gatewayCalls, 1); // Not incremented!
+  assert.equal(res2.recording.fromCache, true);
+});
+
+test('restitchSegments validates inputs and rejects empty segments or missing takes', async () => {
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: { async uploadReferenceAudio() {}, async synthesize() {} },
+  });
+
+  // Empty list
+  await assert.rejects(() => useCase.restitchSegments({ segments: [] }), ValidationError);
+
+  // All empty text
+  const emptySeg = createEditableSegment({ id: 's0', text: '   ' });
+  await assert.rejects(() => useCase.restitchSegments({ segments: [emptySeg] }), ValidationError);
+
+  // Missing take on non-empty segment
+  const segNoTake = createEditableSegment({ id: 's1', text: 'អត្ថបទគ្មានថត' });
+  await assert.rejects(() => useCase.restitchSegments({ segments: [segNoTake] }), ValidationError);
+
+  // Take with unresolvable audio
+  const takeNoAudio = createSegmentTake({ id: 't0', duration: 1.0 });
+  const segBadAudio = createEditableSegment({ id: 's2', text: 'អត្ថបទ', takes: [takeNoAudio] });
+  await assert.rejects(() => useCase.restitchSegments({ segments: [segBadAudio] }), SynthesisError);
+});
+
+test('restitchSegments concatenates multiple segment takes with calibrated pauses', async () => {
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: { async uploadReferenceAudio() {}, async synthesize() {} },
+  });
+
+  const blob1 = makePcmWavBlob(new Array(4800).fill(200));
+  const blob2 = makePcmWavBlob(new Array(4800).fill(300));
+  const take1 = createSegmentTake({ id: 't1', duration: 0.1, blob: blob1, isSelected: true });
+  const take2 = createSegmentTake({ id: 't2', duration: 0.1, blob: blob2, isSelected: true });
+
+  const seg1 = createEditableSegment({ id: 's1', text: 'ប្រយោគមួយ', takes: [take1], pauseDuration: 0.25 });
+  const seg2 = createEditableSegment({ id: 's2', text: 'ប្រយោគពីរ', takes: [take2] });
+
+  const result = await useCase.restitchSegments({
+    segments: [seg1, seg2],
+    character: CHAR_NISA,
+    options: { defaultPauseSeconds: 0.15, masterAudio: false },
+  });
+
+  assert.ok(result.recording);
+  assert.equal(result.recording.isRestitched, true);
+  assert.equal(result.recording.isAssembled, true);
+  assert.equal(result.recording.isNarration, true);
+  assert.equal(result.recording.characterId, CHAR_NISA.id);
+  assert.equal(result.recording.transcript, 'ប្រយោគមួយ\nប្រយោគពីរ');
+  assert.equal(result.recording.chunks.length, 2);
+  assert.equal(result.recording.chunks[0].pauseAfterMs, 250);
+  assert.equal(result.recording.chunks[1].pauseAfterMs, 150);
+
+  const stitchedBuffer = await result.recording.blob.arrayBuffer();
+  const info = inspectWavBuffer(stitchedBuffer);
+  assert.equal(info.sampleRate, 48000);
+  assert.ok(info.dataSize > 0);
+
+  const assembleRes = await useCase.assembleAudioNarration({
+    segments: [seg1, seg2],
+    character: CHAR_NISA,
+    projectTitle: 'Episode One',
+  });
+  assert.equal(assembleRes.recording.isAssembled, true);
+  assert.equal(assembleRes.filename, 'episode-one-narration.wav');
+});
+
+test('restitchSegments resolves audioAssetId via assetFetcher and supports mastering', async () => {
+  let masterCalled = false;
+  const audioMaster = {
+    async masterWav(blob) {
+      masterCalled = true;
+      return { blob, mastered: true };
+    },
+  };
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: { async uploadReferenceAudio() {}, async synthesize() {} },
+    audioMaster,
+  });
+
+  const rawBytes = new Uint8Array(await makePcmWavBlob(new Array(4800).fill(400)).arrayBuffer());
+  const assetId = '12345678-1234-4234-8234-123456789abc';
+  const assetFetcher = async id => (id === assetId ? { bytes: rawBytes } : null);
+
+  const take = createSegmentTake({ id: 't-asset', duration: 0.1, audioAssetId: assetId, isSelected: true });
+  const seg = createEditableSegment({ id: 's-asset', text: 'ថតតាម asset', takes: [take] });
+
+  const result = await useCase.restitchSegments({
+    segments: [seg],
+    character: CHAR_NISA,
+    assetFetcher,
+    options: { masterAudio: true },
+  });
+
+  assert.ok(result.recording);
+  assert.equal(masterCalled, true);
+  assert.equal(result.recording.mastered, true);
+});
+
+test('synthesizeMultiSpeaker rejects empty or invalid segment lists', async () => {
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: { async uploadReferenceAudio() {}, async synthesize() {} },
+  });
+
+  await assert.rejects(() => useCase.synthesizeMultiSpeaker({ segments: [] }), ValidationError);
+  await assert.rejects(
+    () => useCase.synthesizeMultiSpeaker({ segments: [createEditableSegment({ id: 's1', text: '   ' })] }),
+    ValidationError
+  );
+});
+
+test('synthesizeMultiSpeaker generates multi-character audio with isolated anchors and seeds', async () => {
+  const synthesizeCalls = [];
+  const uploadCalls = [];
+
+  const speechGateway = {
+    async uploadReferenceAudio(params) {
+      uploadCalls.push(params);
+      return { path: `/tmp/${params.characterId}.wav`, meta: { _type: 'gradio.FileData' } };
+    },
+    async synthesize(params) {
+      synthesizeCalls.push(params);
+      const samples = params.text.includes('នីសា') ? new Array(4800).fill(111) : new Array(4800).fill(222);
+      return {
+        blob: makePcmWavBlob(samples),
+        duration: 0.1,
+        seed: params.seed ?? 1234,
+      };
+    },
+  };
+
+  const useCase = createSynthesizeSpeechUseCase({ speechGateway });
+
+  const anchorNisa = {
+    characterId: CHAR_NISA.id,
+    blob: makePcmWavBlob([1, 2]),
+    transcript: 'គំរូនីសា',
+    revision: 1,
+  };
+  const anchorKiri = {
+    characterId: CHAR_KIRI.id,
+    blob: makePcmWavBlob([3, 4]),
+    transcript: 'គំរូគីរី',
+    revision: 2,
+  };
+
+  const seg1 = createEditableSegment({
+    id: 's-nisa',
+    text: 'ជំរាបសួរពីនីសា',
+    voiceId: CHAR_NISA.id,
+    pauseDuration: 0.2,
+  });
+  const seg2 = createEditableSegment({
+    id: 's-kiri',
+    text: 'សួស្តីពីគីរី',
+    voiceId: CHAR_KIRI.id,
+    pauseDuration: 0.15,
+  });
+
+  const progressUpdates = [];
+  const result = await useCase.synthesizeMultiSpeaker({
+    segments: [seg1, seg2],
+    characters: [CHAR_NISA, CHAR_KIRI],
+    anchors: { [CHAR_NISA.id]: anchorNisa, [CHAR_KIRI.id]: anchorKiri },
+    options: { ditSteps: 8, seed: 9999 },
+    onProgress: p => progressUpdates.push(p),
+  });
+
+  assert.equal(synthesizeCalls.length, 2);
+  assert.equal(uploadCalls.length, 2);
+  assert.equal(synthesizeCalls[0].text, 'ជំរាបសួរពីនីសា');
+  assert.equal(synthesizeCalls[1].text, 'សួស្តីពីគីរី');
+
+  assert.ok(result.recording);
+  assert.equal(result.recording.isMultiSpeaker, true);
+  assert.equal(result.recording.characterId, 'multi-speaker');
+  assert.equal(result.recording.characterName, 'Multiple speakers');
+  assert.equal(result.recording.chunks.length, 2);
+  assert.equal(result.recording.chunks[0].voiceId, CHAR_NISA.id);
+  assert.equal(result.recording.chunks[0].speakerName, CHAR_NISA.name);
+  assert.equal(result.recording.chunks[1].voiceId, CHAR_KIRI.id);
+  assert.equal(result.recording.chunks[1].speakerName, CHAR_KIRI.name);
+
+  assert.equal(result.segmentResults.length, 2);
+  assert.equal(result.segmentResults[0].segmentId, 's-nisa');
+  assert.equal(result.segmentResults[0].recording.characterId, CHAR_NISA.id);
+  assert.equal(result.segmentResults[1].segmentId, 's-kiri');
+  assert.equal(result.segmentResults[1].recording.characterId, CHAR_KIRI.id);
+
+  assert.ok(progressUpdates.length >= 2);
+  assert.ok(progressUpdates.some(p => p.stage === 'synthesizing_segment'));
+});
+
+test('restitchSegments detects multi-speaker script and marks recording accordingly', async () => {
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway: { async uploadReferenceAudio() {}, async synthesize() {} },
+  });
+
+  const blob1 = makePcmWavBlob(new Array(4800).fill(100));
+  const blob2 = makePcmWavBlob(new Array(4800).fill(200));
+  const take1 = createSegmentTake({ id: 't1', duration: 0.1, blob: blob1, isSelected: true });
+  const take2 = createSegmentTake({ id: 't2', duration: 0.1, blob: blob2, isSelected: true });
+
+  const seg1 = createEditableSegment({
+    id: 's1',
+    text: 'Sentence 1',
+    voiceId: CHAR_NISA.id,
+    speakerName: CHAR_NISA.name,
+    takes: [take1],
+  });
+  const seg2 = createEditableSegment({
+    id: 's2',
+    text: 'Sentence 2',
+    voiceId: CHAR_KIRI.id,
+    speakerName: CHAR_KIRI.name,
+    takes: [take2],
+  });
+
+  const result = await useCase.restitchSegments({
+    segments: [seg1, seg2],
+    options: { defaultPauseSeconds: 0.1 },
+  });
+
+  assert.ok(result.recording);
+  assert.equal(result.recording.isMultiSpeaker, true);
+  assert.equal(result.recording.characterId, 'multi-speaker');
+  assert.equal(result.recording.characterName, 'Multiple speakers');
+  assert.equal(result.recording.chunks.length, 2);
+  assert.equal(result.recording.chunks[0].voiceId, CHAR_NISA.id);
+  assert.equal(result.recording.chunks[0].speakerName, CHAR_NISA.name);
+  assert.equal(result.recording.chunks[1].voiceId, CHAR_KIRI.id);
+  assert.equal(result.recording.chunks[1].speakerName, CHAR_KIRI.name);
+});
+
+test('createSynthesizeSpeechUseCase applies approved Stage 3 terminology with project overrides without mixing stages', async () => {
+  const spokenCalls = [];
+  const speechGateway = {
+    async uploadReferenceAudio() { return null; },
+    async synthesize(params) {
+      spokenCalls.push(params.text);
+      return { blob: makePcmWavBlob(new Array(4800).fill(123)), duration: 0.1, seed: params.seed ?? 42 };
+    },
+  };
+  const terminologyRepository = {
+    async loadTerms() {
+      return [
+        { id: 'spell-1', category: 'spelling', status: 'approved', enabled: true, term: 'Phnom Penh', variants: ['Pnom Penh'] },
+        { id: 'tr-1', category: 'translation', status: 'approved', enabled: true, term: 'Hello', translation: 'សួស្តី', targetLanguage: 'khm_Khmr' },
+        { id: 'name-1', category: 'name', status: 'approved', enabled: true, term: 'VoxCPM', pronunciation: 'វ៉ុកស៊ីភីអឹម' },
+        { id: 'pron-draft', category: 'pronunciation', status: 'draft', enabled: true, term: 'TTS', pronunciation: 'ថេកស៍ធូស្ពីច' },
+      ];
+    },
+  };
+  const glossaryRepository = {
+    async loadRules() {
+      return [
+        { id: 'leg-1', source: 'VoxCPM', replacement: 'legacy-vox', enabled: true },
+        { id: 'leg-2', source: 'Khmer', replacement: 'ខ្មែរ', enabled: true },
+      ];
+    },
+  };
+
+  const useCase = createSynthesizeSpeechUseCase({
+    speechGateway,
+    glossaryRepository,
+    terminologyRepository,
+    seedGenerator: () => 42,
+  });
+
+  // Global terminology + legacy fallback: terminology wins on VoxCPM; spelling & translation NEVER fire in TTS; draft ignored
+  await useCase.execute({
+    script: 'Hello Pnom Penh via VoxCPM TTS in Khmer',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 8,
+  });
+  assert.equal(spokenCalls[0], 'Hello Pnom Penh via វ៉ុកស៊ីភីអឹម TTS in ខ្មែរ');
+
+  // Per-project override changes VoxCPM pronunciation exclusively for that call
+  await useCase.execute({
+    script: 'Hello VoxCPM in Khmer',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 8,
+    projectTerminology: {
+      overrides: {
+        'name-1': { pronunciation: 'វ៉ុក-ស្ទូឌីយោ' },
+      },
+      projectTerms: [
+        { id: 'proj-p', category: 'pronunciation', status: 'approved', term: 'TTS', pronunciation: 'ធីធីអេស' },
+      ],
+    },
+  });
+  assert.equal(spokenCalls[1], 'Hello វ៉ុក-ស្ទូឌីយោ in ខ្មែរ');
+  assert.equal(spokenCalls[1].includes('សួស្តី'), false);
+
+  // Disabled global name override restores normal name utterance
+  await useCase.execute({
+    script: 'VoxCPM runs TTS',
+    character: CHAR_NISA,
+    guidance: 2,
+    steps: 8,
+    projectTerminology: {
+      overrides: { 'name-1': { disabled: true } },
+      projectTerms: [{ id: 'proj-p', category: 'pronunciation', status: 'approved', term: 'TTS', pronunciation: 'ធីធីអេស' }],
+    },
+  });
+  assert.equal(spokenCalls[2], 'VoxCPM runs ធីធីអេស');
+});
+

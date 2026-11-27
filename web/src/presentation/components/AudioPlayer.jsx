@@ -280,15 +280,57 @@ function TakeHistoryPills({ takes, activeTakeId, onSelectTake, onDeleteTake }) {
   );
 }
 
+function resolveNarrationDownloadName(recording) {
+  if (recording?.filename) return recording.filename;
+  if (recording?.isAssembled || recording?.isRestitched) return 'voxcpm2-assembled-narration.wav';
+  if (recording?.isMultiSpeaker) return 'voxcpm2-multi-speaker.wav';
+  if (recording?.seed != null) return `voxcpm2-${recording.seed}.wav`;
+  return 'voxcpm2.wav';
+}
+
+function PlaybackActionButtons({ media, recording, activeCharacter, activeAnchor, verification, onPinTake, onDownload }) {
+  const downloadName = resolveNarrationDownloadName(recording);
+  const downloadLabel = recording?.isAssembled ? 'Export Narration' : 'Download WAV';
+  const downloadTitle = recording?.isAssembled ? 'Export complete assembled narration WAV' : 'Download WAV';
+  const pin = resolvePinControlState({ recording, activeCharacter, activeAnchor });
+  const canVerify = Boolean(verification?.canVerify && verification?.onVerify);
+  const handleDownloadClick = () => {
+    if (!media.url || !onDownload) return;
+    onDownload({
+      recording,
+      filename: downloadName,
+      durationSeconds: recording?.audioDurationSeconds ?? recording?.duration ?? (media.duration > 0 ? media.duration : null),
+    });
+  };
+  return (
+    <div className="player-actions">
+      {verification?.onVerify && (
+        <button type="button" className="button subtle-button verify-button" id="verify-speech-btn"
+          disabled={!canVerify || verification.checking} aria-busy={verification.checking || undefined}
+          title="Double-check spoken Khmer words using Whisper" onClick={verification.onVerify}>
+          <Icon name="check_circle" /><span>{verification.checking ? 'Checking…' : 'Check words'}</span>
+        </button>
+      )}
+      <button type="button" className={pin.isLocked ? 'button lock-button is-locked' : 'button lock-button'}
+        id="lock-voice" disabled={pin.disabled} aria-pressed={pin.isLocked} onClick={onPinTake} title={pin.title}>
+        <Icon name="lock" /><span>{pin.label}</span>
+      </button>
+      <a className="button download-button" id="download" href={media.url || undefined}
+        download={downloadName} aria-disabled={media.url ? undefined : true} title={downloadTitle}
+        onClick={handleDownloadClick}>
+        <Icon name="arrow_down_to_line" /><span>{downloadLabel}</span>
+      </a>
+    </div>
+  );
+}
+
 /**
  * Renders play/pause, waveform scrubber, optional Whisper word-check button, character voice-pin button, and WAV download link.
  * @param {object} props - Controls props.
  * @returns {React.ReactElement} Player controls row.
  */
-function PlaybackControls({ media, recording, activeCharacter, activeAnchor, verification, onTogglePlay, onSeek, onPinTake }) {
-  const downloadName = recording?.seed != null ? `voxcpm2-${recording.seed}.wav` : 'voxcpm2.wav';
-  const pin = resolvePinControlState({ recording, activeCharacter, activeAnchor });
-  const canVerify = Boolean(verification?.canVerify && verification?.onVerify);
+function PlaybackControls(props) {
+  const { media, onTogglePlay, onSeek } = props;
   return (
     <div className="player">
       <button type="button" className="button play-button" id="play"
@@ -296,23 +338,7 @@ function PlaybackControls({ media, recording, activeCharacter, activeAnchor, ver
         <Icon name={media.playing ? 'pause_fill' : 'play_fill'} />
       </button>
       <AudioTrackBar media={media} onSeek={onSeek} />
-      <div className="player-actions">
-        {verification?.onVerify && (
-          <button type="button" className="button subtle-button verify-button" id="verify-speech-btn"
-            disabled={!canVerify || verification.checking} aria-busy={verification.checking || undefined}
-            title="Double-check spoken Khmer words using Whisper" onClick={verification.onVerify}>
-            <Icon name="check_circle" /><span>{verification.checking ? 'Checking…' : 'Check words'}</span>
-          </button>
-        )}
-        <button type="button" className={pin.isLocked ? 'button lock-button is-locked' : 'button lock-button'}
-          id="lock-voice" disabled={pin.disabled} aria-pressed={pin.isLocked} onClick={onPinTake} title={pin.title}>
-          <Icon name="lock" /><span>{pin.label}</span>
-        </button>
-        <a className="button download-button" id="download" href={media.url || undefined}
-          download={downloadName} aria-disabled={media.url ? undefined : true}>
-          <Icon name="arrow_down_to_line" /><span>Download WAV</span>
-        </a>
-      </div>
+      <PlaybackActionButtons {...props} />
     </div>
   );
 }
@@ -386,15 +412,19 @@ function reportAudioElementError({ event, url, logger, setMedia, onPlaybackError
  * @param {{ audioRef: React.RefObject<HTMLAudioElement|null>, url: string|null, logger: import('../../domain/ports.js').LoggerPort, setMedia: Function, onPlaybackError: () => void }} props - Media element props.
  * @returns {React.ReactElement} Keyed `<audio>` element.
  */
-function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError }) {
+function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError, onPlay }) {
   const syncDuration = event => syncAudioDurationFromEvent(event, setMedia);
   const syncSeconds = event => syncAudioSecondsFromEvent(event, setMedia);
   const handleError = event => reportAudioElementError({ event, url, logger, setMedia, onPlaybackError });
+  const handlePlay = () => {
+    setMedia(previous => ({ ...previous, playing: true }));
+    onPlay?.();
+  };
   return (
     <audio key={url || 'empty'} id="audio" ref={audioRef} src={url || undefined} preload="auto"
       onLoadedMetadata={syncDuration} onDurationChange={syncDuration} onLoadedData={syncDuration} onCanPlay={syncDuration}
       onTimeUpdate={syncSeconds}
-      onPlay={() => setMedia(previous => ({ ...previous, playing: true }))}
+      onPlay={handlePlay}
       onPause={() => setMedia(previous => ({ ...previous, playing: false }))}
       onEnded={() => setMedia(previous => ({ ...previous, playing: false, seconds: 0 }))}
       onError={handleError} />
@@ -403,14 +433,14 @@ function PlaybackAudioElement({ audioRef, url, logger, setMedia, onPlaybackError
 
 /**
  * Renders the playback dock with status line, play/pause toggle, waveform scrubber, take A/B pills, character lock, and WAV download.
- * Inputs: `{ recording, takes, activeTakeId, activeCharacter, activeAnchor, status, onPinTake, onSelectTake, onDeleteTake, onPlaybackError }`.
+ * Inputs: `{ recording, takes, activeTakeId, activeCharacter, activeAnchor, status, onPinTake, onSelectTake, onDeleteTake, onPlaybackError, onAudioPlay }`.
  * Outputs: `<section className="playback">` element.
  * Side effects: mounts a fresh `<audio>` per recording URL, tracks playback timing, and delegates decoding to `useRecordingMedia`.
  * Failure modes: calls `onPlaybackError` if `<audio>` fails to load or `play()` rejects.
  * @param {object} props - Player props.
  * @returns {React.ReactElement} Audio player dock.
  */
-export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError }) {
+export function AudioPlayer({ recording, takes = [], activeTakeId = null, activeCharacter, activeAnchor, status, busyMeta = null, verification = null, onPinTake, onSelectTake, onDeleteTake, onPlaybackError, onAudioPlay, onDownload = null }) {
   const { logger } = useStudioServices();
   const audio = useRef(null);
   const [media, setMedia] = useRecordingMedia(recording);
@@ -428,12 +458,12 @@ export function AudioPlayer({ recording, takes = [], activeTakeId = null, active
     <section className="playback" data-has-audio={media.url ? 'true' : 'false'} aria-labelledby="playback-title">
       <PlaybackInfo status={status} busyMeta={busyMeta} />
       <PlaybackControls media={media} recording={recording} activeCharacter={activeCharacter}
-        activeAnchor={activeAnchor} verification={verification} onSeek={handleSeek} onPinTake={onPinTake}
+        activeAnchor={activeAnchor} verification={verification} onSeek={handleSeek} onPinTake={onPinTake} onDownload={onDownload}
         onTogglePlay={() => void toggleAudioElement({ element: audio.current, logger, onPlaybackError })} />
       <TakeHistoryPills takes={takes} activeTakeId={activeTakeId || recording?.id || null}
         onSelectTake={onSelectTake} onDeleteTake={onDeleteTake} />
       <SpeechVerificationPanel verification={verification} />
-      <PlaybackAudioElement audioRef={audio} url={media.url} logger={logger} setMedia={setMedia} onPlaybackError={onPlaybackError} />
+      <PlaybackAudioElement audioRef={audio} url={media.url} logger={logger} setMedia={setMedia} onPlaybackError={onPlaybackError} onPlay={onAudioPlay} />
     </section>
   );
 }

@@ -35,12 +35,12 @@ function PronunciationRuleRow({ row, position, disabled, onChange, onRemove }) {
  * Outputs: `<div className="pronunciation">` or null when no repository is injected.
  * Side effects: loads and saves the dictionary through the injected repository.
  * Failure modes: shows validation/storage errors inline without losing the draft.
- * @param {{ glossaryRepository: object|null, disabled?: boolean }} props - Control props.
+ * @param {{ glossaryRepository: object|null, disabled?: boolean, onSaved?: Function }} props - Control props.
  * @returns {React.ReactElement|null} Pronunciation rules control.
  */
-export function PronunciationRulesControl({ glossaryRepository, disabled = false }) {
+export function PronunciationRulesControl({ glossaryRepository, disabled = false, onSaved = null }) {
   const [isOpen, setIsOpen] = useState(false);
-  const editor = usePronunciationRules(glossaryRepository);
+  const editor = usePronunciationRules(glossaryRepository, { onSaved });
   if (!glossaryRepository) return null;
   const count = editor.savedCount > 0 ? ` (${editor.savedCount})` : '';
   return (

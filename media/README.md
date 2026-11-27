@@ -4,8 +4,10 @@ Local Apple Silicon FastAPI service (port `8810`) powering the **Video to subtit
 
 - **Speech-to-text & Khmer verification**: Hybrid ASR ([`asr.py`](./asr.py), [`khmer_verifier.py`](./khmer_verifier.py)) routing Khmer to `seanghay/Qwen3-ASR-0.6B-Khmer` (+ 3-layer local Khmer lexicon in [`khmer_dictionary.py`](./khmer_dictionary.py) & [`lexicon/`](./lexicon/)), with automatic selective recovery on broken turns, optional full subtitle double-check, and TTS round-trip word QA (`POST /verify-speech`) via `seanghay/whisper-small-khmer-v2`; other languages use `mlx-community/whisper-large-v3-turbo`.
 - **Speaker diarization**: Optional offline `sherpa-onnx` pipeline ([`diarizer.py`](./diarizer.py)) with adaptive RMS energy VAD fallback when disabled.
-- **Offline translation**: Meta `facebook/nllb-200-distilled-600M` ([`translator.py`](./translator.py)) with source/output repetition guards and beam search.
-- **Subtitle export & burn-in**: Grapheme/Khmer-cluster-safe ASS/SRT/VTT generation ([`subtitles.py`](./subtitles.py)) and `ffmpeg-full` (`libass`) MP4 rendering ([`video_io.py`](./video_io.py)).
+- **Offline translation**: Meta `facebook/nllb-200-distilled-600M` ([`translator.py`](./translator.py)) with source/output repetition guards, beam search, and stage-separated terminology preservation ([`terminology.py`](./terminology.py)).
+- **Subtitle export, burn-in & video dubbing**: Grapheme/Khmer-cluster-safe ASS/SRT/VTT generation ([`subtitles.py`](./subtitles.py)) and `ffmpeg-full` MP4 export ([`video_io.py`](./video_io.py)):
+  - `POST /burn`: hard-coded `libass` ASS subtitles (`yuv420p`, AAC `48 kHz` stereo, `+faststart`).
+  - `POST /dub`: time-aligned dubbed MP4 export with explicit audio modes (`original`, `replace`/`mute`, `duck`, `keep`/`mix`), mixing/ducking gain controls (`originalVolume`, `dubVolume`, `duckVolume`), and explicit subtitle modes (`none`, `burned` ASS, `soft` MP4 `mov_text` track with ISO-639-2 language metadata).
 
 ## Prerequisites (macOS Apple Silicon)
 

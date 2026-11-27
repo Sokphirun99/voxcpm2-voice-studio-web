@@ -1,13 +1,31 @@
 /**
- * @fileoverview Pure domain helpers for per-frame and selected-batch subtitle Text-to-Speech generation and WAV stitching.
+ * @fileoverview Pure domain helpers for per-frame and selected-batch subtitle Text-to-Speech generation, timeline alignment, and WAV stitching.
  */
 
+import { SynthesisError } from './errors.js';
+import { createSegmentTake } from './projects.js';
+import { assertMatchingWaveFormats, assertPcmFormat } from './audioAssembly.js';
+import {
+  DURATION_MISMATCH_TOLERANCE_SEC,
+  assertNoUnresolvedDurationMismatches,
+  detectDurationMismatches,
+  isSpillApprovalValid,
+} from './durationMismatch.js';
 import { DEFAULT_STEPS, STYLE_MODES } from './presets.js';
 import { pickSegmentText } from './subtitles.js';
-import { concatenateWavBlobs, ensureAudioWavBlob } from './wavCodec.js';
+import {
+  applyBoundaryMicroFades,
+  buildWaveHeader,
+  concatenateWavBlobs,
+  ensureAudioWavBlob,
+  inspectWavBuffer,
+  prepareCleanPcmSlice,
+} from './wavCodec.js';
 
 export const DEFAULT_SUBTITLE_TTS_GUIDANCE = 2;
 export const DEFAULT_SUBTITLE_TTS_STEPS = DEFAULT_STEPS;
+export const DEFAULT_ALIGNED_FADE_MS = 5;
+export const DEFAULT_TIME_ALIGNED_SUFFIX = '-time-aligned-dub';
 export const SUBTITLE_VOICEOVER_GAP_OPTIONS = Object.freeze([
   Object.freeze({ ms: 100, label: '0.1s' }),
   Object.freeze({ ms: 200, label: '0.2s' }),
@@ -100,15 +118,16 @@ export function resolveSubtitleSpeechText(segment, useTranslation = false) {
 
 /**
  * Computes a stable cache/staleness signature for a generated subtitle voice clip.
- * Inputs: `{ text, characterId, anchorTag }`.
+ * Inputs: `{ text, characterId, anchorTag, pronunciationTag }`.
  * Outputs: canonical signature string.
  * Side effects: none.
  * Failure modes: coerces missing fields safely to empty strings.
- * @param {{ text?: string, characterId?: string, anchorTag?: string }} [spec] - Signature inputs.
+ * @param {{ text?: string, characterId?: string, anchorTag?: string, pronunciationTag?: string }} [spec] - Signature inputs.
  * @returns {string} Signature string.
  */
-export function buildSubtitleSpeechSignature({ text = '', characterId = '', anchorTag = '' } = {}) {
-  return `${characterId}\0${anchorTag}\0${String(text).trim()}`;
+export function buildSubtitleSpeechSignature({ text = '', characterId = '', anchorTag = '', pronunciationTag = '' } = {}) {
+  const base = `${characterId}\0${anchorTag}\0${String(text).trim()}`;
+  return pronunciationTag ? `${base}\0${pronunciationTag}` : base;
 }
 
 /**
@@ -130,17 +149,17 @@ export function selectOrderedSegments(segments, selectedIds) {
 
 /**
  * Builds the `synthesizeSpeech.execute` command payload for a subtitle frame.
- * Inputs: `{ text, character, anchor, cachedUpload, seed }`.
+ * Inputs: `{ text, character, anchor, cachedUpload, seed, pronunciationRules, terminology, sourceLanguage }`.
  * Outputs: synthesis command object compatible with `createSynthesizeSpeechUseCase`.
  * Side effects: none.
  * Failure modes: returns a command object with safe defaults; validation occurs in `validateGenerationInput`.
- * @param {{ text: string, character: object, anchor?: object|null, cachedUpload?: object|null, seed?: number|string|null }} params - Synthesis spec.
+ * @param {{ text: string, character: object, anchor?: object|null, cachedUpload?: object|null, seed?: number|string|null, pronunciationRules?: Array<object>, terminology?: Array<object>, sourceLanguage?: string }} params - Synthesis spec.
  * @returns {object} Synthesis command payload.
  */
-export function buildSubtitleSynthesisCommand({ text, character, anchor = null, cachedUpload = null, seed = '' }) {
+export function buildSubtitleSynthesisCommand({ text, character, anchor = null, cachedUpload = null, seed = '', pronunciationRules, terminology, sourceLanguage }) {
   const cleanText = String(text || '').trim();
   const effectiveSeed = seed != null && seed !== '' ? seed : (!anchor && character?.defaultSeed != null ? character.defaultSeed : '');
-  return {
+  const command = {
     script: cleanText,
     character,
     anchor,
@@ -154,6 +173,10 @@ export function buildSubtitleSynthesisCommand({ text, character, anchor = null, 
     denoiseReference: false,
     masterAudio: true,
   };
+  if (Array.isArray(pronunciationRules)) command.pronunciationRules = pronunciationRules;
+  if (Array.isArray(terminology)) command.terminology = terminology;
+  if (sourceLanguage) command.sourceLanguage = sourceLanguage;
+  return command;
 }
 
 /**
@@ -187,25 +210,44 @@ export function buildVoiceoverDownloadFilename(videoFile, suffix = '-voiceover')
   return `${stem}${suffix}.wav`;
 }
 
+function resolveDubSpillConfig(spillOrOptions) {
+  if (!spillOrOptions || typeof spillOrOptions !== 'object') return { spillApprovals: {}, mediaDuration: 0 };
+  if ('spillApprovals' in spillOrOptions || 'mediaDuration' in spillOrOptions) {
+    return {
+      spillApprovals: spillOrOptions.spillApprovals || {},
+      mediaDuration: Number(spillOrOptions.mediaDuration) || 0,
+    };
+  }
+  return { spillApprovals: spillOrOptions, mediaDuration: 0 };
+}
+
 /**
  * Collects time-aligned WAV clips for dubbed MP4 export, respecting selected frames when any selected frame has audio.
- * Inputs: ordered `segments`, `selectedIds`, and `segmentClips` map.
- * Outputs: ordered array of `{ segmentId, start, end, blob }`.
+ * Inputs: ordered `segments`, `selectedIds`, `segmentClips` map, and optional `spillOrOptions` (`spillApprovals` or `{ spillApprovals, mediaDuration }`).
+ * Outputs: ordered array of `{ segmentId, start, end, blob, allowOverflow? }`.
  * Side effects: none.
  * Failure modes: returns `[]` when no matching segments have generated audio blobs.
  * @param {Array<{ id: string, start?: number, end?: number }>} segments - Timeline subtitle segments.
  * @param {Iterable<string>|null|undefined} selectedIds - Active selection IDs.
  * @param {Record<string, { blob?: Blob }>} segmentClips - Generated clip records keyed by segment ID.
- * @returns {Array<{ segmentId: string, start: number, end: number, blob: Blob }>} Ordered dub clips.
+ * @param {Record<string, object>|{ spillApprovals?: Record<string, object>, mediaDuration?: number }} [spillOrOptions] - Spill approvals or options.
+ * @returns {Array<{ segmentId: string, start: number, end: number, blob: Blob, allowOverflow?: boolean }>} Ordered dub clips.
  */
-export function buildDubExportClips(segments, selectedIds, segmentClips) {
+export function buildDubExportClips(segments, selectedIds, segmentClips, spillOrOptions = {}) {
   if (!Array.isArray(segments) || !segments.length || !segmentClips) return [];
+  const { spillApprovals, mediaDuration } = resolveDubSpillConfig(spillOrOptions);
   const selected = selectOrderedSegments(segments, selectedIds).filter(seg => Boolean(segmentClips[seg.id]?.blob));
   const matched = selected.length > 0 ? selected : segments.filter(seg => Boolean(segmentClips[seg.id]?.blob));
+  const indexById = new Map(segments.map((seg, i) => [seg.id, i]));
   return matched.map(seg => {
     const start = Number.isFinite(Number(seg.start)) ? Math.max(0, Number(seg.start)) : 0;
     const rawEnd = Number.isFinite(Number(seg.end)) ? Number(seg.end) : start;
-    return { segmentId: seg.id, start, end: Math.max(start, rawEnd), blob: segmentClips[seg.id].blob };
+    const idx = indexById.get(seg.id) ?? -1;
+    const nextSeg = idx >= 0 && idx < segments.length - 1 ? segments[idx + 1] : null;
+    const allowOverflow = isSpillApprovalValid(spillApprovals?.[seg.id], {
+      segment: seg, clip: segmentClips[seg.id], nextSegment: nextSeg, mediaDuration,
+    });
+    return { segmentId: seg.id, start, end: Math.max(start, rawEnd), blob: segmentClips[seg.id].blob, ...(allowOverflow ? { allowOverflow: true } : {}) };
   });
 }
 
@@ -221,4 +263,326 @@ export function buildDubExportClips(segments, selectedIds, segmentClips) {
 export function buildDubDownloadFilename(videoFile) {
   const stem = String(videoFile?.name || 'subtitle').replace(/\.[^.]+$/, '') || 'subtitle';
   return `${stem}-dubbed.mp4`;
+}
+
+/**
+ * Derives a clean time-aligned dub `.wav` export filename from the active video file.
+ * Inputs: optional `videoFile` and filename `suffix`.
+ * Outputs: sanitized filename ending in `.wav`.
+ * Side effects: none.
+ * Failure modes: falls back to `subtitle` stem when filename is unavailable.
+ * @param {{ name?: string }|null|undefined} videoFile - Source media file.
+ * @param {string} [suffix='-time-aligned-dub'] - Descriptive suffix appended before `.wav`.
+ * @returns {string} Export filename ending in `.wav`.
+ */
+export function buildTimeAlignedDubDownloadFilename(videoFile, suffix = DEFAULT_TIME_ALIGNED_SUFFIX) {
+  return buildVoiceoverDownloadFilename(videoFile, suffix);
+}
+
+function filterAndOrderTargetClips(segments, selectedIds, segmentClips) {
+  if (!Array.isArray(segments) || !segments.length || !segmentClips) return [];
+  const selected = selectOrderedSegments(segments, selectedIds).filter(s => Boolean(segmentClips[s.id]?.blob));
+  const pool = selected.length > 0 ? selected : segments.filter(s => Boolean(segmentClips[s.id]?.blob));
+  return pool
+    .map(s => {
+      const start = Number.isFinite(Number(s.start)) ? Math.max(0, Number(s.start)) : 0;
+      const rawEnd = Number.isFinite(Number(s.end)) ? Number(s.end) : start;
+      return { id: s.id, start, end: Math.max(start, rawEnd), blob: segmentClips[s.id].blob };
+    })
+    .sort((a, b) => a.start - b.start);
+}
+
+async function decodeAlignmentClip(item, index, baseInfo, expectedSampleRate) {
+  const buffer = await item.blob.arrayBuffer();
+  const info = inspectWavBuffer(buffer);
+  assertPcmFormat(info, index);
+  if (expectedSampleRate && info.sampleRate !== expectedSampleRate) {
+    throw new SynthesisError(
+      `Segment #${index + 1} has mismatched sample rate: expected ${expectedSampleRate} Hz, received ${info.sampleRate} Hz.`,
+      { code: 'WAV_FORMAT_MISMATCH' }
+    );
+  }
+  if (baseInfo) assertMatchingWaveFormats(baseInfo, info, index);
+  const pcm = prepareCleanPcmSlice(buffer, info);
+  return { ...item, info, pcm };
+}
+
+async function decodeTargetClips(targets, sampleRate) {
+  const decoded = [];
+  for (let i = 0; i < targets.length; i++) {
+    const baseInfo = i > 0 ? decoded[0].info : null;
+    decoded.push(await decodeAlignmentClip(targets[i], i, baseInfo, sampleRate));
+  }
+  return decoded;
+}
+
+function resolveNextBoundaryFrame(index, ordered, totalDuration, sampleRate) {
+  if (index < ordered.length - 1) {
+    return Math.round(ordered[index + 1].start * sampleRate);
+  }
+  if (Number.isFinite(totalDuration) && totalDuration > 0) {
+    return Math.round(totalDuration * sampleRate);
+  }
+  return Infinity;
+}
+
+function placeClipWithinWindow(spec) {
+  const { clipPcm, targetStartFrame, boundaryFrame, baseInfo } = spec;
+  const clipFrames = Math.floor(clipPcm.byteLength / baseInfo.blockAlign);
+  const maxAvailableFrames = Math.max(0, boundaryFrame - targetStartFrame);
+  if (clipFrames <= maxAvailableFrames) {
+    return { pcm: clipPcm, placedFrames: clipFrames, clamped: false, requestedFrames: clipFrames };
+  }
+  const clampedBytes = new Uint8Array(clipPcm.slice(0, maxAvailableFrames * baseInfo.blockAlign));
+  applyBoundaryMicroFades(clampedBytes, baseInfo, DEFAULT_ALIGNED_FADE_MS);
+  return { pcm: clampedBytes, placedFrames: maxAvailableFrames, clamped: true, requestedFrames: clipFrames };
+}
+
+function createClampedWarning(item, requestedFrames, maxFrames, sampleRate) {
+  const requestedSec = requestedFrames / sampleRate;
+  const maxSec = maxFrames / sampleRate;
+  return {
+    segmentId: item.id,
+    requestedDuration: requestedSec,
+    maxDuration: maxSec,
+    message: `Clip for cue #${item.id} (${requestedSec.toFixed(2)}s) exceeded window (${maxSec.toFixed(2)}s); clamped with micro-fade.`,
+  };
+}
+
+function assembleAlignedTrackFrames(decoded, totalDuration, baseInfo) {
+  const { sampleRate, blockAlign } = baseInfo;
+  const parts = [];
+  const warnings = [];
+  let currentFrame = 0;
+  for (let i = 0; i < decoded.length; i++) {
+    const item = decoded[i];
+    const startFrame = Math.round(item.start * sampleRate);
+    if (startFrame > currentFrame) {
+      parts.push(new Uint8Array((startFrame - currentFrame) * blockAlign));
+      currentFrame = startFrame;
+    }
+    const boundary = resolveNextBoundaryFrame(i, decoded, totalDuration, sampleRate);
+    const res = placeClipWithinWindow({ clipPcm: item.pcm, targetStartFrame: startFrame, boundaryFrame: boundary, baseInfo });
+    const clampedSec = (res.requestedFrames - res.placedFrames) / sampleRate;
+    if (res.clamped && clampedSec > DURATION_MISMATCH_TOLERANCE_SEC) {
+      warnings.push(createClampedWarning(item, res.requestedFrames, res.placedFrames, sampleRate));
+    }
+    parts.push(res.pcm);
+    currentFrame += res.placedFrames;
+  }
+  return { parts, currentFrame, warnings };
+}
+
+function appendTrailingSilence(parts, totalDuration, currentFrame, baseInfo) {
+  if (!Number.isFinite(totalDuration) || totalDuration <= 0) return currentFrame;
+  const targetTotal = Math.round(totalDuration * baseInfo.sampleRate);
+  if (targetTotal <= currentFrame) return currentFrame;
+  parts.push(new Uint8Array((targetTotal - currentFrame) * baseInfo.blockAlign));
+  return targetTotal;
+}
+
+function createTrackWavBlob(baseInfo, parts) {
+  const dataLength = parts.reduce((sum, p) => sum + p.byteLength, 0);
+  const header = buildWaveHeader({ ...baseInfo, dataLength });
+  return new Blob([header, ...parts], { type: 'audio/wav' });
+}
+
+async function applyTrackMastering(blob, audioMaster, signal, logger = null) {
+  if (!audioMaster?.masterWav) return { blob, mastered: false };
+  try {
+    const res = await audioMaster.masterWav(blob, { signal });
+    return { blob: res.blob || blob, mastered: res.mastered ?? true };
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.name === 'SynthesisCancelledError') throw err;
+    logger?.warn?.('assembleTimelineAlignedVoiceover.masterWav', err?.message || 'Mastering degraded to unmastered WAV');
+    return { blob, mastered: false };
+  }
+}
+
+function buildDecodedClipDurations(decoded, segmentClips) {
+  const map = { ...(segmentClips || {}) };
+  for (const item of decoded) {
+    const existing = segmentClips?.[item.id];
+    const wavDuration = item.info.byteRate > 0 ? item.info.dataSize / item.info.byteRate : 0;
+    const durationSeconds = Number.isFinite(existing?.durationSeconds) && existing.durationSeconds > 0
+      ? existing.durationSeconds
+      : wavDuration;
+    map[item.id] = { ...(existing || {}), blob: item.blob, durationSeconds };
+  }
+  return map;
+}
+
+/**
+ * Assembles generated subtitle clips into a single time-aligned PCM WAV track.
+ * Inputs: `{ segments, segmentClips, totalDuration, sampleRate, audioMaster, signal, selectedIds, strictDurationCheck, spillApprovals }`.
+ * Outputs: Promise resolving to `{ blob, duration, clipCount, warnings, mismatches, sampleRate, mastered }`.
+ * Side effects: reads ArrayBuffer from clips, applies optional audio mastering.
+ * Failure modes: returns empty descriptor on missing clips; throws SynthesisError on WAV format mismatch or ValidationError when `strictDurationCheck` detects unresolved mismatches.
+ * @param {object} params - Assembly spec.
+ * @returns {Promise<{ blob: Blob|null, duration: number, clipCount: number, warnings: Array<object>, mismatches: Array<object>, sampleRate: number, mastered: boolean }>} Aligned WAV result.
+ */
+export async function assembleTimelineAlignedVoiceover(spec = {}) {
+  const {
+    segments = [], segmentClips = {}, totalDuration = 0, sampleRate = null, audioMaster = null,
+    signal = null, selectedIds = null, strictDurationCheck = false, spillApprovals = {}, logger = null,
+  } = spec;
+  const targets = filterAndOrderTargetClips(segments, selectedIds, segmentClips);
+  if (!targets.length) {
+    return { blob: null, duration: 0, clipCount: 0, warnings: [], mismatches: [], sampleRate: sampleRate || 0, mastered: false };
+  }
+  const decoded = await decodeTargetClips(targets, sampleRate);
+  const baseInfo = decoded[0].info;
+  const mismatchReport = detectDurationMismatches({
+    segments,
+    segmentClips: buildDecodedClipDurations(decoded, segmentClips),
+    mediaDuration: totalDuration,
+    spillApprovals,
+    selectedIds,
+    targetOnly: true,
+  });
+  if (strictDurationCheck) assertNoUnresolvedDurationMismatches(mismatchReport);
+  const { parts, currentFrame, warnings } = assembleAlignedTrackFrames(decoded, totalDuration, baseInfo);
+  const finalFrame = appendTrailingSilence(parts, totalDuration, currentFrame, baseInfo);
+  const rawBlob = createTrackWavBlob(baseInfo, parts);
+  const { blob, mastered } = await applyTrackMastering(rawBlob, audioMaster, signal, logger);
+  return {
+    blob, duration: finalFrame / baseInfo.sampleRate, clipCount: targets.length,
+    warnings, mismatches: mismatchReport.unresolved, sampleRate: baseInfo.sampleRate, mastered,
+  };
+}
+
+export const MAX_SUBTITLE_SEGMENT_TAKES = 10;
+
+function buildSubtitleTakeSettings(clipSpec) {
+  return Object.freeze({
+    text: typeof clipSpec.text === 'string' ? clipSpec.text : '',
+    voiceId: clipSpec.characterId || '',
+    characterName: clipSpec.characterName || '',
+    signature: typeof clipSpec.signature === 'string' ? clipSpec.signature : '',
+    seed: clipSpec.seed ?? null,
+    ...(clipSpec.preTrimAssetId ? { preTrimAssetId: clipSpec.preTrimAssetId } : {}),
+    ...(Number.isFinite(clipSpec.preTrimDuration) && clipSpec.preTrimDuration > 0 ? { preTrimDuration: clipSpec.preTrimDuration } : {}),
+  });
+}
+
+function buildSelectedSubtitleTake(segmentId, clipSpec) {
+  const duration = Number.isFinite(clipSpec.durationSeconds) && clipSpec.durationSeconds > 0
+    ? clipSpec.durationSeconds
+    : null;
+  return createSegmentTake({
+    id: clipSpec.takeId || `take-${segmentId}-${Date.now()}`,
+    audioAssetId: clipSpec.audioAssetId,
+    duration,
+    isSelected: true,
+    settings: buildSubtitleTakeSettings(clipSpec),
+  });
+}
+
+/**
+ * Extracts the active persisted audio take specification from a subtitle segment.
+ * Inputs: subtitle `segment` object.
+ * Outputs: Frozen `{ takeId, audioAssetId, durationSeconds, text, characterId, characterName, signature, seed, preTrimAssetId, preTrimDuration }` or `null`.
+ * Side effects: none.
+ * Failure modes: returns `null` when no take with a durable `audioAssetId` exists.
+ * @param {object|null|undefined} segment - Subtitle cue record.
+ * @returns {Readonly<object>|null} Active take metadata or null.
+ */
+export function extractActiveSubtitleTakeSpec(segment) {
+  const takes = Array.isArray(segment?.takes) ? segment.takes : [];
+  if (!takes.length) return null;
+  const active = takes.find(item => item?.isSelected) || takes[takes.length - 1];
+  if (!active?.audioAssetId) return null;
+  const settings = active.settings || {};
+  return Object.freeze({
+    takeId: active.id || active.takeId || '',
+    audioAssetId: active.audioAssetId,
+    durationSeconds: Number.isFinite(active.duration) && active.duration > 0 ? active.duration : null,
+    text: typeof settings.text === 'string' ? settings.text : '',
+    characterId: settings.voiceId || segment.voiceId || '',
+    characterName: settings.characterName || '',
+    signature: typeof settings.signature === 'string' ? settings.signature : '',
+    seed: settings.seed ?? null,
+    preTrimAssetId: settings.preTrimAssetId || null,
+    preTrimDuration: Number.isFinite(settings.preTrimDuration) && settings.preTrimDuration > 0 ? settings.preTrimDuration : null,
+  });
+}
+
+/**
+ * Attaches a persisted voiceover `SegmentTake` onto a subtitle segment immutably and idempotently.
+ * Inputs: `segments` array, target `segmentId`, and `clipSpec` (`{ audioAssetId, takeId, text, characterId, characterName, signature, durationSeconds, seed, preTrimAssetId, preTrimDuration }`).
+ * Outputs: Updated segments array (returns original reference if idempotent or invalid).
+ * Side effects: none.
+ * Failure modes: returns input segments untouched when `segmentId`, `audioAssetId`, or matching cue is missing.
+ * @param {Array<object>} segments - Subtitle segments array.
+ * @param {string} segmentId - Target cue id.
+ * @param {object} [clipSpec={}] - Persisted take metadata.
+ * @returns {Array<object>} Updated segments array.
+ */
+export function attachSubtitleClipTake(segments, segmentId, clipSpec = {}) {
+  if (!Array.isArray(segments) || !segmentId || !clipSpec?.audioAssetId) return Array.isArray(segments) ? segments : [];
+  const idx = segments.findIndex(seg => seg?.id === segmentId);
+  if (idx < 0) return segments;
+  const target = segments[idx];
+  const nextVoiceId = clipSpec.characterId || target.voiceId || null;
+  const currentSpec = extractActiveSubtitleTakeSpec(target);
+  const sameAsset = currentSpec?.audioAssetId === clipSpec.audioAssetId && currentSpec?.preTrimAssetId === (clipSpec.preTrimAssetId || null);
+  if (sameAsset && (target.voiceId || null) === nextVoiceId) return segments;
+  const existingTakes = Array.isArray(target.takes) ? target.takes : [];
+  const prior = existingTakes.slice(-(MAX_SUBTITLE_SEGMENT_TAKES - 1)).map(t => Object.freeze({ ...t, isSelected: false, blob: null }));
+  const nextTake = buildSelectedSubtitleTake(segmentId, clipSpec);
+  const updated = Object.freeze({ ...target, voiceId: nextVoiceId, status: 'ready', takes: Object.freeze([...prior, nextTake]) });
+  return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+}
+
+/**
+ * Clears all persisted voiceover takes from a subtitle segment when its clip is removed.
+ * Inputs: `segments` array and target `segmentId`.
+ * Outputs: Updated segments array with empty `takes` on the target cue.
+ * Side effects: none.
+ * Failure modes: returns input segments unchanged if target has no takes or does not exist.
+ * @param {Array<object>} segments - Subtitle segments array.
+ * @param {string} segmentId - Target cue id.
+ * @returns {Array<object>} Updated segments array.
+ */
+export function clearSubtitleSegmentTakes(segments, segmentId) {
+  if (!Array.isArray(segments) || !segmentId) return Array.isArray(segments) ? segments : [];
+  const idx = segments.findIndex(seg => seg?.id === segmentId);
+  if (idx < 0) return segments;
+  const target = segments[idx];
+  if (!Array.isArray(target.takes) || target.takes.length === 0) return segments;
+  const updated = Object.freeze({ ...target, takes: Object.freeze([]), status: 'draft' });
+  return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+}
+
+function isValidSpillApprovalEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const start = Number(entry.cueStart);
+  const end = Number(entry.cueEnd);
+  const clipDur = Number(entry.clipDuration);
+  return typeof entry.segmentId === 'string' && Boolean(entry.segmentId)
+    && Number.isFinite(start) && start >= 0
+    && Number.isFinite(end) && end >= start
+    && Number.isFinite(clipDur) && clipDur > 0
+    && typeof entry.clipSignature === 'string';
+}
+
+/**
+ * Validates and normalizes persisted R3-05 speech spill approvals into an immutable lookup map.
+ * Inputs: `rawApprovals` candidate record.
+ * Outputs: Frozen `Record<string, object>` containing only valid spill approval records.
+ * Side effects: none.
+ * Failure modes: returns empty frozen object for non-object or malformed inputs.
+ * @param {unknown} rawApprovals - Raw spill approval map.
+ * @returns {Readonly<Record<string, object>>} Normalized spill approvals.
+ */
+export function normalizeSpillApprovalsMap(rawApprovals) {
+  if (!rawApprovals || typeof rawApprovals !== 'object' || Array.isArray(rawApprovals)) {
+    return Object.freeze({});
+  }
+  const clean = {};
+  for (const [segId, entry] of Object.entries(rawApprovals)) {
+    if (!segId || typeof segId !== 'string' || !isValidSpillApprovalEntry(entry)) continue;
+    clean[segId] = Object.freeze({ ...entry });
+  }
+  return Object.freeze(clean);
 }

@@ -20,10 +20,14 @@ const NOT_BEFORE_KHMER_MARK = '(?![\\u17B6-\\u17D3\\u17DD])';
 
 /**
  * Escapes every regex metacharacter so a glossary term is always matched literally.
+ * Inputs: raw string term.
+ * Outputs: regex-escaped literal pattern.
+ * Side effects: none.
+ * Failure modes: throws TypeError if term is not a string.
  * @param {string} term - Raw glossary term.
  * @returns {string} Regex-safe literal pattern.
  */
-function escapeRegexLiteral(term) {
+export function escapeRegexLiteral(term) {
   return term.replace(REGEX_METACHARACTERS, '\\$&');
 }
 
@@ -129,10 +133,14 @@ function buildTrailingGuard(lastChar) {
 
 /**
  * Builds one regex alternative that matches `source` literally with script-aware edge guards.
+ * Inputs: non-empty glossary source term.
+ * Outputs: regex source fragment guarding Latin token edges and Khmer cluster edges.
+ * Side effects: none.
+ * Failure modes: throws TypeError if source is empty or not a string.
  * @param {string} source - Non-empty glossary source term.
  * @returns {string} Regex source fragment.
  */
-function buildTermPattern(source) {
+export function buildTermPattern(source) {
   const chars = Array.from(source);
   return `${buildLeadingGuard(chars[0])}${escapeRegexLiteral(source)}${buildTrailingGuard(chars[chars.length - 1])}`;
 }

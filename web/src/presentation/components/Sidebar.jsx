@@ -6,16 +6,19 @@ import React from 'react';
 import { Icon } from './Icon.jsx';
 
 export const DEFAULT_WORKSPACES = Object.freeze([
+  { id: 'projects', label: 'Projects', icon: 'folder' },
   { id: 'tts', label: 'Text to speech', icon: 'square_pencil' },
   { id: 'subtitles', label: 'Video to subtitle', icon: 'subtitles' },
+  { id: 'jobs', label: 'Batch Jobs', icon: 'layers' },
+  { id: 'models', label: 'Models & Setup', icon: 'cpu' },
 ]);
 
 /**
  * Renders one top-level function switcher button inside the Studio navigation rail.
- * @param {{ item: { id: string, label: string, icon: string }, isActive: boolean, onSelect: (id: string) => void }} props - Nav item props.
+ * @param {{ item: { id: string, label: string, icon: string }, isActive: boolean, badgeCount?: number, onSelect: (id: string) => void }} props - Nav item props.
  * @returns {React.ReactElement} Workspace nav button.
  */
-function WorkspaceNavButton({ item, isActive, onSelect }) {
+function WorkspaceNavButton({ item, isActive, badgeCount = 0, onSelect }) {
   return (
     <button
       type="button"
@@ -26,13 +29,18 @@ function WorkspaceNavButton({ item, isActive, onSelect }) {
     >
       <Icon name={item.icon} />
       <span>{item.label}</span>
+      {badgeCount > 0 && (
+        <span className="nav-badge" aria-label={`${badgeCount} pending or interrupted`}>
+          {badgeCount}
+        </span>
+      )}
     </button>
   );
 }
 
 /**
  * Renders the navigation sidebar for switching top-level Studio functions.
- * Inputs: `{ activeWorkspace, workspaces, onSelectWorkspace, onFocusScript }`.
+ * Inputs: `{ activeWorkspace, workspaces, onSelectWorkspace, onFocusScript, jobsBadgeCount }`.
  * Outputs: `<aside className="studio-sidebar">` element.
  * Side effects: triggers workspace switch callbacks on click.
  * Failure modes: none.
@@ -44,6 +52,7 @@ export function Sidebar({
   workspaces = DEFAULT_WORKSPACES,
   onSelectWorkspace,
   onFocusScript,
+  jobsBadgeCount = 0,
   soundMuted = false,
   onToggleSoundMuted,
 }) {
@@ -59,7 +68,13 @@ export function Sidebar({
       </div>
       <nav className="studio-nav" aria-label="Workspace">
         {workspaces.map(item => (
-          <WorkspaceNavButton key={item.id} item={item} isActive={activeWorkspace === item.id} onSelect={handleSelect} />
+          <WorkspaceNavButton
+            key={item.id}
+            item={item}
+            isActive={activeWorkspace === item.id}
+            badgeCount={item.id === 'jobs' ? jobsBadgeCount : 0}
+            onSelect={handleSelect}
+          />
         ))}
       </nav>
       {onToggleSoundMuted && (

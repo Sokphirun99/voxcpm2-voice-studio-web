@@ -83,3 +83,53 @@ export class StorageError extends Error {
     this.code = 'STORAGE_ERROR';
   }
 }
+
+/**
+ * Error thrown when a revision mismatch or concurrent modification occurs.
+ */
+export class ConflictError extends Error {
+  /**
+   * Creates a ConflictError.
+   * Inputs: human-readable message and conflict metadata `{ currentRevision, expectedRevision, code }`.
+   * Outputs: ConflictError instance.
+   * Side effects: none.
+   * Failure modes: none.
+   * @param {string} [message='Resource revision conflict.'] - User-facing conflict message.
+   * @param {{ currentRevision?: number, expectedRevision?: number, code?: string }} [meta] - Conflict metadata.
+   */
+  constructor(message = 'Resource revision conflict.', meta = {}) {
+    super(message);
+    this.name = 'ConflictError';
+    this.code = meta.code || 'REVISION_CONFLICT';
+    this.currentRevision = meta.currentRevision;
+    this.expectedRevision = meta.expectedRevision;
+  }
+}
+
+/**
+ * Error thrown when an offline action is attempted without its required model cached locally.
+ */
+export class OfflineModelMissingError extends Error {
+  /**
+   * Creates an OfflineModelMissingError.
+   * Inputs: metadata object `{ featureId, featureName, modelId, modelName, repo, approxSize, message }`.
+   * Outputs: OfflineModelMissingError instance.
+   * Side effects: none.
+   * Failure modes: none.
+   * @param {object} meta - Error metadata.
+   */
+  constructor({ featureId, featureName, modelId, modelName, repo, approxSize, message } = {}) {
+    const defaultMsg = `${modelName || 'Model'} (${repo || 'unknown'}) is not cached locally (~${approxSize || 'unknown'}). A one-time internet connection is required to download this model before working offline.`;
+    super(message || defaultMsg);
+    this.name = 'OfflineModelMissingError';
+    this.code = 'OFFLINE_MODEL_MISSING';
+    this.featureId = featureId;
+    this.featureName = featureName;
+    this.modelId = modelId;
+    this.modelName = modelName;
+    this.repo = repo;
+    this.approxSize = approxSize;
+  }
+}
+
+

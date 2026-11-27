@@ -83,7 +83,7 @@ async function readHttpErrorDetail(response, fallback) {
  * @param {object} spec - Upload file and analysis options.
  * @returns {FormData} Multipart form payload.
  */
-function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, diarize = true, translateTo = '', translateToKhmer = false, doubleCheck = false }) {
+function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, diarize = true, translateTo = '', translateToKhmer = false, doubleCheck = false, terminology = null }) {
   const form = new FormData();
   const target = String(translateTo || '').trim() || (translateToKhmer ? 'km' : '');
   form.append('file', file, file?.name || 'video.mp4');
@@ -92,6 +92,9 @@ function buildTranscribeFormData({ file, language = 'auto', numSpeakers = 0, dia
   form.append('diarize', String(Boolean(diarize)));
   form.append('translate_to', target);
   form.append('double_check', String(Boolean(doubleCheck)));
+  if (Array.isArray(terminology) && terminology.length > 0) {
+    form.append('terminology', JSON.stringify(terminology));
+  }
   return form;
 }
 
@@ -108,15 +111,50 @@ function buildVerifySpeechFormData({ blob, expectedText, language = 'km', fileNa
   return form;
 }
 
+function appendOptionalDubMixFields(form, mixSettings) {
+  if (!mixSettings || typeof mixSettings !== 'object') return;
+  const { originalVolume, dubVolume, duckVolume } = mixSettings;
+  if (Number.isFinite(originalVolume) && Math.abs(originalVolume - 1) > 1e-4) {
+    form.append('originalVolume', String(originalVolume));
+  }
+  if (Number.isFinite(dubVolume) && Math.abs(dubVolume - 1) > 1e-4) {
+    form.append('dubVolume', String(dubVolume));
+  }
+  if (Number.isFinite(duckVolume) && Math.abs(duckVolume - 0.15) > 1e-4) {
+    form.append('duckVolume', String(duckVolume));
+  }
+}
+
+function appendOptionalDubSubtitles(form, subtitleMode, subtitles) {
+  const cleanSubMode = String(subtitleMode || '').trim().toLowerCase();
+  if (!cleanSubMode || cleanSubMode === 'none') return;
+  form.append('subtitleMode', cleanSubMode);
+  if (subtitles && typeof subtitles === 'object') {
+    form.append('subtitles', JSON.stringify(subtitles));
+  }
+}
+
 /**
  * Builds the multipart FormData payload for time-aligned dubbed MP4 export (`/media_api/dub`).
- * @param {{ jobId: string, clips: Array<{ segmentId: string, start: number, end: number, blob: Blob }>, originalAudioMode?: string }} spec - Dub export inputs.
- * @returns {FormData} Multipart payload containing jobId, originalAudioMode, metadata JSON, and WAV files.
+ * @param {object} spec - Dub export inputs (`jobId`, `clips`, `originalAudioMode`, `audioLanguage`, `mixSettings`, `subtitleMode`, `subtitles`).
+ * @returns {FormData} Multipart payload containing jobId, audio/subtitle modes, gains, metadata JSON, and WAV files.
  */
-function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck' }) {
+function buildDubVideoFormData({
+  jobId,
+  clips = [],
+  originalAudioMode = 'duck',
+  audioLanguage = '',
+  mixSettings = null,
+  subtitleMode = 'none',
+  subtitles = null,
+}) {
   const form = new FormData();
   form.append('jobId', String(jobId || ''));
   form.append('originalAudioMode', String(originalAudioMode || 'duck'));
+  const cleanAudioLanguage = String(audioLanguage || '').trim();
+  if (cleanAudioLanguage) form.append('audioLanguage', cleanAudioLanguage);
+  appendOptionalDubMixFields(form, mixSettings);
+  appendOptionalDubSubtitles(form, subtitleMode, subtitles);
   const metadata = clips.map((clip, fileIndex) => {
     const fileName = `dub-clip-${String(fileIndex + 1).padStart(3, '0')}.wav`;
     form.append('files', clip.blob, fileName);
@@ -125,6 +163,7 @@ function buildDubVideoFormData({ jobId, clips = [], originalAudioMode = 'duck' }
       start: Number(clip.start) || 0,
       end: Number(clip.end) || 0,
       fileIndex,
+      ...(clip.allowOverflow ? { allowOverflow: true } : {}),
     };
   });
   form.append('metadata', JSON.stringify(metadata));
@@ -180,12 +219,16 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       }
     },
 
-    async translateSegments({ segments, sourceLanguage, targetLanguage = 'km', signal }) {
+    async translateSegments({ segments, sourceLanguage, targetLanguage = 'km', terminology = null, signal }) {
       try {
+        const body = { segments, sourceLanguage, targetLanguage };
+        if (Array.isArray(terminology) && terminology.length > 0) {
+          body.terminology = terminology;
+        }
         const res = await fetchImpl(TRANSLATE_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ segments, sourceLanguage, targetLanguage }),
+          body: JSON.stringify(body),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not translate subtitles'), { status: res.status });
@@ -207,13 +250,25 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       bilingual = false,
       subtitleStyle,
       videoSize,
+      audioLanguage = '',
       signal,
     }) {
       try {
+        const cleanAudioLanguage = String(audioLanguage || '').trim();
         const res = await fetchImpl(BURN_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jobId, segments, speakerNames, includeSpeaker, useTranslation, bilingual, subtitleStyle, videoSize }),
+          body: JSON.stringify({
+            jobId,
+            segments,
+            speakerNames,
+            includeSpeaker,
+            useTranslation,
+            bilingual,
+            subtitleStyle,
+            videoSize,
+            ...(cleanAudioLanguage ? { audioLanguage: cleanAudioLanguage } : {}),
+          }),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not burn subtitles onto video'), { status: res.status });
@@ -243,11 +298,28 @@ export function createMediaSubtitleGateway({ fetchImpl = globalThis.fetch, logge
       }
     },
 
-    async exportDubbedVideo({ jobId, clips = [], originalAudioMode = 'duck', signal }) {
+    async exportDubbedVideo({
+      jobId,
+      clips = [],
+      originalAudioMode = 'duck',
+      audioLanguage = '',
+      mixSettings = null,
+      subtitleMode = 'none',
+      subtitles = null,
+      signal,
+    }) {
       try {
         const res = await fetchImpl(DUB_ENDPOINT, {
           method: 'POST',
-          body: buildDubVideoFormData({ jobId, clips, originalAudioMode }),
+          body: buildDubVideoFormData({
+            jobId,
+            clips,
+            originalAudioMode,
+            audioLanguage,
+            mixSettings,
+            subtitleMode,
+            subtitles,
+          }),
           signal,
         });
         if (!res.ok) throw new SynthesisError(await readHttpErrorDetail(res, 'Could not export dubbed MP4'), { status: res.status });

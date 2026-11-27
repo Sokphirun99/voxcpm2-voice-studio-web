@@ -132,6 +132,15 @@ test('mediaSubtitleGateway exportDubbedVideo uploads multipart metadata + WAV cl
   ]);
   assert.equal(form.getAll('files').length, 2);
 
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    clips: [{ segmentId: 'seg-1', start: 0.2, end: 1.0, blob: wav1, allowOverflow: true }],
+  });
+  assert.deepEqual(JSON.parse(calls[1].init.body.get('metadata')), [
+    { segmentId: 'seg-1', start: 0.2, end: 1.0, fileIndex: 0, allowOverflow: true },
+  ]);
+
   const errGw = createMediaSubtitleGateway({
     fetchImpl: async () => new Response(JSON.stringify({ detail: 'Dubbed MP4 export is only supported for video files.' }), { status: 400 }),
   });
@@ -168,4 +177,79 @@ test('both Vite dev proxy and Nginx allowlist expose /media_api/dub while blocki
     assert.equal(nginxPattern.test(path), true, `nginx should allow ${path}`);
   }
   assert.equal(nginxPattern.test('/media_api/admin'), false);
+});
+
+test('mediaSubtitleGateway forwards optional audioLanguage cleanly on burnSubtitles and exportDubbedVideo', async () => {
+  const calls = [];
+  const gateway = createMediaSubtitleGateway({
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return new Response(new Blob(['MP4']), { status: 200, headers: { 'content-type': 'video/mp4' } });
+    },
+  });
+
+  await gateway.burnSubtitles({
+    jobId: 'abcd1234ef567890',
+    segments: [{ id: 's1', start: 0, end: 1, text: 'សួស្តី' }],
+    speakerNames: {},
+    audioLanguage: 'khm_Khmr',
+  });
+  assert.equal(JSON.parse(calls[0].init.body).audioLanguage, 'khm_Khmr');
+
+  await gateway.burnSubtitles({
+    jobId: 'abcd1234ef567890',
+    segments: [],
+    speakerNames: {},
+  });
+  assert.equal('audioLanguage' in JSON.parse(calls[1].init.body), false);
+
+  const wav = new Blob(['RIFF1111WAVE'], { type: 'audio/wav' });
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    audioLanguage: 'eng_Latn',
+    clips: [{ segmentId: 's1', start: 0, end: 1, blob: wav }],
+  });
+  assert.equal(calls[2].init.body.get('audioLanguage'), 'eng_Latn');
+
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    clips: [{ segmentId: 's1', start: 0, end: 1, blob: wav }],
+  });
+  assert.equal(calls[3].init.body.get('audioLanguage'), null);
+
+  // R3-09: custom mixSettings, subtitleMode/subtitles JSON, and 0-clip original audio mode
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'original',
+    audioLanguage: 'en',
+    mixSettings: { originalVolume: 0.85, dubVolume: 1, duckVolume: 0.15 },
+    subtitleMode: 'soft',
+    subtitles: { segments: [{ id: 's1', start: 0, end: 1, text: 'Hello' }], subtitleLanguage: 'en' },
+    clips: [],
+  });
+  const origForm = calls[4].init.body;
+  assert.equal(origForm.get('originalAudioMode'), 'original');
+  assert.equal(origForm.get('originalVolume'), '0.85');
+  assert.equal(origForm.get('dubVolume'), null);
+  assert.equal(origForm.get('duckVolume'), null);
+  assert.equal(origForm.get('subtitleMode'), 'soft');
+  assert.equal(JSON.parse(origForm.get('subtitles')).subtitleLanguage, 'en');
+  assert.deepEqual(JSON.parse(origForm.get('metadata')), []);
+  assert.equal(origForm.getAll('files').length, 0);
+
+  await gateway.exportDubbedVideo({
+    jobId: 'abcd1234ef567890',
+    originalAudioMode: 'duck',
+    mixSettings: { originalVolume: 1, dubVolume: 1.3, duckVolume: 0.25 },
+    subtitleMode: 'none',
+    clips: [{ segmentId: 's1', start: 0, end: 1, blob: wav }],
+  });
+  const duckForm = calls[5].init.body;
+  assert.equal(duckForm.get('originalVolume'), null);
+  assert.equal(duckForm.get('dubVolume'), '1.3');
+  assert.equal(duckForm.get('duckVolume'), '0.25');
+  assert.equal(duckForm.get('subtitleMode'), null);
+  assert.equal(duckForm.get('subtitles'), null);
 });

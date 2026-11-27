@@ -27,12 +27,39 @@ function ExportFormatButtons({ hasSegments, busy, onExportFile, onCopyDialogue }
   );
 }
 
+function resolveAlignedExportTitle({ hasAlignedVoice, canExportAlignedVoice, unresolvedMismatchCount }) {
+  if (!hasAlignedVoice) return 'Generate subtitle voice clips before exporting time-aligned WAV';
+  if (!canExportAlignedVoice && unresolvedMismatchCount > 0) {
+    const word = unresolvedMismatchCount === 1 ? 'mismatch' : 'mismatches';
+    return `Resolve ${unresolvedMismatchCount} speech duration ${word} before exporting time-aligned WAV`;
+  }
+  return 'Export synchronized time-aligned voiceover WAV for video editing';
+}
+
+function ExportAlignedDubButton({ hasAlignedVoice, canExportAlignedVoice = hasAlignedVoice, unresolvedMismatchCount = 0, busy, onExportAlignedVoice }) {
+  if (!onExportAlignedVoice) return null;
+  const title = resolveAlignedExportTitle({ hasAlignedVoice, canExportAlignedVoice, unresolvedMismatchCount });
+  return (
+    <button
+      type="button"
+      id="subtitle-export-aligned-wav-btn"
+      className="button button-secondary"
+      disabled={!hasAlignedVoice || !canExportAlignedVoice || busy}
+      title={title}
+      onClick={onExportAlignedVoice}
+    >
+      <Icon name="waveform" />
+      <span>Time-aligned dub WAV</span>
+    </button>
+  );
+}
+
 /**
  * Renders the Subtitle workspace footer with live status, export buttons, optional speaker TTS filter, and burn-in action.
- * Inputs: `{ hasSegments, hasSubtitleText, canBurn, isAudioOnly, speakers, speakerNames, ttsSpeakerId, onChangeTtsSpeakerId, busy, busyAction, busyMeta, status, onExportFile, onCopyDialogue, onBurnVideo, onSendToTts }`.
+ * Inputs: `{ hasSegments, hasSubtitleText, selectedCount, canBurn, hasVideoJob, isAudioOnly, speakers, speakerNames, ttsSpeakerId, onChangeTtsSpeakerId, busy, busyAction, busyMeta, status, hasAlignedVoice, canExportAlignedVoice, unresolvedMismatchCount, onExportAlignedVoice, onExportFile, onCopyDialogue, onBurnVideo, onSendToTts }`.
  * Outputs: `<section className="playback subtitle-dock">`.
  * Side effects: triggers file download, clipboard copy, MP4 burn-in, or TTS transfer.
- * Failure modes: disables invalid export buttons cleanly until extraction completes or when audio-only.
+ * Failure modes: disables invalid export buttons cleanly until extraction completes, when audio-only, or when duration mismatches remain.
  * @param {object} props - Export dock props.
  * @returns {React.ReactElement} Subtitle export dock.
  */
@@ -51,6 +78,12 @@ export function SubtitleExportDock({
   busyAction,
   busyMeta = null,
   status,
+  hasAlignedVoice = false,
+  canExportAlignedVoice = hasAlignedVoice,
+  unresolvedMismatchCount = 0,
+  onExportAlignedVoice = null,
+  onOpenExportProject = null,
+  exportHistoryCount = 0,
   onExportFile,
   onCopyDialogue,
   onBurnVideo,
@@ -74,6 +107,25 @@ export function SubtitleExportDock({
             <Icon name="arrow_down_to_line" />
             <span>{busyAction === 'burn' ? 'Rendering MP4...' : 'Export burned MP4'}</span>
           </button>
+          <ExportAlignedDubButton
+            hasAlignedVoice={hasAlignedVoice}
+            canExportAlignedVoice={canExportAlignedVoice}
+            unresolvedMismatchCount={unresolvedMismatchCount}
+            busy={busy}
+            onExportAlignedVoice={onExportAlignedVoice}
+          />
+          {onOpenExportProject && (
+            <button
+              type="button"
+              id="subtitle-export-project-btn"
+              className="button button-secondary"
+              disabled={busy}
+              onClick={onOpenExportProject}
+            >
+              <Icon name="arrow_down_to_line" />
+              <span>Export project{exportHistoryCount > 0 ? ` (${exportHistoryCount})` : ''}</span>
+            </button>
+          )}
           {showSpeakerFilter && (
             <div className="select-field select-field--plain subtitle-tts-speaker-wrap">
               <select id="subtitle-tts-speaker" aria-label="Speaker for Text to speech" value={ttsSpeakerId} disabled={busy}

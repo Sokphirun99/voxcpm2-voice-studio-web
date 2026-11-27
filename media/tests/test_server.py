@@ -685,6 +685,7 @@ def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path
     with open(sample_mp4, "rb") as fh:
         tr = client.post("/transcribe", files={"file": ("news.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
     assert tr.status_code == 200
+    assert tr.json()["duration"] > 1.5
     job_id = tr.json()["jobId"]
 
     wav_a = _make_wav_bytes(0.3)
@@ -762,6 +763,42 @@ def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path
     )
     assert bad_index.status_code == 400
 
+    bad_allow = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 1.0, "fileIndex": 0, "allowOverflow": "yes"}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert bad_allow.status_code == 400
+
+    wav_spill = _make_wav_bytes(0.6)
+    valid_allow = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 0.2, "fileIndex": 0, "allowOverflow": True}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", wav_spill, "audio/wav"))],
+    )
+    assert valid_allow.status_code == 200
+
+    overflow_past_video = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 1.6, "end": 1.8, "fileIndex": 0, "allowOverflow": True}]), "originalAudioMode": "duck"},
+        files=[("files", ("clip1.wav", _make_wav_bytes(0.9), "audio/wav"))],
+    )
+    assert overflow_past_video.status_code == 400
+
+    overflow_collides_next = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([
+                {"segmentId": "seg-1", "start": 0.0, "end": 0.2, "fileIndex": 0, "allowOverflow": True},
+                {"segmentId": "seg-2", "start": 0.3, "end": 0.8, "fileIndex": 1},
+            ]),
+            "originalAudioMode": "duck",
+        },
+        files=[("files", ("clip1.wav", wav_spill, "audio/wav")), ("files", ("clip2.wav", wav_a, "audio/wav"))],
+    )
+    assert overflow_collides_next.status_code == 400
+
     bad_wav = client.post(
         "/dub",
         data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.0, "end": 1.0, "fileIndex": 0}]), "originalAudioMode": "duck"},
@@ -824,3 +861,311 @@ def test_dub_endpoint_roundtrip_validation_and_non_blocking_async(tmp_path: Path
             assert dub_res.headers["content-type"] == "video/mp4"
 
     asyncio.run(exercise_async_dub())
+
+
+def test_transcribe_and_translate_enforce_stage_separated_terminology(tmp_path: Path) -> None:
+    import json
+
+    sample_mp4 = tmp_path / "term_sample.mp4"
+    _make_sample_mp4(sample_mp4)
+
+    class _TermTranscriber:
+        def transcribe(self, audio_wav: Path, language: str = "auto", **kwargs):
+            return {
+                "language": "en",
+                "segments": [
+                    {"start": 0.0, "end": 1.2, "text": "Pnom Penh launches vox cpm with AI today."},
+                ],
+            }
+
+    class _MaskCheckingTranslator:
+        def translate_lines(self, lines: list[str], source_lang: str, target_lang: str = "km") -> list[str]:
+            return [f"[{target_lang}] {line}" for line in lines]
+
+    app = create_app(
+        MediaServices(
+            job_store=MediaJobStore(tmp_path / "jobs"),
+            transcriber=_TermTranscriber(),
+            diarizer=_FakeDiarizer(),
+            translator=_MaskCheckingTranslator(),
+        )
+    )
+    client = TestClient(app)
+
+    terminology = [
+        {"id": "s1", "category": "spelling", "status": "approved", "term": "Phnom Penh", "variants": ["Pnom Penh"]},
+        {"id": "n1", "category": "name", "status": "approved", "term": "VoxCPM", "variants": ["vox cpm"], "preserveInTranslation": True, "pronunciation": "DO_NOT_LEAK_TTS"},
+        {"id": "t1", "category": "translation", "status": "approved", "term": "AI", "translation": "បញ្ញាសិប្បនិម្មិត", "sourceLanguage": "en", "targetLanguage": "khm_Khmr"},
+        {"id": "d1", "category": "spelling", "status": "draft", "term": "NEVER", "variants": ["today"]},
+    ]
+
+    with open(sample_mp4, "rb") as fh:
+        res = client.post(
+            "/transcribe",
+            files={"file": ("term_sample.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "translate_to": "khm_Khmr", "terminology": json.dumps(terminology)},
+        )
+    assert res.status_code == 200
+    seg = res.json()["segments"][0]
+    assert seg["text"] == "Phnom Penh launches VoxCPM with AI today."
+    assert seg["translatedText"] == "[khm_Khmr] Phnom Penh launches VoxCPM with បញ្ញាសិប្បនិម្មិត today."
+    assert "DO_NOT_LEAK_TTS" not in seg["text"]
+    assert "DO_NOT_LEAK_TTS" not in seg["translatedText"]
+
+    with open(sample_mp4, "rb") as fh:
+        bad_json = client.post(
+            "/transcribe",
+            files={"file": ("bad.mp4", fh, "video/mp4")},
+            data={"language": "en", "diarize": "false", "terminology": "{invalid"},
+        )
+    assert bad_json.status_code == 400
+
+    tr_res = client.post(
+        "/translate",
+        json={
+            "segments": [{"id": "seg-1", "start": 0.0, "end": 1.0, "text": "VoxCPM and AI"}],
+            "sourceLanguage": "en",
+            "targetLanguage": "khm_Khmr",
+            "terminology": terminology,
+        },
+    )
+    assert tr_res.status_code == 200
+    assert tr_res.json()["segments"][0]["translatedText"] == "[khm_Khmr] VoxCPM and បញ្ញាសិប្បនិម្មិត"
+
+
+def test_burn_and_dub_apply_audio_language_metadata_safely(tmp_path: Path) -> None:
+    import json
+    from video_io import resolve_ffprobe_bin
+
+    sample_mp4 = tmp_path / "lang_sample.mp4"
+    _make_sample_mp4(sample_mp4)
+    client = _make_client(tmp_path)
+
+    with open(sample_mp4, "rb") as fh:
+        tr = client.post("/transcribe", files={"file": ("clip.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert tr.status_code == 200
+    job_id = tr.json()["jobId"]
+
+    ffprobe = resolve_ffprobe_bin()
+    if not Path(ffprobe).exists() and not shutil.which(ffprobe):
+        pytest.skip("ffprobe not installed")
+
+    burn_res = client.post(
+        "/burn",
+        json={
+            "jobId": job_id,
+            "segments": [{"id": "seg-1", "start": 0.1, "end": 1.2, "text": "សួស្តី", "speakerId": "speaker-1"}],
+            "speakerNames": {},
+            "videoSize": {"width": 640, "height": 360},
+            "audioLanguage": "khm_Khmr",
+        },
+    )
+    assert burn_res.status_code == 200, burn_res.text
+    burned_mp4 = tmp_path / "burn-lang.mp4"
+    burned_mp4.write_bytes(burn_res.content)
+    burn_probe = json.loads(
+        subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(burned_mp4)], capture_output=True, text=True, check=True).stdout
+    )
+    burn_audio = next(s for s in burn_probe["streams"] if s["codec_type"] == "audio")
+    assert (burn_audio.get("tags") or {}).get("language") == "khm"
+
+    wav_a = _make_wav_bytes(0.4)
+    dub_res = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.9, "fileIndex": 0}]),
+            "originalAudioMode": "mute",
+            "audioLanguage": "zsm_Latn",
+        },
+        files=[("files", ("clip1.wav", wav_a, "audio/wav"))],
+    )
+    assert dub_res.status_code == 200, dub_res.text
+    dubbed_mp4 = tmp_path / "dub-lang.mp4"
+    dubbed_mp4.write_bytes(dub_res.content)
+    dub_probe = json.loads(
+        subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(dubbed_mp4)], capture_output=True, text=True, check=True).stdout
+    )
+    dub_audio = next(s for s in dub_probe["streams"] if s["codec_type"] == "audio")
+    assert (dub_audio.get("tags") or {}).get("language") == "msa"
+
+    # Malformed or injected language input falls back safely without breaking FFmpeg
+    bad_lang_burn = client.post(
+        "/burn",
+        json={
+            "jobId": job_id,
+            "segments": [{"id": "seg-1", "start": 0.1, "end": 1.2, "text": "Hello", "speakerId": "speaker-1"}],
+            "speakerNames": {},
+            "videoSize": {"width": 640, "height": 360},
+            "audioLanguage": "km\n-invalid-flag",
+        },
+    )
+    assert bad_lang_burn.status_code == 200, bad_lang_burn.text
+
+
+def test_r309_dub_endpoint_original_replace_mix_gains_subtitles_and_silent_video_guards(tmp_path: Path) -> None:
+    import json
+    import shutil
+    from video_io import probe_media_duration, resolve_ffprobe_bin
+
+    ffprobe = resolve_ffprobe_bin()
+    if not Path(ffprobe).exists() and not shutil.which(ffprobe):
+        pytest.skip("ffprobe not installed")
+
+    sample_mp4 = tmp_path / "dub_modes.mp4"
+    _make_sample_mp4(sample_mp4)
+    client = _make_client(tmp_path)
+
+    with open(sample_mp4, "rb") as fh:
+        tr = client.post("/transcribe", files={"file": ("dub_modes.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert tr.status_code == 200
+    tr_body = tr.json()
+    assert tr_body["hasAudioStream"] is True
+    job_id = tr_body["jobId"]
+
+    subs_payload = json.dumps({
+        "segments": [
+            {"id": "seg-1", "start": 0.1, "end": 1.1, "speakerId": "speaker-1", "text": "Hello world", "translatedText": "សួស្តីពិភពលោក"},
+        ],
+        "speakerNames": {"speaker-1": "Host"},
+        "includeSpeaker": True,
+        "useTranslation": True,
+        "bilingual": True,
+        "subtitleLanguage": "khm_Khmr",
+        "videoSize": {"width": 640, "height": 360},
+    })
+
+    # 1. Original audio + Soft embedded subtitles (0 uploaded WAV clips, full 2s duration preserved)
+    orig_soft = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": "[]",
+            "originalAudioMode": "original",
+            "audioLanguage": "en",
+            "originalVolume": "0.85",
+            "subtitleMode": "soft",
+            "subtitles": subs_payload,
+        },
+    )
+    assert orig_soft.status_code == 200, orig_soft.text
+    orig_soft_mp4 = tmp_path / "orig_soft.mp4"
+    orig_soft_mp4.write_bytes(orig_soft.content)
+    assert 1.8 <= probe_media_duration(orig_soft_mp4) <= 2.3
+    soft_probe = json.loads(subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(orig_soft_mp4)], capture_output=True, text=True, check=True).stdout)
+    assert any(s["codec_type"] == "subtitle" and s["codec_name"] == "mov_text" and (s.get("tags") or {}).get("language") == "khm" for s in soft_probe["streams"])
+
+    # Original mode rejects unexpected WAV clips or non-empty metadata rather than silently ignoring them
+    wav_a = _make_wav_bytes(0.4)
+    orig_with_clips = client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": json.dumps([{"segmentId": "s1", "start": 0.1, "end": 0.6, "fileIndex": 0}]), "originalAudioMode": "original"},
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert orig_with_clips.status_code == 400
+
+    # 2. Replacement dubbing (`replace` alias) + Burned ASS subtitles + custom dubVolume
+    rep_burned = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.9, "fileIndex": 0}]),
+            "originalAudioMode": "replace",
+            "dubVolume": "1.2",
+            "audioLanguage": "khm_Khmr",
+            "subtitleMode": "burned",
+            "subtitles": subs_payload,
+        },
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert rep_burned.status_code == 200, rep_burned.text
+    rep_mp4 = tmp_path / "rep_burned.mp4"
+    rep_mp4.write_bytes(rep_burned.content)
+    rep_probe = json.loads(subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", str(rep_mp4)], capture_output=True, text=True, check=True).stdout)
+    assert not any(s["codec_type"] == "subtitle" for s in rep_probe["streams"])
+    assert any(s["codec_type"] == "audio" and (s.get("tags") or {}).get("language") == "khm" for s in rep_probe["streams"])
+
+    # 3. Ducking mix with custom gains; passing `subtitles` when `subtitleMode == 'none'` fails loudly (400)
+    bad_none_subs = client.post(
+        "/dub",
+        data={
+            "jobId": job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.9, "fileIndex": 0}]),
+            "originalAudioMode": "duck",
+            "subtitleMode": "none",
+            "subtitles": subs_payload,
+        },
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert bad_none_subs.status_code == 400
+
+    # Out-of-bounds gains or invalid audio/subtitle modes return HTTP 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "stereo"}).status_code == 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "original", "subtitleMode": "vtt"}).status_code == 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "original", "originalVolume": "2.5"}).status_code == 400
+    assert client.post("/dub", data={"jobId": job_id, "originalAudioMode": "original", "duckVolume": "not-a-num"}).status_code == 400
+
+    # 4. Silent video (`hasAudioStream=False`): `/transcribe` registers job, `/dub` rejects `duck`/`keep`/`original` with 422 and succeeds on `replace`
+    silent_mp4 = tmp_path / "silent_vid.mp4"
+    ffmpeg = resolve_ffmpeg_bin()
+    subprocess.run([
+        ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=#111111:s=320x240:d=1.6:r=24",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(silent_mp4),
+    ], check=True, capture_output=True)
+
+    with open(silent_mp4, "rb") as fh:
+        silent_tr = client.post("/transcribe", files={"file": ("silent.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"})
+    assert silent_tr.status_code == 200, silent_tr.text
+    silent_info = silent_tr.json()
+    assert silent_info["hasAudioStream"] is False
+    assert silent_info["isAudioOnly"] is False
+    silent_job_id = silent_info["jobId"]
+
+    for blocked_mode in ("duck", "keep", "original"):
+        res_blocked = client.post(
+            "/dub",
+            data={
+                "jobId": silent_job_id,
+                "metadata": "[]" if blocked_mode == "original" else json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.8, "fileIndex": 0}]),
+                "originalAudioMode": blocked_mode,
+            },
+            files=[] if blocked_mode == "original" else [("files", ("c1.wav", wav_a, "audio/wav"))],
+        )
+        assert res_blocked.status_code == 422, f"Expected 422 for silent video mode {blocked_mode}, got {res_blocked.status_code}"
+
+    silent_replace = client.post(
+        "/dub",
+        data={
+            "jobId": silent_job_id,
+            "metadata": json.dumps([{"segmentId": "seg-1", "start": 0.1, "end": 0.8, "fileIndex": 0}]),
+            "originalAudioMode": "replace",
+        },
+        files=[("files", ("c1.wav", wav_a, "audio/wav"))],
+    )
+    assert silent_replace.status_code == 200, silent_replace.text
+    silent_dub_out = tmp_path / "silent_replaced.mp4"
+    silent_dub_out.write_bytes(silent_replace.content)
+    assert has_audio_stream(silent_dub_out) is True
+
+    # 5. Zero/negative-duration subtitle cues fail loudly (HTTP 400) rather than silently producing a 0-cue MP4
+    zero_dur_subs = json.dumps({
+        "segments": [{"id": "seg-1", "start": 1.0, "end": 1.0, "speakerId": "speaker-1", "text": "Zero duration cue"}],
+    })
+    assert client.post(
+        "/dub",
+        data={"jobId": job_id, "metadata": "[]", "originalAudioMode": "original", "subtitleMode": "soft", "subtitles": zero_dur_subs},
+    ).status_code == 400
+    assert client.post(
+        "/burn",
+        json={"jobId": job_id, "segments": [{"id": "seg-1", "start": 1.2, "end": 0.5, "speakerId": "speaker-1", "text": "Inverted cue"}]},
+    ).status_code == 400
+
+    # 6. Isolated per-request export-*.mp4 files are cleaned up after streaming, and evicted jobs (>12) return HTTP 404 cleanly
+    job_root = (tmp_path / "jobs" / job_id)
+    assert list(job_root.glob("export-*.mp4")) == []
+    assert list(job_root.glob("dub-*")) == []
+    for i in range(12):
+        with open(sample_mp4, "rb") as fh:
+            assert client.post("/transcribe", files={"file": (f"extra_{i}.mp4", fh, "video/mp4")}, data={"language": "en", "diarize": "false"}).status_code == 200
+    evicted_res = client.post("/dub", data={"jobId": job_id, "metadata": "[]", "originalAudioMode": "original"})
+    assert evicted_res.status_code == 404

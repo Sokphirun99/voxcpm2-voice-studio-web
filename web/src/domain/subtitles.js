@@ -4,6 +4,7 @@
 
 import { MAX_SCRIPT_LENGTH, countGraphemes } from './presets.js';
 import { ValidationError } from './errors.js';
+import { resolveBcp47LanguageTag } from './subtitleLanguages.js';
 export {
   DEFAULT_ENGLISH_TARGET,
   DEFAULT_KHMER_TARGET,
@@ -17,8 +18,45 @@ export {
   isSameSubtitleLanguage,
   normalizeTargetLanguageCode,
   pickDefaultTargetLanguage,
+  resolveBcp47LanguageTag,
+  resolveLanguageDisplayMeta,
   resolveTargetLanguageMeta,
 } from './subtitleLanguages.js';
+export {
+  DURATION_MISMATCH_TOLERANCE_SEC,
+  MISMATCH_REMEDY_TYPES,
+  assertNoUnresolvedDurationMismatches,
+  createSpillApproval,
+  detectDurationMismatches,
+  extendAllSafeMismatches,
+  extendCueAndShiftLater,
+  extendCueToSpeech,
+  isSpillApprovalValid,
+  shiftCueStartEarlier,
+  trimClipWavToInterval,
+} from './durationMismatch.js';
+export {
+  MAX_CHARS_PER_LINE,
+  MAX_LINE_BREAKS,
+  MAX_READING_SPEED_CPS,
+  REMEDY_ACTIONS,
+  SUBTITLE_ISSUE_SEVERITIES,
+  SUBTITLE_ISSUE_TYPES,
+  VALIDATION_MAX_DURATION_SEC,
+  VALIDATION_MIN_DURATION_SEC,
+  autoBreakLongLine,
+  detectValidationOverlaps,
+  filterSegmentsWithIssues,
+  findNextSegmentWithIssue,
+  findPreviousSegmentWithIssue,
+  validateDurationMismatches,
+  validateSegmentDuration,
+  validateSegmentLineLengths,
+  validateSegmentText,
+  validateSegmentVoice,
+  validateSingleSegment,
+  validateSubtitleSegments,
+} from './subtitleValidation.js';
 
 export const SUBTITLE_SPEAKER_COLORS = Object.freeze([
   '#eeeeec',
@@ -83,7 +121,25 @@ const AUDIO_ONLY_EXT_PATTERN = /\.(mp3|wav|m4a|aac|ogg|flac)$/i;
 const VIDEO_EXT_PATTERN = /\.(mp4|mov|m4v|webm|mkv|avi)$/i;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 export const MIN_SPLIT_GAP_SEC = 0.1;
+export const MIN_CUE_DURATION_SEC = 0.05;
+export const DEFAULT_TIMING_PRECISION = 1;
+export const PRECISE_TIMING_PRECISION = 3;
+export const TIMING_NUDGE_COARSE_SEC = 0.2;
+export const TIMING_NUDGE_FINE_SEC = 0.05;
 export const MAX_SUBTITLE_FILE_BYTES = 2 * 1024 * 1024;
+
+export const OVERLAP_RESOLVE_MODES = Object.freeze({
+  TRIM_PREVIOUS: 'trim_previous',
+  SHIFT_FORWARD: 'shift_forward',
+  TRIM_NEXT: 'trim_next',
+});
+
+export const OVERLAP_BEHAVIOR_MODES = Object.freeze({
+  ALLOW: 'allow',
+  PREVENT: 'prevent',
+  REJECT: 'reject',
+  SHIFT_NEXT: 'shift_next',
+});
 
 /**
  * Formats seconds as `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` (VTT).
@@ -335,15 +391,22 @@ export function pickSegmentText(seg, useTranslation = false, bilingual = false) 
 }
 
 /**
- * Normalizes CRLF line endings and collapses blank lines inside a single SRT/VTT cue body.
+ * Normalizes CRLF line endings, sanitizes cue timing arrows, and collapses blank lines inside a single SRT/VTT cue body.
  * @param {string} text - Raw cue text.
- * @returns {string} Cue-safe text without internal blank lines.
+ * @returns {string} Cue-safe text without internal blank lines or `-->` markers.
  */
 function normalizeCueText(text) {
   return String(text || '')
     .replace(/\r\n?/g, '\n')
+    .replace(/-->/g, '→')
     .replace(/\n(?:[ \t]*\n)+/g, '\n')
     .trim();
+}
+
+function buildVttHeader(language = '') {
+  const bcp47 = resolveBcp47LanguageTag(language);
+  if (!bcp47) return 'WEBVTT';
+  return `WEBVTT\nKind: subtitles\nLanguage: ${bcp47}`;
 }
 
 /**
@@ -356,7 +419,7 @@ export function buildSrt({ segments = [], speakerNames = {}, includeSpeaker = tr
   for (const seg of segments) {
     const body = normalizeCueText(pickSegmentText(seg, useTranslation, bilingual));
     if (!body) continue;
-    const prefix = includeSpeaker ? `[${resolveSpeakerLabel(seg.speakerId, speakerNames)}] ` : '';
+    const prefix = includeSpeaker ? `[${normalizeCueText(resolveSpeakerLabel(seg.speakerId, speakerNames))}] ` : '';
     const timing = `${formatSubtitleTime(seg.start, ',')} --> ${formatSubtitleTime(seg.end, ',')}`;
     blocks.push(`${blocks.length + 1}\n${timing}\n${prefix}${body}`);
   }
@@ -364,16 +427,16 @@ export function buildSrt({ segments = [], speakerNames = {}, includeSpeaker = tr
 }
 
 /**
- * Formats subtitle segments into WebVTT (`.vtt`) text for `<video><track>` preview.
+ * Formats subtitle segments into WebVTT (`.vtt`) text for `<video><track>` preview and external players.
  * @param {object} [spec] - WebVTT formatting specification.
  * @returns {string} WebVTT content.
  */
-export function buildVtt({ segments = [], speakerNames = {}, includeSpeaker = true, useTranslation = false, bilingual = false } = {}) {
-  const blocks = ['WEBVTT'];
+export function buildVtt({ segments = [], speakerNames = {}, includeSpeaker = true, useTranslation = false, bilingual = false, language = '' } = {}) {
+  const blocks = [buildVttHeader(language)];
   for (const seg of segments) {
     const body = normalizeCueText(pickSegmentText(seg, useTranslation, bilingual));
     if (!body) continue;
-    const prefix = includeSpeaker ? `${resolveSpeakerLabel(seg.speakerId, speakerNames)}: ` : '';
+    const prefix = includeSpeaker ? `${normalizeCueText(resolveSpeakerLabel(seg.speakerId, speakerNames))}: ` : '';
     const timing = `${formatSubtitleTime(seg.start, '.')} --> ${formatSubtitleTime(seg.end, '.')}`;
     blocks.push(`${timing}\n${prefix}${body}`);
   }
@@ -493,20 +556,282 @@ export function findActiveSegmentId(segments, currentTimeSeconds) {
 }
 
 /**
- * Formats seconds as `MM:SS.d` or `H:MM:SS.d` for inline timestamp editing.
+ * Rounds non-negative seconds to exact millisecond precision.
+ * Inputs: seconds timestamp. Outputs: rounded seconds with <= 3 decimal places.
+ * Side effects: none. Failure modes: returns 0 on non-finite input.
+ * @param {number} seconds - Input timestamp in seconds.
+ * @returns {number} Rounded seconds.
+ */
+export function roundToMs(seconds) {
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.round(seconds * 1000) / 1000;
+}
+
+function resolveTimestampPrecision(seconds, precision) {
+  if (typeof precision === 'number' && Number.isFinite(precision)) {
+    return Math.max(0, Math.min(PRECISE_TIMING_PRECISION, Math.floor(precision)));
+  }
+  if (precision && typeof precision === 'object' && Number.isFinite(precision.precision)) {
+    return Math.max(0, Math.min(PRECISE_TIMING_PRECISION, Math.floor(precision.precision)));
+  }
+  const hasSubTenth = Math.abs(roundToMs(seconds) - Math.round(seconds * 10) / 10) > 1e-4;
+  return hasSubTenth ? PRECISE_TIMING_PRECISION : DEFAULT_TIMING_PRECISION;
+}
+
+/**
+ * Formats seconds as `MM:SS.d`, `MM:SS.mmm`, or `H:MM:SS.mmm` for inline editing.
+ * Inputs: seconds timestamp, optional precision. Outputs: formatted clock string.
+ * Side effects: none. Failure modes: clamps non-finite to 0.
  * @param {number} seconds - Non-negative timestamp in seconds.
+ * @param {number|object} [precision] - Decimal precision (1-3) or option object.
  * @returns {string} Editable timestamp string.
  */
-export function formatEditableTimestamp(seconds) {
-  const clamped = Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 10) / 10 : 0;
-  const totalTenths = Math.round(clamped * 10);
-  const hours = Math.floor(totalTenths / 36000);
-  const mins = Math.floor((totalTenths % 36000) / 600);
-  const secs = Math.floor((totalTenths % 600) / 10);
-  const tenth = totalTenths % 10;
-  const secLabel = `${String(secs).padStart(2, '0')}.${tenth}`;
+export function formatEditableTimestamp(seconds, precision = null) {
+  const prec = resolveTimestampPrecision(seconds, precision);
+  const factor = Math.pow(10, prec);
+  const clamped = Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * factor) / factor : 0;
+  const totalUnits = Math.round(clamped * factor);
+  const hours = Math.floor(totalUnits / (3600 * factor));
+  const mins = Math.floor((totalUnits % (3600 * factor)) / (60 * factor));
+  const secs = Math.floor((totalUnits % (60 * factor)) / factor);
+  const fraction = totalUnits % factor;
+  const fracLabel = prec > 0 ? `.${String(fraction).padStart(prec, '0')}` : '';
+  const secLabel = `${String(secs).padStart(2, '0')}${fracLabel}`;
   if (hours > 0) return `${hours}:${String(mins).padStart(2, '0')}:${secLabel}`;
   return `${String(mins).padStart(2, '0')}:${secLabel}`;
+}
+
+/**
+ * Validates a cue timing interval returning a typed validation result.
+ * Inputs: timing parameters `{ start, end, minDuration, maxDuration }`. Outputs: validation object.
+ * Side effects: none. Failure modes: returns structured failure object on invalid timing.
+ * @param {object} params - Interval parameters.
+ * @param {number} params.start - Cue start time in seconds.
+ * @param {number} params.end - Cue end time in seconds.
+ * @param {number} [params.minDuration=MIN_SPLIT_GAP_SEC] - Minimum required duration.
+ * @param {number|null} [params.maxDuration=null] - Maximum media duration bound.
+ * @returns {{ valid: boolean, error: string|null, code: string|null, field: string|null }} Result.
+ */
+export function validateCueInterval({ start, end, minDuration = MIN_SPLIT_GAP_SEC, maxDuration = null }) {
+  if (!Number.isFinite(start) || start < 0) {
+    return { valid: false, error: 'Start time must be a non-negative number.', code: 'INVALID_START_TIME', field: 'start' };
+  }
+  if (!Number.isFinite(end)) {
+    return { valid: false, error: 'End time must be a valid number.', code: 'INVALID_END_TIME', field: 'end' };
+  }
+  if (end <= start) {
+    return { valid: false, error: 'End time must be greater than start time.', code: 'END_BEFORE_START', field: 'end' };
+  }
+  if (roundToMs(end - start) < minDuration) {
+    return { valid: false, error: `Duration must be at least ${minDuration}s.`, code: 'DURATION_TOO_SHORT', field: 'duration' };
+  }
+  if (Number.isFinite(maxDuration) && maxDuration > 0 && end > maxDuration) {
+    return { valid: false, error: `End time exceeds media duration of ${maxDuration}s.`, code: 'EXCEEDS_MEDIA_DURATION', field: 'end' };
+  }
+  return { valid: true, error: null, code: null, field: null };
+}
+
+/**
+ * Asserts that a cue interval is valid, throwing ValidationError when invalid.
+ * Inputs: timing parameters. Outputs: void.
+ * Side effects: throws on failure. Failure modes: ValidationError.
+ * @param {object} params - Interval parameters.
+ * @throws {ValidationError} When interval is invalid.
+ */
+export function assertValidCueInterval(params) {
+  const result = validateCueInterval(params);
+  if (!result.valid) {
+    throw new ValidationError(result.error, result.field, result.code);
+  }
+}
+
+function buildOverlapDescriptor(a, b, indexA, indexB) {
+  const start = Math.max(roundToMs(a.start), roundToMs(b.start));
+  const end = Math.min(roundToMs(a.end), roundToMs(b.end));
+  if (end <= start) return null;
+  return {
+    cueAId: a.id,
+    cueBId: b.id,
+    indexA,
+    indexB,
+    overlapStart: start,
+    overlapEnd: end,
+    overlapDuration: roundToMs(end - start),
+  };
+}
+
+/**
+ * Detects overlapping time intervals across cues in a segment list.
+ * Inputs: timed segments array. Outputs: array of detected overlap records.
+ * Side effects: none. Failure modes: empty array on invalid inputs.
+ * @param {Array<object>} segments - Timed subtitle segments.
+ * @returns {Array<object>} List of detected overlap descriptors.
+ */
+export function detectCueOverlaps(segments) {
+  if (!Array.isArray(segments) || segments.length < 2) return [];
+  const overlaps = [];
+  for (let i = 0; i < segments.length; i++) {
+    for (let j = i + 1; j < segments.length; j++) {
+      const desc = buildOverlapDescriptor(segments[i], segments[j], i, j);
+      if (desc) overlaps.push(desc);
+    }
+  }
+  return overlaps;
+}
+
+/**
+ * Finds any overlap involving the specified segment ID.
+ * Inputs: segments array, segment ID. Outputs: overlap record or null.
+ * Side effects: none. Failure modes: null if not overlapping.
+ * @param {Array<object>} segments - Timed subtitle segments.
+ * @param {string} segId - Target segment ID.
+ * @returns {object|null} Overlap record or null.
+ */
+export function findCueOverlap(segments, segId) {
+  if (!segId) return null;
+  const overlaps = detectCueOverlaps(segments);
+  return overlaps.find(o => o.cueAId === segId || o.cueBId === segId) || null;
+}
+
+/**
+ * Retrieves the pause/gap duration before and after a specified cue.
+ * Inputs: segments array, segment ID. Outputs: gap duration info.
+ * Side effects: none. Failure modes: null gap bounds when on edge cues.
+ * @param {Array<object>} segments - Timed subtitle segments.
+ * @param {string} segId - Target segment ID.
+ * @returns {{ pauseBefore: number|null, pauseAfter: number|null, isOverlapping: boolean }} Gap info.
+ */
+export function getCuePause(segments, segId) {
+  const list = segments || [];
+  const idx = list.findIndex(s => s.id === segId);
+  if (idx < 0) return { pauseBefore: null, pauseAfter: null, isOverlapping: false };
+  const cur = list[idx];
+  const prev = idx > 0 ? list[idx - 1] : null;
+  const next = idx < list.length - 1 ? list[idx + 1] : null;
+  const pauseBefore = prev ? roundToMs(cur.start - prev.end) : null;
+  const pauseAfter = next ? roundToMs(next.start - cur.end) : null;
+  const isOverlapping = (pauseBefore !== null && pauseBefore < 0) || (pauseAfter !== null && pauseAfter < 0);
+  return { pauseBefore, pauseAfter, isOverlapping };
+}
+
+/**
+ * Clamps a cue interval within neighbor boundaries and minimum duration limits.
+ * Inputs: interval object, constraints. Outputs: clamped interval object.
+ * Side effects: none. Failure modes: enforces safe positive values.
+ * @param {{ start: number, end: number }} interval - Target interval.
+ * @param {object} [constraints] - Clamping bounds.
+ * @returns {{ start: number, end: number }} Clamped interval.
+ */
+export function clampCueInterval(interval, { minStart = 0, maxEnd = Infinity, minDuration = MIN_SPLIT_GAP_SEC } = {}) {
+  const safeMinStart = Math.max(0, Number.isFinite(minStart) ? minStart : 0);
+  const start = Math.max(safeMinStart, roundToMs(interval?.start ?? safeMinStart));
+  const rawEnd = roundToMs(interval?.end ?? start + minDuration);
+  const minEnd = roundToMs(start + minDuration);
+  const safeMaxEnd = Number.isFinite(maxEnd) ? Math.max(minEnd, maxEnd) : Infinity;
+  const end = Math.min(safeMaxEnd, Math.max(minEnd, rawEnd));
+  return { start, end };
+}
+
+/**
+ * Snaps a candidate timestamp to an anchor timestamp when within threshold distance.
+ * Inputs: candidate timestamp, target timestamp, snap threshold. Outputs: snapped or original timestamp.
+ * Side effects: none. Failure modes: returns 0 on invalid candidate.
+ * @param {number} timestamp - Current timestamp.
+ * @param {number} targetTimestamp - Snap target timestamp.
+ * @param {number} [threshold=0.15] - Maximum snapping distance in seconds.
+ * @returns {number} Snapped or original timestamp.
+ */
+export function snapCueTimestamp(timestamp, targetTimestamp, threshold = 0.15) {
+  if (!Number.isFinite(timestamp)) return 0;
+  if (!Number.isFinite(targetTimestamp)) return roundToMs(timestamp);
+  if (Math.abs(timestamp - targetTimestamp) <= threshold) {
+    return roundToMs(targetTimestamp);
+  }
+  return roundToMs(timestamp);
+}
+
+function shiftSubsequentCues(list, startIndex, delta, rippleAll) {
+  const endIndex = rippleAll ? list.length - 1 : startIndex;
+  return list.map((seg, i) => {
+    if (i < startIndex || i > endIndex) return seg;
+    return {
+      ...seg,
+      start: roundToMs(seg.start + delta),
+      end: roundToMs(seg.end + delta),
+    };
+  });
+}
+
+/**
+ * Adjusts the pause gap between a cue and its successor.
+ * Inputs: segments array, cue ID, target pause in seconds, options. Outputs: updated segments array.
+ * Side effects: none. Failure modes: returns input array when last cue or ID not found.
+ * @param {Array<object>} segments - Timed subtitle segments.
+ * @param {string} segId - Target segment ID.
+ * @param {number} pauseSec - Desired pause in seconds (>= 0).
+ * @param {object} [options] - Adjustment options.
+ * @returns {Array<object>} Updated segments list.
+ */
+export function adjustCuePause(segments, segId, pauseSec, options = {}) {
+  const list = segments || [];
+  const idx = list.findIndex(s => s.id === segId);
+  if (idx < 0 || idx >= list.length - 1) return list;
+  const { mode = 'shift_subsequent', minDuration = MIN_SPLIT_GAP_SEC, rippleAll = true } = options;
+  const safePause = Math.max(0, roundToMs(pauseSec));
+  const cur = list[idx];
+  const next = list[idx + 1];
+  if (mode === 'adjust_end') {
+    const nextEnd = Math.max(cur.start + minDuration, roundToMs(next.start - safePause));
+    return list.map((seg, i) => (i === idx ? { ...seg, end: nextEnd } : seg));
+  }
+  const targetNextStart = roundToMs(cur.end + safePause);
+  const delta = roundToMs(targetNextStart - next.start);
+  if (delta === 0) return list;
+  return shiftSubsequentCues(list, idx + 1, delta, rippleAll);
+}
+
+function resolveOverlapPair(a, b, options) {
+  const { resolutionMode, minDuration, minGap } = options;
+  if (resolutionMode === OVERLAP_RESOLVE_MODES.TRIM_NEXT) {
+    const newBStart = roundToMs(a.end + minGap);
+    const newBEnd = Math.max(newBStart + minDuration, b.end);
+    return [{ ...a }, { ...b, start: newBStart, end: newBEnd }];
+  }
+  if (resolutionMode === OVERLAP_RESOLVE_MODES.SHIFT_FORWARD) {
+    const duration = roundToMs(b.end - b.start);
+    const newBStart = roundToMs(a.end + minGap);
+    return [{ ...a }, { ...b, start: newBStart, end: roundToMs(newBStart + duration) }];
+  }
+  const trimmedEnd = Math.max(a.start + minDuration, roundToMs(b.start - minGap));
+  const forcedStart = trimmedEnd > roundToMs(b.start - minGap) ? roundToMs(trimmedEnd + minGap) : b.start;
+  const finalBEnd = Math.max(forcedStart + minDuration, b.end);
+  return [{ ...a, end: trimmedEnd }, { ...b, start: forcedStart, end: finalBEnd }];
+}
+
+/**
+ * Resolves overlapping intervals across adjacent subtitle segments.
+ * Inputs: segments array, resolution options. Outputs: resolved segments array.
+ * Side effects: none. Failure modes: returns input array when < 2 cues.
+ * @param {Array<object>} segments - Timed subtitle segments.
+ * @param {object} [options] - Resolution options.
+ * @returns {Array<object>} Resolved segments array.
+ */
+export function resolveCueOverlaps(segments, options = {}) {
+  const { resolutionMode = OVERLAP_RESOLVE_MODES.TRIM_PREVIOUS, minDuration = MIN_SPLIT_GAP_SEC, minGap = 0 } = options;
+  if (!Array.isArray(segments) || segments.length < 2) return segments || [];
+  const out = [segments[0]];
+  for (let i = 1; i < segments.length; i++) {
+    const prev = out[i - 1];
+    const cur = segments[i];
+    if (roundToMs(prev.end) > roundToMs(cur.start - minGap)) {
+      const [fixedPrev, fixedCur] = resolveOverlapPair(prev, cur, { resolutionMode, minDuration, minGap });
+      out[i - 1] = fixedPrev;
+      out.push(fixedCur);
+    } else {
+      out.push(cur);
+    }
+  }
+  return out;
 }
 
 /**
@@ -531,21 +856,62 @@ export function parseEditableTimestamp(raw) {
   return Math.round(total * 1000) / 1000;
 }
 
+function resolveSegmentTimingBounds(list, idx, minGap) {
+  const prev = idx > 0 ? list[idx - 1] : null;
+  const next = idx < list.length - 1 ? list[idx + 1] : null;
+  return {
+    prevEnd: prev ? roundToMs(prev.end + minGap) : 0,
+    nextStart: next ? roundToMs(next.start - minGap) : Infinity,
+  };
+}
+
+function computeClampedCueTimes(rawStart, rawEnd, bounds, minDuration) {
+  const boundedStart = Math.max(bounds.prevEnd, rawStart);
+  const minEnd = roundToMs(boundedStart + minDuration);
+  const boundedEnd = Math.min(bounds.nextStart, Math.max(minEnd, rawEnd));
+  return { start: boundedStart, end: boundedEnd };
+}
+
+function applyTimingWithOverlapMode(list, idx, params) {
+  const { rawStart, rawEnd, bounds, minDuration, overlapMode, minGap } = params;
+  if (overlapMode === OVERLAP_BEHAVIOR_MODES.PREVENT) {
+    const clamped = computeClampedCueTimes(rawStart, rawEnd, bounds, minDuration);
+    return list.map((seg, i) => (i === idx ? { ...seg, ...clamped } : seg));
+  }
+  const nextEnd = Math.max(roundToMs(rawStart + minDuration), rawEnd);
+  if (overlapMode === OVERLAP_BEHAVIOR_MODES.REJECT && (rawStart < bounds.prevEnd || nextEnd > bounds.nextStart)) {
+    throw new ValidationError('Cue interval overlaps with an adjacent cue.', 'timing', 'CUE_OVERLAP');
+  }
+  if (overlapMode === OVERLAP_BEHAVIOR_MODES.SHIFT_NEXT && nextEnd > bounds.nextStart) {
+    const delta = roundToMs(nextEnd - bounds.nextStart + minGap);
+    const updated = list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
+    return shiftSubsequentCues(updated, idx + 1, delta, true);
+  }
+  return list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
+}
+
 /**
- * Updates start/end timestamps on one subtitle segment while enforcing valid ordering.
+ * Updates start/end timestamps on one subtitle segment with validation and overlap handling.
+ * Inputs: segments array, cue ID, patch object, options. Outputs: updated segments array.
+ * Side effects: throws ValidationError when overlapMode is 'reject' and overlap occurs.
+ * Failure modes: returns input array when segId not found.
  * @param {Array<object>} segments - Subtitle segments.
  * @param {string} segId - Target segment ID.
- * @param {{ start?: number, end?: number }} patch - Timing patch.
+ * @param {{ start?: number, end?: number, duration?: number }} [patch] - Timing patch.
+ * @param {object} [options] - Timing and overlap options.
  * @returns {Array<object>} Updated segments array.
  */
-export function adjustSubtitleSegmentTiming(segments, segId, { start, end } = {}) {
-  return (segments || []).map(seg => {
-    if (seg.id !== segId) return seg;
-    const nextStart = Number.isFinite(start) ? Math.max(0, Math.round(start * 1000) / 1000) : seg.start;
-    const rawEnd = Number.isFinite(end) ? Math.max(0, Math.round(end * 1000) / 1000) : seg.end;
-    const nextEnd = Math.max(nextStart + MIN_SPLIT_GAP_SEC, rawEnd);
-    return { ...seg, start: nextStart, end: nextEnd };
-  });
+export function adjustSubtitleSegmentTiming(segments, segId, patch = {}, options = {}) {
+  const list = segments || [];
+  const idx = list.findIndex(seg => seg.id === segId);
+  if (idx < 0) return list;
+  const { minDuration = MIN_SPLIT_GAP_SEC, overlapMode = OVERLAP_BEHAVIOR_MODES.ALLOW, minGap = 0 } = options;
+  const cur = list[idx];
+  const rawStart = Number.isFinite(patch?.start) ? Math.max(0, roundToMs(patch.start)) : cur.start;
+  const candidateEnd = Number.isFinite(patch?.duration) ? roundToMs(rawStart + patch.duration) : patch?.end;
+  const rawEnd = Number.isFinite(candidateEnd) ? roundToMs(candidateEnd) : cur.end;
+  const bounds = resolveSegmentTimingBounds(list, idx, minGap);
+  return applyTimingWithOverlapMode(list, idx, { rawStart, rawEnd, bounds, minDuration, overlapMode, minGap });
 }
 
 /**
@@ -637,7 +1003,7 @@ export function splitSubtitleSegment(segments, segId, { ratio = 0.5, nextId } = 
   if (!textB && !trB) return list;
   const freshId = nextId || buildUniqueSegmentId(list, seg.id);
   const first = { ...seg, end: splitTime, text: textA || seg.text, translatedText: trA };
-  const second = { ...seg, id: freshId, start: splitTime, text: textB, translatedText: trB };
+  const second = { ...seg, id: freshId, start: splitTime, text: textB, translatedText: trB, ...(Array.isArray(seg.takes) ? { takes: [] } : {}) };
   return [...list.slice(0, idx), first, second, ...list.slice(idx + 1)];
 }
 
@@ -685,4 +1051,56 @@ export function replaceTextInSegments({ segments = [], findText = '', replaceTex
     return useTranslation ? { ...seg, translatedText: replaced } : { ...seg, text: replaced };
   });
   return { segments: next, matchCount, segmentCount };
+}
+
+import { applySpellingTerms, applyTranslationTerms } from './terminology.js';
+
+/**
+ * Stage 1 Batch Remedy: applies approved spelling & name variants to cue source `text` only.
+ * Never mutates `translatedText` or reads TTS pronunciation fields.
+ * Inputs: segments list, resolved terminology list, and optional `{ sourceLanguage, segmentId? }`.
+ * Outputs: `{ segments, updatedCount, updatedIds }`.
+ * Side effects: none.
+ * Failure modes: returns original segments when no matches are found.
+ * @param {Array<object>} segments - Subtitle segments.
+ * @param {readonly object[]} effectiveTerms - Resolved project terminology.
+ * @param {{ sourceLanguage?: string, segmentId?: string }} [options] - Language filter and optional single cue ID.
+ * @returns {{ segments: Array<object>, updatedCount: number, updatedIds: string[] }} Updated result.
+ */
+export function applySpellingTermsToSegments(segments, effectiveTerms, { sourceLanguage = '', segmentId = '' } = {}) {
+  if (!Array.isArray(segments) || !segments.length) return { segments: segments || [], updatedCount: 0, updatedIds: [] };
+  const updatedIds = [];
+  const next = segments.map(seg => {
+    if (segmentId && seg.id !== segmentId) return seg;
+    const corrected = applySpellingTerms(seg.text || '', effectiveTerms, { sourceLanguage });
+    if (corrected === (seg.text || '')) return seg;
+    updatedIds.push(seg.id);
+    return { ...seg, text: corrected };
+  });
+  return { segments: updatedIds.length ? next : segments, updatedCount: updatedIds.length, updatedIds };
+}
+
+/**
+ * Stage 2 Batch Remedy: applies approved translation terminology to existing `translatedText` cues only.
+ * Never modifies source `text` or injects TTS pronunciation overrides.
+ * Inputs: segments list, resolved terminology list, and `{ sourceLanguage?, targetLanguage?, segmentId? }`.
+ * Outputs: `{ segments, updatedCount, updatedIds }`.
+ * Side effects: none.
+ * Failure modes: returns unchanged list when no direct source-to-target replacements apply.
+ * @param {Array<object>} segments - Subtitle segments.
+ * @param {readonly object[]} effectiveTerms - Resolved project terminology.
+ * @param {{ sourceLanguage?: string, targetLanguage?: string, segmentId?: string }} [options] - Language pair and optional cue ID.
+ * @returns {{ segments: Array<object>, updatedCount: number, updatedIds: string[] }} Updated result.
+ */
+export function applyTranslationTermsToSegments(segments, effectiveTerms, { sourceLanguage = '', targetLanguage = '', segmentId = '' } = {}) {
+  if (!Array.isArray(segments) || !segments.length) return { segments: segments || [], updatedCount: 0, updatedIds: [] };
+  const updatedIds = [];
+  const next = segments.map(seg => {
+    if ((segmentId && seg.id !== segmentId) || !seg.translatedText) return seg;
+    const updated = applyTranslationTerms(seg.translatedText, effectiveTerms, { sourceLanguage, targetLanguage });
+    if (updated === seg.translatedText) return seg;
+    updatedIds.push(seg.id);
+    return { ...seg, translatedText: updated };
+  });
+  return { segments: updatedIds.length ? next : segments, updatedCount: updatedIds.length, updatedIds };
 }

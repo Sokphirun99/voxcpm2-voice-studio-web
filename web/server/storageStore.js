@@ -12,11 +12,34 @@ import {
 } from '../src/domain/audioValidation.js';
 import { StorageError, ValidationError } from '../src/domain/errors.js';
 import { normalizeGlossaryRules } from '../src/domain/pronunciationRules.js';
+import { normalizeTerminologyList } from '../src/domain/terminology.js';
 import { normalizeSavedEntry } from '../src/domain/voiceLibrary.js';
+import { createProjectStore, assertSafeProjectId, resolveSafeProjectPath } from './projectStore.js';
+import { createAssetStore } from './assetStore.js';
+import { createJobStore } from './jobStore.js';
+import {
+  runStorageMigrations,
+  verifyStorageIntegrity,
+  detectStorageMigrationsNeeded,
+  createStorageBackup,
+  rollbackStorageBackup,
+} from './storageMigration.js';
+
+export { assertSafeProjectId, resolveSafeProjectPath } from './projectStore.js';
+export {
+  runStorageMigrations,
+  verifyStorageIntegrity,
+  detectStorageMigrationsNeeded,
+  createStorageBackup,
+  rollbackStorageBackup,
+} from './storageMigration.js';
+
 
 const CATALOG_VERSION = 1;
 const GLOSSARY_VERSION = 1;
 const GLOSSARY_FILE_NAME = 'glossary.json';
+const TERMINOLOGY_VERSION = 1;
+const TERMINOLOGY_FILE_NAME = 'terminology.json';
 const CATALOG_FILE_NAME = 'catalog.json';
 const ANCHORS_DIR_NAME = 'anchors';
 const CACHE_DIR_NAME = 'cache';
@@ -29,10 +52,9 @@ const MAX_CACHE_ENTRIES = 100;
 const DEFAULT_AUDIO_MIME = 'audio/wav';
 const OCTET_STREAM_MIME = 'application/octet-stream';
 const PROJECTS_DIR_NAME = 'projects';
-const PROJECT_FILE_EXT = '.json';
-const PROJECT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const VALID_PROJECT_KINDS = new Set(['subtitle', 'tts']);
-const MAX_PROJECT_DOC_BYTES = 256 * 1024;
+const ASSETS_DIR_NAME = 'assets';
+const JOBS_DIR_NAME = 'jobs';
+
 
 /**
  * Validates that a cache key is a 64-character lowercase SHA-256 hex digest.
@@ -451,191 +473,6 @@ function saveCacheRecord(ctx, { key: rawKey, bytes, mimeType, metadata }) {
   });
 }
 
-/**
- * Validates that a project id is a UUID (never sequential integers) and safe for filesystem paths.
- * @param {unknown} rawId - Candidate project identifier.
- * @param {string} [field='projectId'] - Error field label.
- * @returns {string} Validated project id.
- */
-export function assertSafeProjectId(rawId, field = 'projectId') {
-  const id = typeof rawId === 'string' ? rawId.trim() : '';
-  if (!id || !PROJECT_ID_PATTERN.test(id)) {
-    throw new ValidationError('Project id must be a UUID.', field, 'INVALID_PROJECT_ID');
-  }
-  return id;
-}
-
-/**
- * Resolves a project snapshot path inside `projectsDir` and guards against directory escape.
- * @param {string} projectsDir - Base projects directory.
- * @param {string} projectId - Validated UUID project identifier.
- * @returns {string} Resolved absolute path inside `projectsDir`.
- */
-function resolveSafeProjectPath(projectsDir, projectId) {
-  const base = path.resolve(projectsDir);
-  const resolved = path.resolve(base, `${projectId}${PROJECT_FILE_EXT}`);
-  if (!resolved.startsWith(`${base}${path.sep}`)) {
-    throw new StorageError('Resolved project path escaped storage directory.');
-  }
-  return resolved;
-}
-
-/**
- * Reads a project snapshot from disk, returning null when absent.
- * @param {object} ctx - Store internals.
- * @param {string} projectId - Validated UUID project identifier.
- * @returns {Promise<object|null>} Parsed project snapshot or null.
- */
-async function readProjectFile(ctx, projectId) {
-  const projectPath = resolveSafeProjectPath(ctx.projectsDir, projectId);
-  try {
-    const raw = await readFile(projectPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    return parsed;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return null;
-    throw new StorageError('Could not read project snapshot from disk.', error);
-  }
-}
-
-/**
- * Validates project kind, title, and payload shape for create/update.
- * @param {object} input - Raw project input `{ kind, title, payload }`.
- * @returns {{ kind: string, title: string, payload: object }} Normalized project input.
- */
-function validateProjectInput(input) {
-  const { kind, title, payload } = input || {};
-  if (!VALID_PROJECT_KINDS.has(kind)) {
-    throw new ValidationError("Project kind must be 'subtitle' or 'tts'.", 'kind', 'INVALID_PROJECT_KIND');
-  }
-  if (typeof title !== 'string' || !title.trim()) {
-    throw new ValidationError('Project title is required.', 'title', 'INVALID_PROJECT_TITLE');
-  }
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new ValidationError('Project payload must be a JSON object.', 'payload', 'INVALID_PROJECT_PAYLOAD');
-  }
-  return { kind, title: title.trim(), payload };
-}
-
-/**
- * Builds a stored project row preserving `createdAt` across updates and stamping `updatedAt`.
- * @param {string} id - Validated UUID project id.
- * @param {object} input - Validated project input.
- * @param {object|undefined} existing - Prior row if present.
- * @returns {object} Persisted project row.
- */
-function buildProjectRow(id, input, existing) {
-  const nowIso = new Date().toISOString();
-  const isCreated = !existing || Boolean(existing.deletedAt);
-  const { kind, title, payload } = input;
-  const row = {
-    id,
-    kind,
-    title,
-    payload,
-    createdAt: isCreated ? nowIso : existing.createdAt,
-    updatedAt: nowIso,
-    deletedAt: null,
-  };
-  const docBytes = Buffer.byteLength(JSON.stringify(row), 'utf8');
-  if (docBytes > MAX_PROJECT_DOC_BYTES) {
-    throw new ValidationError('Project payload exceeds the size limit.', 'payload', 'PROJECT_TOO_LARGE');
-  }
-  return row;
-}
-
-/**
- * Upserts a project snapshot under `projects/<projectId>.json` atomically.
- * @param {object} ctx - Store internals.
- * @param {string} rawId - Project identifier.
- * @param {object} input - Raw project input.
- * @returns {Promise<{ project: object, isCreated: boolean }>} Saved record and create flag.
- */
-function saveProjectRecord(ctx, rawId, input) {
-  const id = assertSafeProjectId(rawId, 'projectId');
-  const projectInput = validateProjectInput(input);
-  return ctx.enqueueWrite(async () => {
-    await ctx.init();
-    const projectPath = resolveSafeProjectPath(ctx.projectsDir, id);
-    const existing = await readProjectFile(ctx, id);
-    const row = buildProjectRow(id, projectInput, existing);
-    await writeAtomicFile(projectPath, JSON.stringify(row, null, 2));
-    return { project: row, isCreated: !existing || Boolean(existing.deletedAt) };
-  });
-}
-
-/**
- * Reads one active project snapshot by id.
- * @param {object} ctx - Store internals.
- * @param {string} rawId - Project identifier.
- * @returns {Promise<object|null>} Full project snapshot or null if missing/soft-deleted.
- */
-async function getProjectRecord(ctx, rawId) {
-  const id = assertSafeProjectId(rawId, 'projectId');
-  const record = await readProjectFile(ctx, id);
-  if (!record || record.deletedAt) return null;
-  return record;
-}
-
-/**
- * Lists active (non-deleted) project summaries sorted by `updatedAt` desc with bounded pagination.
- * @param {object} ctx - Store internals.
- * @param {{ limit?: unknown, offset?: unknown }} query - Pagination options.
- * @returns {Promise<{ items: Array<object>, total: number, limit: number, offset: number, hasMore: boolean }>} Paginated summaries.
- */
-async function listProjectRecords(ctx, query) {
-  const { limit, offset } = normalizePagination({ limit: query?.limit ?? 50, offset: query?.offset ?? 0 });
-  await ctx.init();
-  let files;
-  try {
-    files = await readdir(ctx.projectsDir);
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { items: [], total: 0, limit, offset, hasMore: false };
-    throw new StorageError('Could not list projects from disk.', error);
-  }
-  const records = [];
-  for (const fileName of files) {
-    if (!fileName.endsWith(PROJECT_FILE_EXT)) continue;
-    const projectId = fileName.slice(0, -PROJECT_FILE_EXT.length);
-    if (!PROJECT_ID_PATTERN.test(projectId)) continue;
-    const record = await readProjectFile(ctx, projectId);
-    if (record && record.id === projectId && !record.deletedAt) records.push(record);
-  }
-  records.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-  const total = records.length;
-  const items = records.slice(offset, offset + limit).map(toPublicProjectSummary);
-  return { items, total, limit, offset, hasMore: offset + items.length < total };
-}
-
-function toPublicProjectSummary(record) {
-  return {
-    id: record.id,
-    kind: record.kind,
-    title: record.title,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-  };
-}
-
-/**
- * Soft-deletes a project snapshot by stamping `deletedAt`.
- * @param {object} ctx - Store internals.
- * @param {string} rawId - Project identifier.
- * @returns {Promise<boolean>} True if an active project was soft-deleted.
- */
-function softDeleteProjectRecord(ctx, rawId) {
-  const id = assertSafeProjectId(rawId, 'projectId');
-  return ctx.enqueueWrite(async () => {
-    const projectPath = resolveSafeProjectPath(ctx.projectsDir, id);
-    const existing = await readProjectFile(ctx, id);
-    if (!existing || existing.deletedAt) return false;
-    const nowIso = new Date().toISOString();
-    const updated = { ...existing, deletedAt: nowIso, updatedAt: nowIso };
-    await writeAtomicFile(projectPath, JSON.stringify(updated, null, 2));
-    return true;
-  });
-}
 
 /**
  * Reads `glossary.json`, returning an empty dictionary when it has never been saved.
@@ -676,6 +513,47 @@ function replaceGlossaryRecord(ctx, rawRules) {
     const row = { version: GLOSSARY_VERSION, rules, createdAt: existing.createdAt || nowIso, updatedAt: nowIso };
     await writeAtomicFile(ctx.glossaryPath, JSON.stringify(row, null, 2));
     return { rules, createdAt: row.createdAt, updatedAt: row.updatedAt };
+  });
+}
+
+/**
+ * Reads `terminology.json`, returning an empty list when it has never been saved.
+ * @param {string} terminologyPath - Path to `terminology.json`.
+ * @returns {Promise<{ terms: Array<object>, createdAt: string|null, updatedAt: string|null }>} Stored terminology.
+ */
+async function readTerminologyFile(terminologyPath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(terminologyPath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { terms: [], createdAt: null, updatedAt: null };
+    throw new StorageError('Could not read terminology library from disk.', error);
+  }
+  try {
+    return { terms: normalizeTerminologyList(parsed?.terms), createdAt: parsed?.createdAt ?? null, updatedAt: parsed?.updatedAt ?? null };
+  } catch (error) {
+    throw new StorageError('Stored terminology library is invalid.', error);
+  }
+}
+
+/**
+ * Validates and atomically replaces the reusable global terminology library inside the write queue.
+ * @param {object} ctx - Store internals.
+ * @param {unknown} rawTerms - Candidate term array (validated before any disk write).
+ * @returns {Promise<{ terms: Array<object>, createdAt: string, updatedAt: string }>} Persisted terminology.
+ */
+function replaceTerminologyRecord(ctx, rawTerms) {
+  const terms = normalizeTerminologyList(rawTerms);
+  return ctx.enqueueWrite(async () => {
+    await ctx.init();
+    const existing = await readTerminologyFile(ctx.terminologyPath).catch(error => {
+      if (error instanceof StorageError) return { createdAt: null };
+      throw error;
+    });
+    const nowIso = new Date().toISOString();
+    const row = { version: TERMINOLOGY_VERSION, terms, createdAt: existing.createdAt || nowIso, updatedAt: nowIso };
+    await writeAtomicFile(ctx.terminologyPath, JSON.stringify(row, null, 2));
+    return { terms, createdAt: row.createdAt, updatedAt: row.updatedAt };
   });
 }
 
@@ -729,10 +607,11 @@ async function readVolumeCapacity(rootDir) {
  * @returns {Promise<object>} Storage usage statistics.
  */
 async function readStoreStats(ctx) {
-  const [catalog, cacheIndex, capacity] = await Promise.all([
+  const [catalog, cacheIndex, capacity, jobsPage] = await Promise.all([
     loadCatalog(ctx.catalogPath),
     loadCacheIndex(ctx.cacheIndexPath),
     readVolumeCapacity(ctx.rootDir),
+    ctx.jobStore.listJobs({ limit: 1, offset: 0 }),
   ]);
   const characters = Object.values(catalog.characters || {}).filter(item => item && !item.deleted_at);
   const anchors = Object.values(catalog.anchors || {}).filter(item => item && !item.deleted_at);
@@ -747,6 +626,8 @@ async function readStoreStats(ctx) {
     maxCacheEntries: ctx.maxCacheEntries,
     cacheBytes,
     usedBytes: anchorBytes + cacheBytes,
+    jobsCount: jobsPage?.summary?.total ?? 0,
+    activeJobsCount: jobsPage?.summary?.active ?? 0,
     ...capacity,
   };
 }
@@ -760,30 +641,56 @@ async function readStoreStats(ctx) {
  * @param {{ dataDir: string, maxCacheEntries?: number }} config - Storage configuration.
  * @returns {object} Persistent storage store.
  */
-export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIES }) {
+export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIES, autoMigrate = true }) {
   const rootDir = path.resolve(dataDir);
   const anchorsDir = path.join(rootDir, ANCHORS_DIR_NAME);
   const cacheDir = path.join(rootDir, CACHE_DIR_NAME);
   const catalogPath = path.join(rootDir, CATALOG_FILE_NAME);
   const cacheIndexPath = path.join(rootDir, CACHE_INDEX_FILE_NAME);
   const projectsDir = path.join(rootDir, PROJECTS_DIR_NAME);
+  const assetsDir = path.join(rootDir, ASSETS_DIR_NAME);
+  const jobsDir = path.join(rootDir, JOBS_DIR_NAME);
   const glossaryPath = path.join(rootDir, GLOSSARY_FILE_NAME);
+  const terminologyPath = path.join(rootDir, TERMINOLOGY_FILE_NAME);
   let writeChain = Promise.resolve();
   const enqueueWrite = task => {
     const run = writeChain.then(task, task);
     writeChain = run.catch(() => {});
     return run;
   };
-  const init = async () => {
-    await mkdir(anchorsDir, { recursive: true });
-    await mkdir(cacheDir, { recursive: true });
-    await mkdir(projectsDir, { recursive: true });
-    await stat(anchorsDir);
+  const projectStore = createProjectStore({ projectsDir, enqueueWrite });
+  const assetStore = createAssetStore({ assetsDir, dataDir: rootDir, enqueueWrite });
+  const jobStore = createJobStore({ jobsDir, dataDir: rootDir, enqueueWrite });
+  let initPromise = null;
+  const init = () => {
+    if (!initPromise) {
+      initPromise = (async () => {
+        await mkdir(anchorsDir, { recursive: true });
+        await mkdir(cacheDir, { recursive: true });
+        await projectStore.init();
+        await assetStore.init();
+        await jobStore.init();
+        if (autoMigrate) {
+          await runStorageMigrations({ dataDir: rootDir });
+        }
+        await stat(anchorsDir);
+      })().catch(error => {
+        initPromise = null;
+        throw error;
+      });
+    }
+    return initPromise;
   };
-  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, maxCacheEntries, enqueueWrite, init };
+  const ctx = { rootDir, anchorsDir, cacheDir, catalogPath, cacheIndexPath, projectsDir, glossaryPath, terminologyPath, jobStore, maxCacheEntries, enqueueWrite, init };
   return {
     init,
     dataDir: rootDir,
+    projectStore,
+    assetStore,
+    jobStore,
+    migrate: options => enqueueWrite(() => runStorageMigrations({ dataDir: rootDir, ...options })),
+    verifyIntegrity: () => verifyStorageIntegrity({ dataDir: rootDir }),
+    detectMigrations: () => detectStorageMigrationsNeeded({ dataDir: rootDir }),
     listCharacters: async query => paginateActiveRecords((await loadCatalog(catalogPath)).characters, query),
     upsertCharacter: (rawId, input) => saveCharacterRecord(ctx, rawId, input),
     deleteCharacter: rawId => softDeleteCharacterRecord(ctx, rawId),
@@ -795,12 +702,33 @@ export function createStorageStore({ dataDir, maxCacheEntries = MAX_CACHE_ENTRIE
     upsertAnchor: input => saveAnchorRecord(ctx, input),
     patchAnchor: (rawId, patch) => patchAnchorRecord(ctx, rawId, patch),
     deleteAnchor: rawId => softDeleteAnchorRecord(ctx, rawId),
-    listProjects: async query => listProjectRecords(ctx, query),
-    upsertProject: (rawId, input) => saveProjectRecord(ctx, rawId, input),
-    getProject: rawId => getProjectRecord(ctx, rawId),
-    deleteProject: rawId => softDeleteProjectRecord(ctx, rawId),
+    listProjects: query => projectStore.listProjects(query),
+    createProject: input => projectStore.createProject(input),
+    upsertProject: (rawId, input, options) => projectStore.saveProject(rawId, input, options),
+    getProject: (rawId, options) => projectStore.getProject(rawId, options),
+    deleteProject: (rawId, options) => projectStore.deleteProject(rawId, options),
+    duplicateProject: (rawId, options) => projectStore.duplicateProject(rawId, options),
+    restoreProject: (rawId, options) => projectStore.restoreProject(rawId, options),
+    saveAsset: input => assetStore.saveAsset(input),
+    getAsset: (rawId, options) => assetStore.getAsset(rawId, options),
+    getAssetBinary: (rawId, options) => assetStore.getAssetBinary(rawId, options),
+    deleteAsset: (rawId, options) => assetStore.deleteAsset(rawId, options),
+    listAssets: query => assetStore.listAssets(query),
+    purgeDeletedAssets: options => assetStore.purgeDeletedAssets(options),
+    enqueueJob: input => jobStore.enqueueJob(input),
+    getJob: rawId => jobStore.getJob(rawId),
+    listJobs: query => jobStore.listJobs(query),
+    updateJob: (rawId, patch, options) => jobStore.updateJob(rawId, patch, options),
+    cancelJob: (rawId, options) => jobStore.cancelJob(rawId, options),
+    retryJob: (rawId, options) => jobStore.retryJob(rawId, options),
+    interruptJob: (rawId, options) => jobStore.interruptJob(rawId, options),
+    recoverInterruptedJobs: () => jobStore.recoverInterruptedJobs(),
+    deleteJob: (rawId, options) => jobStore.deleteJob(rawId, options),
+    clearHistory: () => jobStore.clearHistory(),
     getGlossary: () => readGlossaryFile(glossaryPath),
     replaceGlossary: rawRules => replaceGlossaryRecord(ctx, rawRules),
+    getTerminology: () => readTerminologyFile(terminologyPath),
+    replaceTerminology: rawTerms => replaceTerminologyRecord(ctx, rawTerms),
     getCacheEntry: async rawKey => (await readCacheAudioRecord(ctx, rawKey))?.meta || null,
     getCacheAudio: rawKey => readCacheAudioRecord(ctx, rawKey),
     putCacheEntry: input => saveCacheRecord(ctx, input),

@@ -4,7 +4,7 @@
 
 import React, { createContext, useContext } from 'react';
 
-const StudioContext = createContext(null);
+export const StudioContext = createContext(null);
 
 /**
  * Provides wired domain use cases and adapters to the presentation layer.

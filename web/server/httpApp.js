@@ -3,21 +3,25 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { StorageError, ValidationError } from '../src/domain/errors.js';
+import { ConflictError, StorageError, ValidationError } from '../src/domain/errors.js';
 import { MAX_GLOSSARY_RULES } from '../src/domain/pronunciationRules.js';
+import { MAX_TERMINOLOGY_TERMS } from '../src/domain/terminology.js';
 import { assertSafeProjectId } from './storageStore.js';
 import { FfmpegUnavailableError, createAudioMaster } from './audioMaster.js';
 import { createServerLogger } from './logger.js';
 import { createRateLimiter } from './rateLimiter.js';
+import { handleProjectRoutes } from './projectRoutes.js';
+import { handleAssetRoutes } from './assetRoutes.js';
+import { handleJobRoutes } from './jobRoutes.js';
 
-const MAX_JSON_BODY_BYTES = 256 * 1024;
-const MAX_MULTIPART_BODY_BYTES = 22 * 1024 * 1024;
-const API_PREFIX = '/api/v1';
+export const MAX_JSON_BODY_BYTES = 256 * 1024;
+export const MAX_MULTIPART_BODY_BYTES = 22 * 1024 * 1024;
+export const API_PREFIX = '/api/v1';
 
 /**
  * Typed HTTP error mapped directly to truthful status codes and error envelopes.
  */
-class HttpApiError extends Error {
+export class HttpApiError extends Error {
   /**
    * @param {number} status - HTTP status code.
    * @param {string} code - Machine-readable error code.
@@ -60,7 +64,7 @@ function resolveClientIp(req) {
  * Writes a JSON envelope `{ data, error, meta }` with security headers.
  * @param {{ res: import('node:http').ServerResponse, status: number, payload: { data: unknown, error: unknown, meta?: object }, requestId: string, headers?: Record<string, string> }} spec - Response spec.
  */
-function sendJson({ res, status, payload, requestId, headers = {} }) {
+export function sendJson({ res, status, payload, requestId, headers = {} }) {
   const body = JSON.stringify({
     data: payload.data ?? null,
     error: payload.error ?? null,
@@ -82,7 +86,7 @@ function sendJson({ res, status, payload, requestId, headers = {} }) {
  * @param {number} maxBytes - Maximum permitted payload size.
  * @returns {Promise<Buffer>} Buffered request bytes.
  */
-async function readBoundedBody(req, maxBytes) {
+export async function readBoundedBody(req, maxBytes) {
   const chunks = [];
   let total = 0;
   for await (const chunk of req) {
@@ -100,12 +104,12 @@ async function readBoundedBody(req, maxBytes) {
  * @param {import('node:http').IncomingMessage} req - HTTP request.
  * @returns {Promise<object>} Parsed JSON object.
  */
-async function readJsonPayload(req) {
+export async function readJsonPayload(req, maxBytes = MAX_JSON_BODY_BYTES) {
   const contentType = String(req.headers['content-type'] || '').toLowerCase();
   if (!contentType.includes('application/json')) {
     throw new HttpApiError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Expected application/json request body.');
   }
-  const buffer = await readBoundedBody(req, MAX_JSON_BODY_BYTES);
+  const buffer = await readBoundedBody(req, maxBytes);
   try {
     const parsed = JSON.parse(buffer.toString('utf8') || '{}');
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -162,14 +166,33 @@ function decodePathId(rawSegment) {
  * @returns {{ status: number, code: string, message: string }} Sanitized error descriptor.
  */
 function mapErrorToHttp(error) {
-  if (error instanceof HttpApiError) return { status: error.status, code: error.code, message: error.message };
+  if (error instanceof HttpApiError) return { status: error.status, code: error.code, message: error.message, field: error.field };
   if (error instanceof FfmpegUnavailableError) return { status: 503, code: error.code, message: error.message };
+  if (error instanceof ConflictError || error?.code === 'REVISION_CONFLICT') {
+    return { status: 409, code: error.code || 'REVISION_CONFLICT', message: error.message };
+  }
   if (error instanceof ValidationError) {
-    const status = error.code === 'UNSUPPORTED_AUDIO_TYPE' ? 415 : 422;
-    return { status, code: error.code || 'VALIDATION_ERROR', message: error.message };
+    let status = 422;
+    if (error.code === 'UNSUPPORTED_AUDIO_TYPE') status = 415;
+    else if (error.code === 'JOB_QUEUE_FULL') status = 429;
+    return { status, code: error.code || 'VALIDATION_ERROR', message: error.message, field: error.field };
   }
   if (error instanceof StorageError) return { status: 500, code: error.code || 'STORAGE_ERROR', message: error.message };
   return { status: 500, code: 'INTERNAL_ERROR', message: 'Internal storage service error.' };
+}
+
+async function putCharacterRoute({ req, res, store, requestId, id }) {
+  const body = await readJsonPayload(req);
+  const { character, isCreated } = await store.upsertCharacter(id, body);
+  sendJson({ res, status: isCreated ? 201 : 200, payload: { data: { character } }, requestId });
+  return true;
+}
+
+async function deleteCharacterRoute({ res, store, requestId, id }) {
+  const deleted = await store.deleteCharacter(id);
+  if (!deleted) throw new HttpApiError(404, 'CHARACTER_NOT_FOUND', 'Character was not found.');
+  sendJson({ res, status: 200, payload: { data: { deleted: true, id } }, requestId });
+  return true;
 }
 
 /**
@@ -186,18 +209,8 @@ async function handleCharacterRoutes({ req, res, url, store, requestId }) {
   const match = /^\/api\/v1\/characters\/([^/]+)$/.exec(url.pathname);
   if (!match) return false;
   const id = decodePathId(match[1]);
-  if (req.method === 'PUT') {
-    const body = await readJsonPayload(req);
-    const { character, isCreated } = await store.upsertCharacter(id, body);
-    sendJson({ res, status: isCreated ? 201 : 200, payload: { data: { character } }, requestId });
-    return true;
-  }
-  if (req.method === 'DELETE') {
-    const deleted = await store.deleteCharacter(id);
-    if (!deleted) throw new HttpApiError(404, 'CHARACTER_NOT_FOUND', 'Character was not found.');
-    sendJson({ res, status: 200, payload: { data: { deleted: true, id } }, requestId });
-    return true;
-  }
+  if (req.method === 'PUT') return putCharacterRoute({ req, res, store, requestId, id });
+  if (req.method === 'DELETE') return deleteCharacterRoute({ res, store, requestId, id });
   return false;
 }
 
@@ -239,6 +252,26 @@ async function handleAnchorRoutes({ req, res, url, store, requestId }) {
   return handleAnchorMutationRoutes({ req, res, url, store, requestId });
 }
 
+async function putAnchorRoute({ req, res, store, requestId, characterId }) {
+  const parsed = await readMultipartAnchor(req);
+  const anchor = await store.upsertAnchor({ characterId, ...parsed });
+  sendJson({ res, status: 200, payload: { data: { anchor } }, requestId });
+  return true;
+}
+
+async function patchAnchorRoute({ req, res, store, requestId, characterId }) {
+  const anchor = await store.patchAnchor(characterId, await readJsonPayload(req));
+  if (!anchor) throw new HttpApiError(404, 'ANCHOR_NOT_FOUND', 'Locked voice anchor not found.');
+  sendJson({ res, status: 200, payload: { data: { anchor } }, requestId });
+  return true;
+}
+
+async function deleteAnchorRoute({ res, store, requestId, characterId }) {
+  const deleted = await store.deleteAnchor(characterId);
+  sendJson({ res, status: 200, payload: { data: { deleted, characterId } }, requestId });
+  return true;
+}
+
 /**
  * Dispatches mutating anchor endpoints (`PUT`, `PATCH`, `DELETE /api/v1/anchors/:id`).
  * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
@@ -248,23 +281,9 @@ async function handleAnchorMutationRoutes({ req, res, url, store, requestId }) {
   const match = /^\/api\/v1\/anchors\/([^/]+)$/.exec(url.pathname);
   if (!match) return false;
   const characterId = decodePathId(match[1]);
-  if (req.method === 'PUT') {
-    const parsed = await readMultipartAnchor(req);
-    const anchor = await store.upsertAnchor({ characterId, ...parsed });
-    sendJson({ res, status: 200, payload: { data: { anchor } }, requestId });
-    return true;
-  }
-  if (req.method === 'PATCH') {
-    const anchor = await store.patchAnchor(characterId, await readJsonPayload(req));
-    if (!anchor) throw new HttpApiError(404, 'ANCHOR_NOT_FOUND', 'Locked voice anchor not found.');
-    sendJson({ res, status: 200, payload: { data: { anchor } }, requestId });
-    return true;
-  }
-  if (req.method === 'DELETE') {
-    const deleted = await store.deleteAnchor(characterId);
-    sendJson({ res, status: 200, payload: { data: { deleted, characterId } }, requestId });
-    return true;
-  }
+  if (req.method === 'PUT') return putAnchorRoute({ req, res, store, requestId, characterId });
+  if (req.method === 'PATCH') return patchAnchorRoute({ req, res, store, requestId, characterId });
+  if (req.method === 'DELETE') return deleteAnchorRoute({ res, store, requestId, characterId });
   return false;
 }
 
@@ -298,6 +317,28 @@ async function handleAudioMasterRoute({ req, res, url, audioMaster, requestId })
   return true;
 }
 
+async function handleCacheAudioRoute({ res, store, rawKey, requestId }) {
+  const cached = await store.getCacheAudio(decodePathId(rawKey));
+  if (!cached) throw new HttpApiError(404, 'CACHE_MISS', 'Cached synthesis audio not found.');
+  sendBinaryAudio({ res, bytes: cached.bytes, mimeType: cached.meta.mimeType, requestId });
+  return true;
+}
+
+async function handleCacheEntryRoute({ req, res, store, key, requestId }) {
+  if (req.method === 'GET') {
+    const entry = await store.getCacheEntry(key);
+    if (!entry) throw new HttpApiError(404, 'CACHE_MISS', 'Cached synthesis entry not found.');
+    sendJson({ res, status: 200, payload: { data: { hit: true, entry } }, requestId });
+    return true;
+  }
+  if (req.method === 'PUT') {
+    const entry = await store.putCacheEntry({ key, ...(await readMultipartAnchor(req)) });
+    sendJson({ res, status: 200, payload: { data: { entry } }, requestId });
+    return true;
+  }
+  return false;
+}
+
 /**
  * Dispatches bounded synthesis cache endpoints (`GET`, `PUT /api/v1/cache/:key`).
  * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
@@ -306,65 +347,12 @@ async function handleAudioMasterRoute({ req, res, url, audioMaster, requestId })
 async function handleCacheRoutes({ req, res, url, store, requestId }) {
   const audioMatch = /^\/api\/v1\/cache\/([^/]+)\/audio$/.exec(url.pathname);
   if (audioMatch && req.method === 'GET') {
-    const cached = await store.getCacheAudio(decodePathId(audioMatch[1]));
-    if (!cached) throw new HttpApiError(404, 'CACHE_MISS', 'Cached synthesis audio not found.');
-    sendBinaryAudio({ res, bytes: cached.bytes, mimeType: cached.meta.mimeType, requestId });
-    return true;
+    return handleCacheAudioRoute({ res, store, rawKey: audioMatch[1], requestId });
   }
   const metaMatch = /^\/api\/v1\/cache\/([^/]+)$/.exec(url.pathname);
   if (!metaMatch) return false;
   const key = decodePathId(metaMatch[1]);
-  if (req.method === 'GET') {
-    const entry = await store.getCacheEntry(key);
-    if (!entry) throw new HttpApiError(404, 'CACHE_MISS', 'Cached synthesis entry not found.');
-    sendJson({ res, status: 200, payload: { data: { hit: true, entry } }, requestId });
-    return true;
-  }
-  if (req.method !== 'PUT') return false;
-  const entry = await store.putCacheEntry({ key, ...(await readMultipartAnchor(req)) });
-  sendJson({ res, status: 200, payload: { data: { entry } }, requestId });
-  return true;
-}
-
-/**
- * Dispatches versioned project snapshot endpoints (`GET`, `PUT`, `DELETE /api/v1/projects[:id]`).
- * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
- * @returns {Promise<boolean>} True if route matched.
- */
-async function handleProjectRoutes({ req, res, url, store, requestId }) {
-  if (url.pathname === `${API_PREFIX}/projects` && req.method === 'GET') {
-    const page = await store.listProjects({ limit: url.searchParams.get('limit'), offset: url.searchParams.get('offset') });
-    const { items, ...meta } = page;
-    sendJson({ res, status: 200, payload: { data: { items }, meta }, requestId });
-    return true;
-  }
-  const match = /^\/api\/v1\/projects\/([^/]+)$/.exec(url.pathname);
-  if (!match) return false;
-  let id;
-  try {
-    id = assertSafeProjectId(match[1], 'projectId');
-  } catch (error) {
-    throw new HttpApiError(400, 'INVALID_PROJECT_ID', error.message);
-  }
-  if (req.method === 'GET') {
-    const project = await store.getProject(id);
-    if (!project) throw new HttpApiError(404, 'PROJECT_NOT_FOUND', 'Project snapshot not found.');
-    sendJson({ res, status: 200, payload: { data: { project } }, requestId });
-    return true;
-  }
-  if (req.method === 'PUT') {
-    const body = await readJsonPayload(req);
-    const { project, isCreated } = await store.upsertProject(id, body);
-    sendJson({ res, status: isCreated ? 201 : 200, payload: { data: { project } }, requestId });
-    return true;
-  }
-  if (req.method === 'DELETE') {
-    const deleted = await store.deleteProject(id);
-    if (!deleted) throw new HttpApiError(404, 'PROJECT_NOT_FOUND', 'Project was not found.');
-    sendJson({ res, status: 200, payload: { data: { deleted: true, id } }, requestId });
-    return true;
-  }
-  return false;
+  return handleCacheEntryRoute({ req, res, store, key, requestId });
 }
 
 /**
@@ -402,30 +390,92 @@ function sendGlossary({ res, status, glossary, requestId }) {
 }
 
 /**
- * Resolves health or domain/audio routes inside the API gateway.
- * @param {object} ctx - Dispatch context.
- * @returns {Promise<void>} Resolves once response has been written.
+ * Dispatches the reusable terminology library endpoint (`GET`, `PUT /api/v1/terminology`).
+ * `PUT` replaces the global terminology list: malformed body shape -> 400, rule violations -> 422, other verbs -> 405.
+ * @param {{ req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, url: URL, store: object, requestId: string }} ctx - Route context.
+ * @returns {Promise<boolean>} True if route matched.
  */
-async function routeApiRequest(ctx) {
-  const { req, res, url, store, audioMaster, requestId } = ctx;
+async function handleTerminologyRoutes({ req, res, url, store, requestId }) {
+  if (url.pathname !== `${API_PREFIX}/terminology`) return false;
+  if (req.method === 'GET') {
+    const terminology = await store.getTerminology();
+    sendTerminology({ res, status: 200, terminology, requestId });
+    return true;
+  }
+  if (req.method === 'PUT') {
+    const body = await readJsonPayload(req, MAX_JSON_BODY_BYTES * 2);
+    const unknownKeys = Object.keys(body).filter(key => key !== 'terms');
+    if (!Array.isArray(body.terms) || unknownKeys.length > 0) {
+      throw new HttpApiError(400, 'INVALID_TERMINOLOGY_PAYLOAD', 'Body must be { "terms": [...] }.');
+    }
+    sendTerminology({ res, status: 200, terminology: await store.replaceTerminology(body.terms), requestId });
+    return true;
+  }
+  throw new HttpApiError(405, 'METHOD_NOT_ALLOWED', 'Use GET or PUT for terminology.');
+}
+
+/**
+ * Writes the `{ data: { terms }, meta }` terminology envelope.
+ * @param {{ res: import('node:http').ServerResponse, status: number, terminology: { terms: Array<object>, updatedAt: string|null }, requestId: string }} spec - Response spec.
+ */
+function sendTerminology({ res, status, terminology, requestId }) {
+  const meta = { count: terminology.terms.length, maxTerms: MAX_TERMINOLOGY_TERMS, updatedAt: terminology.updatedAt ?? null };
+  sendJson({ res, status, payload: { data: { terms: terminology.terms }, meta }, requestId });
+}
+
+async function handleSystemRoutes({ req, res, url, store, audioMaster, requestId }) {
   if (url.pathname === `${API_PREFIX}/health` && req.method === 'GET') {
     const ffmpegAvailable = audioMaster ? await audioMaster.checkAvailability() : false;
     sendJson({ res, status: 200, payload: { data: { status: 'ok', service: 'voice-studio-storage', ffmpegAvailable } }, requestId });
-    return;
+    return true;
   }
   if (url.pathname === `${API_PREFIX}/stats` && req.method === 'GET') {
     const storage = await store.getStats();
     const { rss } = process.memoryUsage();
     sendJson({ res, status: 200, payload: { data: { storage, container: { rssBytes: rss, uptimeSeconds: Math.round(process.uptime()) } } }, requestId });
-    return;
+    return true;
   }
+  return false;
+}
+
+/**
+ * Resolves health or domain/audio routes inside the API gateway.
+ * @param {object} ctx - Dispatch context.
+ * @returns {Promise<void>} Resolves once response has been written.
+ */
+async function routeApiRequest(ctx) {
+  if (await handleSystemRoutes(ctx)) return;
   const handled = (await handleCharacterRoutes(ctx))
     || (await handleAnchorRoutes(ctx))
     || (await handleProjectRoutes(ctx))
+    || (await handleAssetRoutes(ctx))
+    || (await handleJobRoutes(ctx))
     || (await handleGlossaryRoutes(ctx))
+    || (await handleTerminologyRoutes(ctx))
     || (await handleAudioMasterRoute(ctx))
     || (await handleCacheRoutes(ctx));
   if (!handled) throw new HttpApiError(404, 'NOT_FOUND', 'Endpoint not found.');
+}
+
+function assertSafePathSegments(rawPath) {
+  if (/^\/api\/v1\/projects\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
+    throw new HttpApiError(400, 'INVALID_PROJECT_ID', 'Project id must be a UUID.');
+  }
+  if (/^\/api\/v1\/assets\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
+    throw new HttpApiError(400, 'INVALID_ASSET_ID', 'Asset id must be a UUID.');
+  }
+  if (/^\/api\/v1\/jobs\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
+    throw new HttpApiError(400, 'INVALID_JOB_ID', 'Job id must be a UUID.');
+  }
+}
+
+function handleDispatchError({ res, error, url, method, requestId, logger }) {
+  const mapped = mapErrorToHttp(error);
+  const retryHeader = mapped.status === 429 ? { 'Retry-After': String(error?.retryAfterSeconds || 60) } : {};
+  const extraHeaders = mapped.status === 405 ? { Allow: error?.allow || 'GET, PUT' } : retryHeader;
+  logger.error('HTTP request failed', { method, path: url.pathname, status: mapped.status, code: mapped.code, errorMessage: error?.message }, requestId);
+  const errorBody = { code: mapped.code, message: mapped.message, ...(mapped.field ? { field: mapped.field } : {}) };
+  if (!res.headersSent) sendJson({ res, status: mapped.status, payload: { data: null, error: errorBody }, requestId, headers: extraHeaders });
 }
 
 /**
@@ -440,20 +490,13 @@ async function dispatchStorageRequest({ req, res, store, audioMaster, limiter, l
   try {
     const rate = limiter.check(resolveClientIp(req));
     if (!rate.allowed) throw new HttpApiError(429, 'RATE_LIMIT_EXCEEDED', 'Too many storage requests. Retry shortly.', rate.retryAfterSeconds);
-    const rawPath = String(req.url || '/').split(/[?#]/, 1)[0];
-    if (/^\/api\/v1\/projects\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(rawPath)) {
-      throw new HttpApiError(400, 'INVALID_PROJECT_ID', 'Project id must be a UUID.');
-    }
+    assertSafePathSegments(String(req.url || '/').split(/[?#]/, 1)[0]);
     await routeApiRequest({ req, res, url, store, audioMaster, requestId });
     if (url.pathname !== `${API_PREFIX}/health`) {
       logger.info('HTTP request completed', { method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt }, requestId);
     }
   } catch (error) {
-    const mapped = mapErrorToHttp(error);
-    const retryHeader = mapped.status === 429 ? { 'Retry-After': String(error?.retryAfterSeconds || 60) } : {};
-    const extraHeaders = mapped.status === 405 ? { Allow: 'GET, PUT' } : retryHeader;
-    logger.error('HTTP request failed', { method: req.method, path: url.pathname, status: mapped.status, code: mapped.code, errorMessage: error?.message }, requestId);
-    if (!res.headersSent) sendJson({ res, status: mapped.status, payload: { data: null, error: { code: mapped.code, message: mapped.message } }, requestId, headers: extraHeaders });
+    handleDispatchError({ res, error, url, method: req.method, requestId, logger });
   }
 }
 

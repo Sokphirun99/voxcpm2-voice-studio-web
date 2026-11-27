@@ -14,9 +14,9 @@ const SILENCE_AMP_THRESHOLD = 128;
 const MIN_TRIM_DURATION_MS = 250;
 const TRIM_HEAD_PAD_MS = 45;
 const TRIM_TAIL_PAD_MS = 80;
-const MIN_FADE_DURATION_MS = 50;
-const EDGE_FADE_MS = 5;
-const DEFAULT_PAUSE_MS = 160;
+export const MIN_FADE_DURATION_MS = 50;
+export const EDGE_FADE_MS = 5;
+export const DEFAULT_PAUSE_MS = 160;
 
 /**
  * Reads a 4-character ASCII tag from a DataView.
@@ -167,10 +167,14 @@ export function readWavDurationSeconds(buffer) {
 
 /**
  * Builds a frame-aligned zero-byte silence buffer for inserting pauses between stitched clips.
+ * Inputs: timing specification ({ byteRate, blockAlign, pauseMs }).
+ * Outputs: zero-filled PCM silence Uint8Array.
+ * Side effects: none.
+ * Failure modes: returns empty Uint8Array for non-finite or negative pauseMs.
  * @param {{ byteRate: number, blockAlign: number, pauseMs: number }} spec - Timing specification.
  * @returns {Uint8Array} Zero-filled PCM silence slice.
  */
-function buildSilenceBytes({ byteRate, blockAlign, pauseMs }) {
+export function buildSilenceBytes({ byteRate, blockAlign, pauseMs }) {
   if (!Number.isFinite(pauseMs) || pauseMs <= 0) return new Uint8Array(0);
   const rawBytes = Math.round((byteRate * pauseMs) / MS_PER_SECOND);
   const alignedBytes = Math.floor(rawBytes / blockAlign) * blockAlign;
@@ -179,10 +183,14 @@ function buildSilenceBytes({ byteRate, blockAlign, pauseMs }) {
 
 /**
  * Creates a standard 44-byte RIFF/WAVE PCM header.
+ * Inputs: format and payload size metadata.
+ * Outputs: 44-byte Uint8Array WAV header.
+ * Side effects: none.
+ * Failure modes: none.
  * @param {{ numChannels: number, sampleRate: number, byteRate: number, blockAlign: number, bitsPerSample: number, dataLength: number }} meta - PCM format and total payload size.
  * @returns {Uint8Array} 44-byte WAV header.
  */
-function buildWaveHeader(meta) {
+export function buildWaveHeader(meta) {
   const header = new ArrayBuffer(RIFF_HEADER_BYTES);
   const view = new DataView(header);
   writeTag(view, 0, 'RIFF');
@@ -199,20 +207,6 @@ function buildWaveHeader(meta) {
   writeTag(view, 36, 'data');
   view.setUint32(40, meta.dataLength, true);
   return new Uint8Array(header);
-}
-
-/**
- * Checks whether two decoded WAV segment formats can be concatenated directly.
- * @param {object} base - First segment format.
- * @param {object} current - Current segment format.
- * @returns {boolean} True if formats match.
- */
-function hasMatchingWaveFormat(base, current) {
-  return (
-    current.sampleRate === base.sampleRate &&
-    current.numChannels === base.numChannels &&
-    current.bitsPerSample === base.bitsPerSample
-  );
 }
 
 /**
@@ -254,37 +248,57 @@ function resolveTrimFrameRange(buffer, info) {
   return { startFrame: Math.max(0, first - headPad), endFrame: Math.min(totalFrames, last + 1 + tailPad) };
 }
 
-/**
- * Scales start and end edge frames smoothly in a freshly allocated 16-bit PCM byte array.
- * @param {Uint8Array} pcmBytes - Copied 16-bit PCM buffer.
- * @param {object} info - WAV format metadata.
- */
-function applyMicroFadeInPlace(pcmBytes, info) {
-  const frameCount = Math.floor(pcmBytes.byteLength / info.blockAlign);
-  const minFadeFrames = Math.round((info.sampleRate * MIN_FADE_DURATION_MS) / MS_PER_SECOND);
-  const fadeFrames = Math.min(Math.round((info.sampleRate * EDGE_FADE_MS) / MS_PER_SECOND), Math.floor(frameCount / 2));
-  if (frameCount < minFadeFrames || fadeFrames <= 0) return;
-  const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+function applyFadeGains(view, spec) {
+  const { fadeFrames, frameCount, info } = spec;
   for (let i = 0; i < fadeFrames; i++) {
-    const startGain = (i + 1) / fadeFrames;
-    const endGain = (fadeFrames - i) / fadeFrames;
+    const headGain = i / fadeFrames;
+    const tailGain = (fadeFrames - 1 - i) / fadeFrames;
     const tailFrame = frameCount - fadeFrames + i;
     for (let ch = 0; ch < info.numChannels; ch++) {
       const headOff = i * info.blockAlign + ch * 2;
       const tailOff = tailFrame * info.blockAlign + ch * 2;
-      view.setInt16(headOff, Math.round(view.getInt16(headOff, true) * startGain), true);
-      view.setInt16(tailOff, Math.round(view.getInt16(tailOff, true) * endGain), true);
+      view.setInt16(headOff, Math.round(view.getInt16(headOff, true) * headGain), true);
+      view.setInt16(tailOff, Math.round(view.getInt16(tailOff, true) * tailGain), true);
     }
   }
 }
 
 /**
+ * Scales start and end edge frames smoothly in a 16-bit PCM byte array to eliminate boundary clicks.
+ * Inputs: 16-bit PCM buffer, WAV format metadata, optional fade duration in milliseconds.
+ * Outputs: none (mutates pcmBytes in place).
+ * Side effects: modifies pcmBytes.
+ * Failure modes: returns early if buffer is too short or parameters invalid.
+ * @param {Uint8Array} pcmBytes - Copied 16-bit PCM buffer.
+ * @param {object} info - WAV format metadata.
+ * @param {number} [fadeMs=5] - Boundary fade duration.
+ */
+export function applyBoundaryMicroFades(pcmBytes, info, fadeMs = EDGE_FADE_MS) {
+  const bits = info?.bitsPerSample ?? PCM_BITS_16;
+  if (!pcmBytes?.buffer || !info?.blockAlign || !info?.sampleRate || bits !== PCM_BITS_16) return;
+  const frameCount = Math.floor(pcmBytes.byteLength / info.blockAlign);
+  const minFadeFrames = Math.round((info.sampleRate * MIN_FADE_DURATION_MS) / MS_PER_SECOND);
+  const fadeFrames = Math.min(Math.round((info.sampleRate * fadeMs) / MS_PER_SECOND), Math.floor(frameCount / 2));
+  if (frameCount < minFadeFrames || fadeFrames <= 0) return;
+  const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  applyFadeGains(view, { fadeFrames, frameCount, info });
+}
+
+function applyMicroFadeInPlace(pcmBytes, info) {
+  applyBoundaryMicroFades(pcmBytes, info, EDGE_FADE_MS);
+}
+
+/**
  * Extracts a trimmed, micro-faded PCM segment from a validated WAV buffer when 16-bit PCM constraints apply.
+ * Inputs: raw WAV ArrayBuffer and parsed format metadata.
+ * Outputs: clean PCM byte Uint8Array.
+ * Side effects: none.
+ * Failure modes: returns un-trimmed raw slice if non-16-bit PCM.
  * @param {ArrayBuffer} buffer - Raw WAV buffer.
  * @param {object} info - Parsed WAV format metadata.
  * @returns {Uint8Array} Clean PCM byte slice.
  */
-function prepareCleanPcmSlice(buffer, info) {
+export function prepareCleanPcmSlice(buffer, info) {
   if (info.bitsPerSample !== PCM_BITS_16 || info.blockAlign !== info.numChannels * 2) {
     return new Uint8Array(buffer, info.dataOffset, info.dataSize);
   }
@@ -311,6 +325,66 @@ export async function smoothAndTrimWavBlob(blob) {
   const info = inspectWavBuffer(buffer);
   const pcm = prepareCleanPcmSlice(buffer, info);
   return new Blob([buildWaveHeader({ ...info, dataLength: pcm.byteLength }), pcm], { type: 'audio/wav' });
+}
+
+function applyTailFadeGains(pcmBytes, info, fadeMs) {
+  const bits = info?.bitsPerSample ?? PCM_BITS_16;
+  if (!pcmBytes?.buffer || !info?.blockAlign || !info?.sampleRate || bits !== PCM_BITS_16) return;
+  const frameCount = Math.floor(pcmBytes.byteLength / info.blockAlign);
+  const fadeFrames = Math.min(Math.round((info.sampleRate * fadeMs) / MS_PER_SECOND), Math.floor(frameCount / 2));
+  if (fadeFrames <= 0) return;
+  const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  for (let i = 0; i < fadeFrames; i++) {
+    const tailGain = (fadeFrames - 1 - i) / fadeFrames;
+    const tailFrame = frameCount - fadeFrames + i;
+    for (let ch = 0; ch < info.numChannels; ch++) {
+      const tailOff = tailFrame * info.blockAlign + ch * 2;
+      view.setInt16(tailOff, Math.round(view.getInt16(tailOff, true) * tailGain), true);
+    }
+  }
+}
+
+function resolveTrimmedPcmSlice(buffer, info, targetFrames, options) {
+  const clean = options.trimSilenceFirst
+    ? prepareCleanPcmSlice(buffer, info)
+    : new Uint8Array(buffer.slice(info.dataOffset, info.dataOffset + Math.floor(info.dataSize / info.blockAlign) * info.blockAlign));
+  const cleanFrames = Math.floor(clean.byteLength / info.blockAlign);
+  if (cleanFrames <= targetFrames) return clean;
+  const sliced = new Uint8Array(clean.slice(0, targetFrames * info.blockAlign));
+  if (!options.trimSilenceFirst) applyBoundaryMicroFades(sliced, info, EDGE_FADE_MS);
+  applyTailFadeGains(sliced, info, options.fadeMs ?? EDGE_FADE_MS);
+  return sliced;
+}
+
+/**
+ * Trims a PCM WAV Blob cleanly to `targetDurationSeconds` with boundary micro-fades.
+ * Inputs: WAV `Blob`, positive target duration in seconds, optional `{ fadeMs, trimSilenceFirst }`.
+ * Outputs: Promise resolving to `{ blob, durationSeconds, originalDurationSeconds, wasTrimmed }`.
+ * Side effects: reads binary bytes from input `Blob`.
+ * Failure modes: throws TypeError on non-Blob input or SynthesisError on invalid duration/WAV headers.
+ * @param {Blob} blob - Source WAV Blob.
+ * @param {number} targetDurationSeconds - Target duration in seconds (> 0).
+ * @param {{ fadeMs?: number, trimSilenceFirst?: boolean }} [options] - Trim options.
+ * @returns {Promise<{ blob: Blob, durationSeconds: number, originalDurationSeconds: number, wasTrimmed: boolean }>} Trimmed WAV descriptor.
+ */
+export async function trimWavBlobToDuration(blob, targetDurationSeconds, options = {}) {
+  const normalized = ensureAudioWavBlob(blob);
+  if (!Number.isFinite(targetDurationSeconds) || targetDurationSeconds <= 0) {
+    throw new SynthesisError('Target trim duration must be a positive number.', { code: 'INVALID_DURATION' });
+  }
+  const buffer = await normalized.arrayBuffer();
+  const info = inspectWavBuffer(buffer);
+  const totalFrames = Math.floor(info.dataSize / info.blockAlign);
+  const targetFrames = Math.min(totalFrames, Math.max(1, Math.floor(targetDurationSeconds * info.sampleRate + 1e-6)));
+  const pcm = resolveTrimmedPcmSlice(buffer, info, targetFrames, options);
+  const finalFrames = Math.floor(pcm.byteLength / info.blockAlign);
+  const trimmedBlob = new Blob([buildWaveHeader({ ...info, dataLength: pcm.byteLength }), pcm], { type: 'audio/wav' });
+  return {
+    blob: trimmedBlob,
+    durationSeconds: Math.round((finalFrames / info.sampleRate) * 1000) / 1000,
+    originalDurationSeconds: Math.round((totalFrames / info.sampleRate) * 1000) / 1000,
+    wasTrimmed: finalFrames < totalFrames,
+  };
 }
 
 /**
@@ -364,6 +438,27 @@ export async function concatenateWavBlobs(blobs, pauseMs = DEFAULT_PAUSE_MS) {
   return stitchDecodedSegments(await decodeWavSegments(blobs), blobs.map(() => pauseMs));
 }
 
+function assertSegmentWaveFormat(base, current, index) {
+  if (current.sampleRate !== base.sampleRate) {
+    throw new SynthesisError(
+      `Segment #${index + 1} has mismatched sample rate: expected ${base.sampleRate} Hz, received ${current.sampleRate} Hz.`,
+      { code: 'WAV_FORMAT_MISMATCH' }
+    );
+  }
+  if (current.numChannels !== base.numChannels) {
+    throw new SynthesisError(
+      `Segment #${index + 1} has mismatched channels: expected ${base.numChannels}, received ${current.numChannels}.`,
+      { code: 'WAV_FORMAT_MISMATCH' }
+    );
+  }
+  if (current.bitsPerSample !== base.bitsPerSample) {
+    throw new SynthesisError(
+      `Segment #${index + 1} has mismatched bit depth: expected ${base.bitsPerSample}-bit, received ${current.bitsPerSample}-bit.`,
+      { code: 'WAV_FORMAT_MISMATCH' }
+    );
+  }
+}
+
 /**
  * Stitches decoded PCM slices into one WAV, inserting frame-aligned silence between neighbours.
  * @param {Array<{ info: object, pcm: Uint8Array }>} decoded - Decoded segments (2 or more).
@@ -375,9 +470,7 @@ function stitchDecodedSegments(decoded, gapsAfterMs) {
   const parts = [];
   let dataLength = 0;
   for (let i = 0; i < decoded.length; i++) {
-    if (!hasMatchingWaveFormat(base, decoded[i].info)) {
-      throw new SynthesisError('Generated segments have mismatched WAV audio formats.', { code: 'WAV_FORMAT_MISMATCH' });
-    }
+    assertSegmentWaveFormat(base, decoded[i].info, i);
     const silence = i > 0 ? buildSilenceBytes({ byteRate: base.byteRate, blockAlign: base.blockAlign, pauseMs: gapsAfterMs[i - 1] }) : null;
     if (silence && silence.byteLength > 0) { parts.push(silence); dataLength += silence.byteLength; }
     parts.push(decoded[i].pcm);

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from languages import resolve_bcp47_code, resolve_iso639_2_code
 from subtitles import (
     SpeakerTurn,
     SubtitleSegment,
@@ -138,3 +139,81 @@ def test_srt_vtt_collapse_crlf_and_blank_lines_and_ass_aligns_odd_video_size() -
     odd_ass = build_ass(segments, video_size=(641, 361), include_speaker=False)
     assert "PlayResX: 640" in odd_ass
     assert "PlayResY: 360" in odd_ass
+
+
+def test_language_resolution_and_vtt_header_sanitization(tmp_path) -> None:
+    assert resolve_iso639_2_code("km") == "khm"
+    assert resolve_iso639_2_code("en-US") == "eng"
+    assert resolve_iso639_2_code("khm_Khmr") == "khm"
+    assert resolve_iso639_2_code("zsm_Latn") == "msa"
+    assert resolve_iso639_2_code("gaz_Latn") == "orm"
+    assert resolve_iso639_2_code("arb_Arab") == "ara"
+    assert resolve_iso639_2_code("br") == "bre"
+    assert resolve_iso639_2_code("auto") == "und"
+    assert resolve_iso639_2_code("unknown-tag") == "und"
+
+    assert resolve_bcp47_code("khm_Khmr") == "km"
+    assert resolve_bcp47_code("zho_Hans") == "zh-Hans"
+    assert resolve_bcp47_code("zho_Hant") == "zh-Hant"
+    assert resolve_bcp47_code("en-US") == "en-US"
+    assert resolve_bcp47_code("auto") == ""
+    assert resolve_bcp47_code("und") == ""
+    assert resolve_bcp47_code("km\r\nBadHeader: evil") == ""
+
+    segments = [
+        SubtitleSegment(start=0.0, end=1.5, text="First --> second", speaker_id="speaker-1"),
+    ]
+    vtt_km = build_vtt(segments, include_speaker=False, language="khm_Khmr")
+    assert vtt_km.startswith("WEBVTT\nKind: subtitles\nLanguage: km\n\n00:00:00.000 --> 00:00:01.500\nFirst → second\n")
+
+    vtt_injected = build_vtt(segments, include_speaker=False, language="km\nInjected: bad")
+    assert vtt_injected.startswith("WEBVTT\n\n")
+    assert "Injected" not in vtt_injected
+
+    srt = build_srt(segments, include_speaker=False)
+    assert srt == "1\n00:00:00,000 --> 00:00:01,500\nFirst → second\n"
+
+    # External FFmpeg tool verification if ffmpeg is available locally.
+    import shutil
+    import subprocess
+    from video_io import resolve_ffmpeg_bin
+
+    ffmpeg_bin = resolve_ffmpeg_bin()
+    if shutil.which(ffmpeg_bin) or __import__("pathlib").Path(ffmpeg_bin).exists():
+        vtt_path = tmp_path / "export.vtt"
+        vtt_path.write_text(vtt_km, encoding="utf-8")
+        proc = subprocess.run([ffmpeg_bin, "-v", "error", "-y", "-i", str(vtt_path), "-f", "srt", "-"], capture_output=True, text=True)
+        assert proc.returncode == 0
+        assert "First → second" in proc.stdout
+
+
+def test_speaker_name_sanitization_and_bcp47_edge_mappings() -> None:
+    segments = [
+        SubtitleSegment(start=0.0, end=1.2, text="Line 1\n\nLine 2", speaker_id="speaker-1"),
+    ]
+    names = {"speaker-1": "Host --> Co-host\n\n2"}
+    vtt = build_vtt(segments, speaker_names=names, include_speaker=True, language="en")
+    assert "Host → Co-host\n2: Line 1\nLine 2\n" in vtt
+    assert "Host -->" not in vtt
+    assert "\n\nLine 2" not in vtt
+
+    srt = build_srt(segments, speaker_names=names, include_speaker=True)
+    assert "[Host → Co-host\n2] Line 1\nLine 2\n" in srt
+    assert "Host -->" not in srt
+    assert "\n\nLine 2" not in srt
+
+    # Verify NLLB-to-BCP47 parity edge mappings fixed against subtitleLanguages.js
+    expected = {
+        "aka_Latn": "ak",
+        "taq_Tfng": "taq-Tfng",
+        "kas_Deva": "ks-Deva",
+        "kas_Arab": "ks-Arab",
+        "kmr_Latn": "kmr",
+        "kon_Latn": "kg",
+        "ayr_Latn": "ay",
+        "fij_Latn": "fj",
+        "bjn_Arab": "bjn-Arab",
+        "knc_Arab": "knc-Arab",
+    }
+    for nllb, bcp47 in expected.items():
+        assert resolve_bcp47_code(nllb) == bcp47
