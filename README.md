@@ -4,18 +4,21 @@ Offline Apple Silicon **Text-to-Speech** and **Multilingual Video-to-Subtitle St
 
 ## Preview
 
-### Text to Speech (Khmer & Multilingual · 48 kHz)
-![Text to Speech workspace with Khmer script, locked character voice, and 48 kHz waveform player](./docs/screenshots/text-to-speech.png)
+### Projects & Persistent Studio Library
+![Projects workspace showing persistent Text to speech, Video to subtitle, Dubbing projects, and global Terminology](./docs/screenshots/projects-workspace.png)
 
-### Video to Subtitle (101 Sources · 202 Translation Targets · Per-Frame TTS Voiceover)
-![Video to Subtitle workspace showing multilingual translation, frame selection, inline playback, and combined WAV voiceover](./docs/screenshots/video-to-subtitle.png)
+### Text to Speech (Khmer & Multilingual · 48 kHz)
+![Text to Speech workspace with Khmer script, structured segments, locked Nisa voice, and 48 kHz player](./docs/screenshots/text-to-speech.png)
+
+### Video to Subtitle & Dubbing (101 Sources · 202 Translation Targets · Time-Aligned Voiceover)
+![Video to Subtitle workspace showing synchronized cue timeline, continuous Khmer translation, and export controls](./docs/screenshots/video-to-subtitle.png)
 
 ## Highlights
 
 - **Text to Speech (`web/` + `engine/`):** High-quality Khmer & multilingual speech synthesis via VoxCPM2 (`48 kHz`), reusable Character Library, 1-person voice locking/anchoring, Khmer number/currency expansion, `-16 LUFS` FFmpeg mastering, structured segment editing with per-segment take history/comparison, project-scoped pronunciation overrides, and on-demand / optional auto Whisper Khmer round-trip word QA (`seanghay/whisper-small-khmer-v2`).
 - **Video to Subtitle & Dubbing (`media/` + `web/`):**
   - **101 source languages** (`Auto-detect` + all 100 Whisper languages via `mlx-community/whisper-large-v3-turbo`, plus `seanghay/Qwen3-ASR-0.6B-Khmer` for Khmer with automatic selective fallback and optional full double-check via `seanghay/whisper-small-khmer-v2`).
-  - **202 offline translation targets** (all Meta NLLB-200 FLORES-200 languages, any-to-any including Khmer → any language and RTL support).
+  - **202 offline translation targets** (all Meta NLLB-200 FLORES-200 languages, any-to-any including Khmer → any language and RTL support) with cross-cue context batching and natural continuous Khmer prose post-processing (`media/khmer_orthography.py`).
   - Optional offline speaker diarization (`sherpa-onnx` Pyannote + 3D-Speaker), live VTT preview, synchronized cue timeline, timing/overlap/duration-mismatch validation & direct remedies, split/merge/find-replace editing, and stage-separated project terminology (`spelling`, `translation`, `proper_noun`, `pronunciation`).
   - **Time-Aligned Voiceover & Dubbed MP4 Export:** Per-frame and tracked batch WAV synthesis with durable asset storage, timeline-aligned WAV stitching (`48 kHz`), export preset verification (WAV/SRT/VTT/TXT/MP4), explicit original/replacement/duck/mix audio modes with gain/ducking controls, and none/burned ASS/soft `mov_text` subtitle modes.
 - **Projects, Batch Jobs & Recovery (`web/`):** Persistent file-backed projects with autosave, crash-draft & asset recovery, bounded background batch job queue with cancel/retry/restart recovery, offline readiness & model diagnostics, and storage schema migration with automatic pre-migration backup.
@@ -80,7 +83,7 @@ Never edit files inside `engine/`. Use `./update-engine.sh` (see [AGENTS.md](./A
 ### Running Tests & Disk Cleanup
 
 ```sh
-npm --prefix web test && npm --prefix web run build
+(cd web && npm test && npm run build)
 media/.venv/bin/pytest -v media/tests
 ./cleanup.sh --unused --dry-run     # preview unused model/cache cleanup (see CLEANUP.md)
 ```
