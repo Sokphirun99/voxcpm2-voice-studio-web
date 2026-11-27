@@ -18,23 +18,33 @@ import {
 async function checkAssetExists(assetRepository, assetId, logger) {
   try {
     const meta = await assetRepository.getAssetMeta(assetId);
-    return Boolean(meta);
+    return meta ? { exists: true, confirmed: true } : { exists: false, confirmed: true };
   } catch (err) {
-    if (err?.status === 404 || err?.code === 'ASSET_NOT_FOUND') return false;
-    logger?.error?.('useProjectRecovery.assetCheckFailed', err, { assetId });
-    return false;
+    const isNotFound = err?.status === 404 || err?.statusCode === 404
+      || err?.code === 'ASSET_NOT_FOUND' || err?.code === 'NOT_FOUND';
+    if (isNotFound) return { exists: false, confirmed: true };
+    logger?.warn?.('useProjectRecovery.assetCheckTransientError', err?.message || 'Transient asset check failure', {
+      assetId,
+      status: err?.status ?? err?.statusCode ?? null,
+    });
+    return { exists: true, confirmed: false };
   }
 }
 
-async function scanMissingAssets(project, assetRepository, logger) {
+async function scanMissingAssets(project, assetRepository, logger, verifiedIds = null) {
   const referenced = collectReferencedAssets(project);
   if (!assetRepository || referenced.length === 0) {
     return { isIntact: true, missingAssets: [] };
   }
   const statuses = {};
   for (const ref of referenced) {
-    const exists = await checkAssetExists(assetRepository, ref.assetId, logger);
-    statuses[ref.assetId] = { exists };
+    if (verifiedIds?.has(ref.assetId)) {
+      statuses[ref.assetId] = { exists: true };
+      continue;
+    }
+    const res = await checkAssetExists(assetRepository, ref.assetId, logger);
+    if (res.exists && res.confirmed) verifiedIds?.add(ref.assetId);
+    statuses[ref.assetId] = { exists: res.exists };
   }
   return assessAssetIntegrity(project, statuses);
 }
@@ -96,17 +106,32 @@ async function executeUploadAndRelink(opts) {
 function useAssetIntegrityState({ projectId, assetRepository, projectRepository, onProjectUpdated, onNotify, logger }) {
   const [missingAssets, setMissingAssets] = useState([]);
   const [showMissingAssetBanner, setShowMissingAssetBanner] = useState(false);
+  const verifiedIdsRef = useRef(new Set());
+  const lastProjectIdRef = useRef(projectId);
+  const scanSeqRef = useRef(0);
+  if (lastProjectIdRef.current !== projectId) {
+    lastProjectIdRef.current = projectId;
+    verifiedIdsRef.current.clear();
+  }
   const verifyAssets = useCallback(async project => {
     if (!project || !assetRepository) return;
-    const report = await scanMissingAssets(project, assetRepository, logger);
+    const seq = ++scanSeqRef.current;
+    const report = await scanMissingAssets(project, assetRepository, logger, verifiedIdsRef.current);
+    if (seq !== scanSeqRef.current) return;
     setMissingAssets(report.missingAssets);
     setShowMissingAssetBanner(!report.isIntact);
   }, [assetRepository, logger]);
   const relinkAssetFile = useCallback(async (file, currentProject) => {
     if (!file || missingAssets.length === 0 || !assetRepository) return;
+    const oldAssetId = missingAssets[0]?.assetId;
     await executeUploadAndRelink({
       file, missingAssets, assetRepository, projectId, currentProject,
-      projectRepository, onProjectUpdated, onNotify, logger, setMissingAssets, setShowBanner: setShowMissingAssetBanner,
+      projectRepository, onProjectUpdated: updated => {
+        if (oldAssetId) verifiedIdsRef.current.delete(oldAssetId);
+        const newId = updated?.sourceAssetId || updated?.sourceAsset?.id;
+        if (newId) verifiedIdsRef.current.add(newId);
+        onProjectUpdated?.(updated);
+      }, onNotify, logger, setMissingAssets, setShowBanner: setShowMissingAssetBanner,
     });
   }, [missingAssets, assetRepository, projectId, projectRepository, onProjectUpdated, onNotify, logger]);
   return { missingAssets, showMissingAssetBanner, verifyAssets, relinkAssetFile, dismissMissingAssets: () => setShowMissingAssetBanner(false) };

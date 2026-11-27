@@ -857,10 +857,10 @@ async function executeOneQueuedJob({ initialJob, deps, workerSessionId, cancelSe
   }
 }
 
-async function recoverStaleSessionJobs(repo, items, workerSessionId, previousSessionId, logger) {
+async function recoverStaleSessionJobs(repo, items, sessionCtx, logger) {
   let recoveredAny = false;
   for (const job of items) {
-    if (!isJobWorkerStale(job, { currentSessionId: workerSessionId, previousSessionId })) continue;
+    if (!isJobWorkerStale(job, sessionCtx)) continue;
     try {
       await repo.interruptJob(job.id, {
         reason: 'Interrupted by browser reload or session disconnect. Retry to resume remaining items.',
@@ -980,7 +980,9 @@ export function useProductionJobs(options = {}) {
     try {
       let page = await deps.jobRepository.listJobs({ limit: 100, offset: 0 });
       let items = page.items || [];
-      if (autoRecover && await recoverStaleSessionJobs(deps.jobRepository, items, workerSessionId, previousSessionRef.current, deps.logger)) {
+      const activeJobIds = new Set([...abortControllersRef.current.keys(), ...abortHandlersRef.current.keys()]);
+      const sessionCtx = { currentSessionId: workerSessionId, previousSessionId: previousSessionRef.current, activeJobIds };
+      if (autoRecover && await recoverStaleSessionJobs(deps.jobRepository, items, sessionCtx, deps.logger)) {
         page = await deps.jobRepository.listJobs({ limit: 100, offset: 0 });
         items = page.items || items;
       }

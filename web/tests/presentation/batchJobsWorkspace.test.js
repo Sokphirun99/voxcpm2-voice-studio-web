@@ -13,6 +13,7 @@ import {
   JOB_STATUS,
   applyJobLifecycleAction,
   createProductionJob,
+  isJobWorkerStale,
   summarizeJobs,
   toJobSummary,
 } from '../../src/domain/productionJobs.js';
@@ -1363,4 +1364,30 @@ test('Multi-tab race on prepare, live failing itemId, resilient stale recovery, 
   } finally {
     dom.restore();
   }
+});
+
+test('isJobWorkerStale detects orphaned same-tab jobs when no active runner owns job id and heartbeat expired', () => {
+  const nowMs = Date.parse('2026-11-27T10:05:00.000Z');
+  const staleBeat = '2026-11-27T10:03:00.000Z';
+  const freshBeat = '2026-11-27T10:04:50.000Z';
+  const sameTabJob = createProductionJob({
+    id: JOB_ID_1,
+    type: 'subtitle_voiceover',
+    title: 'Orphaned same-tab job',
+    status: JOB_STATUS.RUNNING,
+    workerSessionId: 'tab-same',
+    lastHeartbeatAt: staleBeat,
+  });
+
+  // Backwards-compatible default without activeJobIds treats currentSessionId as live.
+  assert.equal(isJobWorkerStale(sameTabJob, { currentSessionId: 'tab-same', nowMs }), false);
+  // Actively running job inside activeJobIds is NOT stale.
+  assert.equal(isJobWorkerStale(sameTabJob, { currentSessionId: 'tab-same', activeJobIds: new Set([JOB_ID_1]), nowMs }), false);
+  // Same-tab job NOT owned by activeJobIds with stale heartbeat IS recoverable.
+  assert.equal(isJobWorkerStale(sameTabJob, { currentSessionId: 'tab-same', activeJobIds: new Set(), nowMs }), true);
+  // Same-tab job with fresh heartbeat is NOT falsely marked stale.
+  assert.equal(
+    isJobWorkerStale({ ...sameTabJob, lastHeartbeatAt: freshBeat }, { currentSessionId: 'tab-same', activeJobIds: new Set(), nowMs }),
+    false
+  );
 });

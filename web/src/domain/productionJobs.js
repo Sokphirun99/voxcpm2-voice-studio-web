@@ -1058,8 +1058,16 @@ export function selectEvictableJobs(jobs = [], maxJobs = MAX_STORED_JOBS) {
  */
 export function isJobWorkerStale(job, context = {}) {
   if (!job || !IN_FLIGHT_JOB_STATUSES.has(job.status) || !job.workerSessionId) return false;
-  const { currentSessionId = '', previousSessionId = '', nowMs = Date.now(), staleAfterMs = STALE_WORKER_HEARTBEAT_MS } = context;
-  if (currentSessionId && job.workerSessionId === currentSessionId) return false;
+  const {
+    currentSessionId = '',
+    previousSessionId = '',
+    activeJobIds = null,
+    nowMs = Date.now(),
+    staleAfterMs = STALE_WORKER_HEARTBEAT_MS,
+  } = context;
+  if (currentSessionId && job.workerSessionId === currentSessionId) {
+    if (!activeJobIds || activeJobIds.has(job.id)) return false;
+  }
   if (previousSessionId && job.workerSessionId === previousSessionId) return true;
   const beatMs = Date.parse(job.lastHeartbeatAt || job.updatedAt || '');
   return Number.isFinite(beatMs) && (nowMs - beatMs) > staleAfterMs;

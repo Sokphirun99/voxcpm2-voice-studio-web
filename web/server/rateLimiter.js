@@ -3,7 +3,7 @@
  */
 
 const DEFAULT_WINDOW_MS = 60_000;
-const DEFAULT_MAX_REQUESTS = 180;
+const DEFAULT_MAX_REQUESTS = 1_500;
 const MAX_TRACKED_KEYS = 2_000;
 
 /**

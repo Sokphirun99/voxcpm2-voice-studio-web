@@ -456,3 +456,86 @@ test('restoring last active project clears storage when project returns 404', as
 
   assert.equal(getLastActiveProject({ storage }), null, 'Failed restore must clear stale active project');
 });
+
+test('useProjectRecovery caches verified asset checks across incremental updates and ignores 429 rate-limit errors', async () => {
+  const dom = createDomShim();
+  const vite = await createViteInstance();
+
+  let root = null;
+  try {
+    const { useProjectRecovery } = await vite.ssrLoadModule('/src/presentation/hooks/useProjectRecovery.js');
+    const a1 = '11111111-1111-4111-8111-111111111111';
+    const a2 = '22222222-2222-4222-8222-222222222222';
+    const aMissing = '33333333-3333-4333-8333-333333333333';
+    const calls = new Map();
+    const assetRepository = {
+      async getAssetMeta(id) {
+        calls.set(id, (calls.get(id) || 0) + 1);
+        if (id === a2) {
+          const err = new Error('Too many storage requests. Retry shortly.');
+          err.status = 429;
+          err.code = 'RATE_LIMIT_EXCEEDED';
+          throw err;
+        }
+        if (id === aMissing) {
+          const err = new Error('Asset not found');
+          err.status = 404;
+          err.code = 'ASSET_NOT_FOUND';
+          throw err;
+        }
+        return { id, fileName: 'ok.wav', kind: 'audio' };
+      },
+    };
+
+    const projectId = '99999999-9999-4999-8999-999999999999';
+    let currentProj = {
+      id: projectId,
+      segments: [{ id: 'seg-1', text: 'One', activeTakeId: 't1', takes: [{ id: 't1', audioAssetId: a1 }] }],
+    };
+    let hookResult = null;
+    let triggerRender = null;
+
+    function Host() {
+      const [, setTick] = React.useState(0);
+      triggerRender = () => setTick(t => t + 1);
+      hookResult = useProjectRecovery({ projectId, workspace: 'subtitles', currentProject: currentProj, assetRepository });
+      return null;
+    }
+
+    root = createRoot(dom.container);
+    await act(async () => { root.render(React.createElement(Host)); });
+    assert.equal(calls.get(a1), 1);
+    assert.equal(hookResult.showMissingAssetBanner, false);
+
+    // Adding a second asset that transiently fails with 429 must NOT re-check a1 or show MissingAssetBanner.
+    currentProj = {
+      id: projectId,
+      segments: [
+        { id: 'seg-1', text: 'One', activeTakeId: 't1', takes: [{ id: 't1', audioAssetId: a1 }] },
+        { id: 'seg-2', text: 'Two', activeTakeId: 't2', takes: [{ id: 't2', audioAssetId: a2 }] },
+      ],
+    };
+    await act(async () => { triggerRender(); });
+    assert.equal(calls.get(a1), 1);
+    assert.equal(calls.get(a2), 1);
+    assert.equal(hookResult.showMissingAssetBanner, false);
+
+    // Adding a truly deleted 404 asset still triggers MissingAssetBanner once cleanly.
+    currentProj = {
+      id: projectId,
+      segments: [
+        ...currentProj.segments,
+        { id: 'seg-3', text: 'Three', activeTakeId: 't3', takes: [{ id: 't3', audioAssetId: aMissing }] },
+      ],
+    };
+    await act(async () => { triggerRender(); });
+    assert.equal(calls.get(a1), 1);
+    assert.equal(calls.get(aMissing), 1);
+    assert.equal(hookResult.showMissingAssetBanner, true);
+    assert.deepEqual(hookResult.missingAssets.map(m => m.assetId), [aMissing]);
+  } finally {
+    await act(async () => root?.unmount());
+    await vite?.close();
+    dom?.restore();
+  }
+});

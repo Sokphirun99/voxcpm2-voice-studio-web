@@ -809,17 +809,35 @@ function buildSubtitleJobItems({ targets, activeCharacter, anchorTag, pronunciat
   return { items, artifacts };
 }
 
+const RATE_LIMIT_RETRY_DELAY_MS = 500;
+
+function isRateLimitedError(err) {
+  return err?.status === 429 || err?.statusCode === 429 || err?.code === 'RATE_LIMIT_EXCEEDED';
+}
+
+async function withRateLimitRetry(operation, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (!isRateLimitedError(err) || attempt === retries) throw err;
+      await new Promise(resolve => globalThis.setTimeout(resolve, RATE_LIMIT_RETRY_DELAY_MS * (attempt + 1)));
+    }
+  }
+  return undefined;
+}
+
 async function uploadSubtitleFrameAsset({ assetRepository, recording, segId, idx, projectId, logger }) {
   if (!assetRepository?.uploadAsset || !recording?.blob) return { outputAssetId: null, artifact: null };
   const fileName = `frame-${String(idx + 1).padStart(2, '0')}.wav`;
   try {
-    const uploaded = await assetRepository.uploadAsset({
+    const uploaded = await withRateLimitRetry(() => assetRepository.uploadAsset({
       bytes: recording.blob,
       fileName,
       kind: 'audio',
       mimeType: recording.blob.type || 'audio/wav',
       projectId: projectId || undefined,
-    });
+    }));
     const assetId = uploaded?.asset?.id || null;
     if (!assetId) return { outputAssetId: null, artifact: null };
     return {
@@ -858,17 +876,30 @@ async function startTrackedSubtitleJob({ jobRepository, spec, workerSessionId, p
   }
 }
 
-async function finalizeTrackedSubtitleJob({ jobRepository, jobId, outcome, err, productionJobs, logger }) {
+async function finalizeTrackedSubtitleJob({ jobRepository, jobId, outcome, err, reason = '', productionJobs, logger }) {
   if (!jobRepository || !jobId) return;
   let finalJob = null;
   try {
-    if (outcome === 'completed') finalJob = (await jobRepository.updateJob(jobId, { action: 'complete' }))?.job;
-    else if (outcome === 'interrupted') {
-      finalJob = (await jobRepository.interruptJob(jobId, {
-        reason: 'Interrupted before completion. Retry to resume remaining frames.',
-      }))?.job;
-    } else if (outcome === 'cancelled') finalJob = (await jobRepository.cancelJob(jobId, { finalize: true }))?.job;
-    else finalJob = (await jobRepository.updateJob(jobId, { action: 'fail', code: err?.code || 'VOICEOVER_ERROR', message: err?.message || 'Subtitle voiceover failed.' }))?.job;
+    if (outcome === 'completed') {
+      try {
+        finalJob = (await withRateLimitRetry(() => jobRepository.updateJob(jobId, { action: 'complete' })))?.job;
+      } catch (completeErr) {
+        logger?.warn?.('useSubtitleVoiceover.completeFallbackInterrupt', completeErr?.message || 'Could not finalize completed job; marking interrupted', { jobId });
+        finalJob = (await withRateLimitRetry(() => jobRepository.interruptJob(jobId, {
+          reason: 'Interrupted before all frame artifacts were recorded. Retry to finish remaining frames.',
+        })))?.job;
+      }
+    } else if (outcome === 'interrupted') {
+      finalJob = (await withRateLimitRetry(() => jobRepository.interruptJob(jobId, {
+        reason: reason || 'Interrupted before completion. Retry to resume remaining frames.',
+      })))?.job;
+    } else if (outcome === 'cancelled') {
+      finalJob = (await withRateLimitRetry(() => jobRepository.cancelJob(jobId, { finalize: true })))?.job;
+    } else {
+      finalJob = (await withRateLimitRetry(() => jobRepository.updateJob(jobId, {
+        action: 'fail', code: err?.code || 'VOICEOVER_ERROR', message: err?.message || 'Subtitle voiceover failed.',
+      })))?.job;
+    }
   } catch (updateErr) {
     logger?.error?.('useSubtitleVoiceover.finalizeTrackedSubtitleJob', updateErr, { jobId, outcome });
   } finally {
@@ -959,25 +990,26 @@ async function processTrackedSubtitleTarget(ctx) {
           seed: existing.seed ?? null,
         });
       }
-      const updated = (await ctx.jobRepository.updateJob(trackedJobId, {
+      const updated = (await withRateLimitRetry(() => ctx.jobRepository.updateJob(trackedJobId, {
         action: 'item_complete',
         itemId: seg.id,
         outputAssetId,
         durationSeconds: existing.durationSeconds ?? null,
         artifact: artifact ? { ...artifact, durationSeconds: existing.durationSeconds ?? null, signature: sig } : undefined,
-      }).catch(err => {
+      })).catch(err => {
         ctx.logger?.debug?.('useSubtitleVoiceover.syncCachedItem', err?.message || 'Could not update cached item', { trackedJobId, segId: seg.id });
         return null;
       }))?.job;
       if (updated) syncTrackedJobUi(ctx.productionJobs, updated);
+      return (!ctx.assetRepository?.uploadAsset || Boolean(outputAssetId)) && Boolean(updated);
     }
-    return;
+    return true;
   }
   ctx.setGeneratingSegmentId(seg.id);
   ctx.setBatchProgress({ completed: idx, total, currentSegmentId: seg.id });
   ctx.onStatus?.({ message: `Generating voice ${idx + 1} of ${total} (${ctx.activeCharacter.name})…`, error: false });
   if (trackedJobId) {
-    await ctx.jobRepository.updateJob(trackedJobId, { action: 'item_start', itemId: seg.id, workerSessionId }).catch(err => {
+    await withRateLimitRetry(() => ctx.jobRepository.updateJob(trackedJobId, { action: 'item_start', itemId: seg.id, workerSessionId })).catch(err => {
       ctx.logger?.debug?.('useSubtitleVoiceover.itemStart', err?.message || 'Could not mark item running', { trackedJobId, segId: seg.id });
     });
   }
@@ -1014,16 +1046,21 @@ async function processTrackedSubtitleTarget(ctx) {
       seed: res.recording?.seed ?? null,
     });
   }
+  let jobUpdated = !trackedJobId;
   if (trackedJobId) {
-    const updated = (await ctx.jobRepository.updateJob(trackedJobId, {
+    const updated = (await withRateLimitRetry(() => ctx.jobRepository.updateJob(trackedJobId, {
       action: 'item_complete', itemId: seg.id, outputAssetId, takeId: res.recording?.id || null, durationSeconds, seed: res.recording?.seed ?? null,
       artifact: artifact ? { ...artifact, durationSeconds, signature: sig } : undefined,
-    }).catch(err => {
+    })).catch(err => {
       ctx.logger?.warn?.('useSubtitleVoiceover.itemComplete', err?.message || 'Could not record completed frame', { trackedJobId, segId: seg.id });
       return null;
     }))?.job;
-    if (updated) syncTrackedJobUi(ctx.productionJobs, updated);
+    if (updated) {
+      syncTrackedJobUi(ctx.productionJobs, updated);
+      jobUpdated = true;
+    }
   }
+  return (!ctx.assetRepository?.uploadAsset || Boolean(outputAssetId)) && jobUpdated;
 }
 
 async function fetchOptionalPreTrimClip(assetRepository, spec, logger) {
@@ -1544,17 +1581,31 @@ export function useSubtitleVoiceover({
         });
       }
       const session = { anchor: activeAnchor, upload: cachedUploadsRef.current[activeCharacter.id] || null };
+      let allPersisted = true;
       for (let i = 0; i < targets.length; i += 1) {
         await assertSubtitleJobNotCancelled({ jobRepository, jobId: trackedJobId, signal: controller.signal, logger });
-        await processTrackedSubtitleTarget({
+        const persisted = await processTrackedSubtitleTarget({
           target: targets[i], idx: i, total: targets.length, trackedJobId, workerSessionId,
           signal: controller.signal, session, activeCharacter, anchorTag, pronunciationSignature,
           segmentClipsRef, setBatchProgress, setGeneratingSegmentId, onStatus, jobRepository,
           synthesizeSpeech, seed: lockedSeeds?.[activeCharacter.id] ?? '', terminology, speechLanguage,
           activeAnchor, cachedUploadsRef, assetRepository, projectId, storeClip, onAttachSegmentTake, productionJobs, logger,
         });
+        if (!persisted) allPersisted = false;
       }
       await assertSubtitleJobNotCancelled({ jobRepository, jobId: trackedJobId, signal: controller.signal, logger });
+      if (!allPersisted && trackedJobId) {
+        await finalizeTrackedSubtitleJob({
+          jobRepository,
+          jobId: trackedJobId,
+          outcome: 'interrupted',
+          reason: 'Some generated frames could not be saved to storage. Resume / Retry to persist remaining frames.',
+          productionJobs,
+          logger,
+        });
+        if (mountedRef.current) onStatus?.({ message: 'Some frames could not be saved to storage. Retry from Batch Jobs to finish.', error: true });
+        return;
+      }
       await finalizeTrackedSubtitleJob({ jobRepository, jobId: trackedJobId, outcome: 'completed', productionJobs, logger });
       const summary = `Voice ready for ${targets.length} selected ${targets.length === 1 ? 'frame' : 'frames'} (${activeCharacter.name}).`;
       onStatus?.({ message: summary, error: false });
