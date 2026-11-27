@@ -29,18 +29,13 @@ logs). Rebuild only when changing `web/package.json` or `web/package-lock.json`.
 docker compose -f web/compose.yaml up --build -d
 ~~~
 
-Open [Voice Studio](http://127.0.0.1:8087). Paste up to 2,000 characters or load
-the Khmer example, pick a speaking **Character** (each character has its own
-unique ID and exclusive 1-person voice), and generate speech. A character's
-voice clip automatically locks on its first generation—or via **Upload voice
-sample…**—so subsequent scripts always sound like the same single person. Use
-**Reset voice** if you want a character to generate a fresh sample, or open
-**Character library** to browse characters and create custom ones in browser
-storage. Use **Cancel** in the toolbar to abort an active synthesis request.
+Open [Voice Studio](http://127.0.0.1:8087) to navigate across its five workspaces:
 
-The player lets you preview, seek, bind a take to the active character, and
-download the 48 kHz WAV. The advanced controls expose guidance, diffusion steps
-(`4–20`), reproducible seed selection, and reference noise cleanup.
+- **Projects:** Search, filter (`Text to speech`, `Video to subtitle`, `Dubbing`), duplicate, rename, delete, or create persistent projects stored in `/api/v1/projects`, and manage global **Terminology** (`spelling`, `translation`, `name`, `pronunciation`).
+- **Text to speech:** Paste up to 2,000 characters or switch to **Segments** mode for structured multi-segment authoring with per-segment take history, pause gaps, and Khmer number expansion. Pick or create a speaking **Character** (each with an exclusive 1-person locked voice anchor), configure project terminology, pronunciation rules, and advanced controls (`guidance`, `4–20` diffusion steps, seed, reference denoise), preview/seek the `48 kHz` WAV player, and run Whisper Khmer word QA (`Check words`).
+- **Video to subtitle:** Extract speech across 101 source languages, translate offline to 202 languages with continuous Khmer orthography post-processing, inspect timing on the synchronized **Subtitle Timeline**, review/remedy overlaps or speech duration mismatches, generate per-cue or batch voiceover takes, and export presets (`WAV`, `.srt`, `.vtt`, `.txt`, burned `MP4`, or dubbed `MP4` with `duck`/`mute`/`keep` original audio and soft `mov_text`/burned subtitles) via **Export project**.
+- **Batch Jobs:** Track queued, running, completed, and interrupted background jobs with automatic restart recovery, retry, cancel, and downloadable artifacts.
+- **Models & Setup:** Verify live connectivity across VoxCPM2 (`:8808`), Media (`:8810`), and Storage (`:8090`), offline readiness per feature, and catalog disk headroom.
 
 Set the `VOICE_STUDIO_PORT` environment variable on the Compose command to change
 the browser port. Docker Desktop provides the container's connection to macOS
