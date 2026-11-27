@@ -232,7 +232,7 @@ def test_translate_lines_normalizes_source_sanitizes_output_and_batches_cleanly(
     assert len(seen_batches) == 2
     assert len(seen_batches[0]) == DEFAULT_BATCH_SIZE
     assert len(seen_batches[1]) == 2
-    assert translated[0] == "នៅ តែ"
+    assert translated[0] == "នៅតែ"
     assert translated[1] == ""
     assert translated[-1] == "[khm_Khmr] Line 8"
 

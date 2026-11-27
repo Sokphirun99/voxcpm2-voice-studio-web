@@ -8,7 +8,8 @@ import unicodedata
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Sequence
 
-from languages import UnsupportedLanguageError, is_same_translation_language
+from khmer_orthography import format_khmer_translation, translate_grouped_segments
+from languages import UnsupportedLanguageError, is_same_translation_language, resolve_nllb_lang_code
 from subtitles import SubtitleSegment
 
 MAX_TERMINOLOGY_FORM_BYTES = 512 * 1024
@@ -371,6 +372,14 @@ def _reconcile_translated_outputs(
     return results
 
 
+def _is_khmer_target(target_language: str) -> bool:
+    """Return True when `target_language` resolves to Khmer (`khm_Khmr`)."""
+    try:
+        return resolve_nllb_lang_code(target_language, strict=True) == "khm_Khmr"
+    except UnsupportedLanguageError:
+        return (target_language or "").strip().lower() in {"km", "khm", "khm_khmr"}
+
+
 def translate_with_terminology(
     translator: Any,
     lines: Sequence[str],
@@ -381,10 +390,12 @@ def translate_with_terminology(
     """Translate lines enforcing approved Stage 2 translation/name terminology with safe fallback if sentinels drop."""
     if not lines:
         return []
+    is_khmer = _is_khmer_target(target_language)
     entries = normalize_entries(raw_entries)
     rules = select_translation_rules(entries, source_language, target_language)
     if not rules:
-        return translator.translate_lines(list(lines), source_language, target_language)
+        raw_out = translator.translate_lines(list(lines), source_language, target_language)
+        return [format_khmer_translation(item) for item in raw_out] if is_khmer else raw_out
     forbidden_targets = "\0".join(tgt for _, tgt, _ in rules)
     masked_lines: list[str] = []
     line_mappings: list[list[tuple[str, str]]] = []
@@ -394,4 +405,26 @@ def translate_with_terminology(
         masked_lines.append(masked)
         line_mappings.append(mapping)
     raw_translated = translator.translate_lines(masked_lines, source_language, target_language)
-    return _reconcile_translated_outputs(translator, lines, raw_translated, line_mappings, (source_language, target_language, rules))
+    reconciled = _reconcile_translated_outputs(translator, lines, raw_translated, line_mappings, (source_language, target_language, rules))
+    return [format_khmer_translation(item) for item in reconciled] if is_khmer else reconciled
+
+
+def translate_segments_with_terminology(
+    translator: Any,
+    segments: Sequence[SubtitleSegment],
+    source_language: str,
+    target_language: str,
+    raw_entries: Sequence[Any] | None = None,
+) -> list[str]:
+    """Translate timed subtitle segments with cross-cue sentence context and approved Stage 2 terminology.
+
+    Inputs: translator, ordered `SubtitleSegment` list, source/target codes, and optional terminology entries.
+    Outputs: translated text list aligned 1:1 with `segments`.
+    Side effects: delegates batched translation to `translator`.
+    Failure modes: returns empty strings for blank cues while preserving segment count.
+    """
+    return translate_grouped_segments(
+        segments,
+        lambda batch: translate_with_terminology(translator, batch, source_language, target_language, raw_entries),
+        is_khmer=_is_khmer_target(target_language),
+    )

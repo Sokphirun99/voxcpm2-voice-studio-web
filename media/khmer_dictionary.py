@@ -11,6 +11,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+from subtitles import segment_subtitle_clusters
+
 logger = logging.getLogger(__name__)
 
 LEXICON_DIR = Path(__file__).resolve().parent / "lexicon"
@@ -19,7 +21,10 @@ COLLOQUIAL_JSON_PATH = LEXICON_DIR / "spoken_colloquial_khmer.json"
 CUSTOM_GLOSSARY_PATH = LEXICON_DIR / "custom_glossary.json"
 
 KHMER_WORD_RE = re.compile(r"^[\u1780-\u17ff]+$")
+TRIPLE_KHMER_CONSONANT_RE = re.compile(r"([\u1780-\u17a2])\1{2,}")
 STRIP_MARKS_RE = re.compile(r"[\u17c6-\u17d3\u17dd\ufffd]")
+MAX_SEGMENT_WORD_LEN = 18
+UNKNOWN_CLUSTER_PENALTY = 8.0
 
 CONSONANT_PHONETIC_MAP = str.maketrans({
     "ខ": "ក", "គ": "ក", "ឃ": "ក",
@@ -52,6 +57,62 @@ def _is_valid_or_compound(token: str, valid_words: set[str]) -> bool:
                 dp[i] = True
                 break
     return dp[n]
+
+
+def _collapse_triple_consonants(token: str, valid_words: set[str]) -> str:
+    """Reduce repeated 3+ Khmer base consonants when the doubled or single form matches the lexicon."""
+    if not TRIPLE_KHMER_CONSONANT_RE.search(token):
+        return token
+    for rep in (r"\1\1", r"\1"):
+        candidate = TRIPLE_KHMER_CONSONANT_RE.sub(rep, token)
+        if _is_valid_or_compound(candidate, valid_words):
+            return candidate
+    return token
+
+
+def _relax_segment_span(
+    clusters: list[str],
+    best: list[tuple[float, int] | None],
+    start: int,
+    context: tuple[set[str], dict[str, int]],
+) -> None:
+    """Relax DP segmentation edges starting at cluster index `start`."""
+    valid_words, ranks = context
+    base_cost = best[start][0] if best[start] is not None else 0.0
+    max_end = min(len(clusters), start + MAX_SEGMENT_WORD_LEN)
+    for end in range(start + 1, max_end + 1):
+        piece = "".join(clusters[start:end])
+        if piece in valid_words:
+            freq_bonus = min(3.0, ranks.get(piece, 1) / 50_000.0)
+            step_cost = 1.0 - freq_bonus * 0.25
+        elif end == start + 1:
+            step_cost = UNKNOWN_CLUSTER_PENALTY
+        else:
+            continue
+        candidate = base_cost + step_cost
+        if best[end] is None or candidate < best[end][0]:
+            best[end] = (candidate, start)
+
+
+def _segment_clusters_dp(clusters: list[str], valid_words: set[str], ranks: dict[str, int]) -> list[str]:
+    """Segment orthographic clusters into known dictionary words via minimum-cost DP."""
+    if not clusters:
+        return []
+    n = len(clusters)
+    best: list[tuple[float, int] | None] = [None] * (n + 1)
+    best[0] = (0.0, -1)
+    context = (valid_words, ranks)
+    for start in range(n):
+        if best[start] is not None:
+            _relax_segment_span(clusters, best, start, context)
+    pieces: list[str] = []
+    cursor = n
+    while cursor > 0 and best[cursor] is not None:
+        prev = best[cursor][1]
+        pieces.append("".join(clusters[prev:cursor]))
+        cursor = prev
+    pieces.reverse()
+    return pieces or clusters
 
 
 def _compile_json_patterns(items: list[dict[str, Any]]) -> list[tuple[re.Pattern[str], str]]:
@@ -168,6 +229,35 @@ class KhmerDictionaryCorrector:
         self._ensure_loaded()
         return _is_valid_or_compound(token, self._valid_words)
 
+    def correct_word(self, token: str) -> str:
+        """Correct a single Khmer word token using triple-consonant collapse and phonetic lexicon match.
+
+        Inputs: single Khmer word string.
+        Outputs: NFC-normalized corrected word (or original token if already valid/no match).
+        Side effects: lazily initializes dictionary tables on first call.
+        Failure modes: returns stripped NFC string unchanged on non-Khmer tokens.
+        """
+        clean = unicodedata.normalize("NFC", token or "").strip()
+        if not clean:
+            return ""
+        self._ensure_loaded()
+        collapsed = _collapse_triple_consonants(clean, self._valid_words)
+        return self._correct_token(collapsed)
+
+    def segment_words(self, text: str) -> list[str]:
+        """Segment an unspaced Khmer string into dictionary words without splitting orthographic clusters.
+
+        Inputs: unspaced Khmer string.
+        Outputs: list of cluster-aligned Khmer word strings.
+        Side effects: lazily initializes dictionary tables on first call.
+        Failure modes: returns empty list for blank input; falls back to cluster splits for OOV spans.
+        """
+        clean = unicodedata.normalize("NFC", text or "").strip()
+        if not clean:
+            return []
+        self._ensure_loaded()
+        return _segment_clusters_dp(segment_subtitle_clusters(clean), self._valid_words, self._ranks)
+
     def _correct_token(self, token: str) -> str:
         """Correct a single out-of-vocabulary Khmer token when a high-confidence phonetic match exists."""
         if len(token) < 4 or not KHMER_WORD_RE.match(token):
@@ -218,3 +308,25 @@ def get_lexicon_stats() -> dict[str, int]:
 def is_known_khmer_word(token: str) -> bool:
     """Check whether a Khmer token belongs to the active 3-layer local Khmer lexicon."""
     return _DEFAULT_CORRECTOR.is_known_khmer_token(token)
+
+
+def correct_khmer_word(token: str) -> str:
+    """Correct a single Khmer word token using the shared 3-layer local Khmer lexicon.
+
+    Inputs: single Khmer word string.
+    Outputs: corrected NFC word string.
+    Side effects: initializes the shared dictionary on first use.
+    Failure modes: returns original normalized token when no higher-confidence correction exists.
+    """
+    return _DEFAULT_CORRECTOR.correct_word(token)
+
+
+def segment_khmer_words(text: str) -> list[str]:
+    """Segment an unspaced Khmer string into cluster-safe dictionary words.
+
+    Inputs: unspaced Khmer string.
+    Outputs: ordered list of Khmer words/clusters.
+    Side effects: initializes the shared dictionary on first use.
+    Failure modes: returns empty list for blank text.
+    """
+    return _DEFAULT_CORRECTOR.segment_words(text)

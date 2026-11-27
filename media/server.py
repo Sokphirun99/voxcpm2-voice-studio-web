@@ -48,7 +48,7 @@ from subtitles import (
 from terminology import (
     apply_spelling_to_segments,
     parse_terminology_form_field,
-    translate_with_terminology,
+    translate_segments_with_terminology,
 )
 from translator import DEFAULT_NLLB_MODEL_ID, LocalTranslator
 from video_io import (
@@ -409,9 +409,9 @@ def _maybe_translate_aligned(
         return None
     if is_same_translation_language(detected_lang, target):
         return None
-    return translate_with_terminology(
+    return translate_segments_with_terminology(
         services.translator,
-        [s.text for s in aligned],
+        aligned,
         detected_lang,
         target,
         terminology,
@@ -847,11 +847,19 @@ def create_app(services: MediaServices | None = None) -> FastAPI:
         try:
             resolve_nllb_lang_code(payload.targetLanguage, strict=True)
             resolve_nllb_lang_code(payload.sourceLanguage)
-            texts = [seg.text for seg in payload.segments]
+            seg_models = [
+                SubtitleSegment(
+                    start=float(seg.start),
+                    end=float(seg.end),
+                    text=seg.text,
+                    speaker_id=(seg.speakerId or "speaker-1").strip() or "speaker-1",
+                )
+                for seg in payload.segments
+            ]
             translated = await asyncio.to_thread(
-                translate_with_terminology,
+                translate_segments_with_terminology,
                 active_services.translator,
-                texts,
+                seg_models,
                 payload.sourceLanguage,
                 payload.targetLanguage,
                 payload.terminology,
