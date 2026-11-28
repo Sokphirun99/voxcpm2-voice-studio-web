@@ -156,6 +156,7 @@ async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRe
 export function Studio() {
   const ttsRef = useRef(null);
   const subtitlesRef = useRef(null);
+  const [speechWorkflowRun, setSpeechWorkflowRun] = useState(null);
   const [activeWorkspace, setActiveWorkspace] = useState('projects');
   const [sidebarOpen, setSidebarOpen] = useState(() => !globalThis.matchMedia?.('(max-width: 860px)').matches);
   const [externalScript, setExternalScript] = useState('');
@@ -248,6 +249,7 @@ export function Studio() {
     characterActions: catalog.actions,
     refreshEngine,
     offlineReadiness,
+    onWorkflowRun: setSpeechWorkflowRun,
     onTtsStateChange: handleTtsStateChange,
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
@@ -328,6 +330,7 @@ export function Studio() {
         <ModelsSetupWorkspace
           hidden={activeWorkspace !== 'models'}
           diagnosticsGateway={services?.diagnosticsGateway}
+          speechWorkflowRun={speechWorkflowRun}
         />
       </main>
       <ToastRegion toasts={notifications.toasts} onDismiss={notifications.dismiss} />

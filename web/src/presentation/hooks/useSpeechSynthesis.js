@@ -128,7 +128,7 @@ async function runSegmentLifecycle(ctx, runner) {
  * @param {object} spec - Execution callbacks and services.
  * @returns {Promise<void>} Completion promise.
  */
-async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, commitRecording, setLastSeed, onNotify }) {
+async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onReferenceUploaded, onCompleted, updateProgress, setStatus, commitRecording, setLastSeed, onNotify, onWorkflowStage }) {
   const runner = request.isMultiSpeaker && typeof synthesizeSpeech.synthesizeMultiSpeaker === 'function'
     ? synthesizeSpeech.synthesizeMultiSpeaker
     : synthesizeSpeech.execute;
@@ -136,6 +136,7 @@ async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onRe
     ...request,
     signal,
     onProgress: info => updateProgress(formatProgressMessage(info)),
+    onWorkflowStage,
     onReferenceUploaded: (charId, fileData) => onReferenceUploaded?.(charId || request.character?.id, fileData),
   });
   commitRecording(result.recording);
@@ -151,11 +152,18 @@ async function executeSynthesisRequest({ synthesizeSpeech, request, signal, onRe
  * @param {object} spec - Lifecycle state setters and runner.
  * @returns {Promise<void>} Completion promise.
  */
-async function runSynthesisLifecycle({ abortController, request, setBusy, setBusyMeta, setActiveCharacterId, setStatus, onFailure, onValidationFieldError, onNotify, onUnlockSound, run }) {
+async function runSynthesisLifecycle({ abortController, request, setBusy, setBusyMeta, setActiveCharacterId, setStatus, onFailure, onValidationFieldError, onNotify, onUnlockSound, onWorkflowRun, run }) {
   onUnlockSound?.();
   const controller = new AbortController();
   abortController.current = controller;
   const startedAt = Date.now();
+  const stages = [];
+  const publish = status => onWorkflowRun?.({ stages: [...stages], status, startedAt, multiSpeaker: Boolean(request?.isMultiSpeaker) });
+  const visit = stage => {
+    stages.push(stage);
+    publish('running');
+  };
+  visit('prepare');
   const initialMessage = 'Preparing speech generation…';
   const updateProgress = nextMsg => {
     setBusyMeta({ startedAt, message: nextMsg });
@@ -166,8 +174,11 @@ async function runSynthesisLifecycle({ abortController, request, setBusy, setBus
   setActiveCharacterId(request?.character?.id || null);
   setStatus({ message: initialMessage, error: false });
   try {
-    await run(controller.signal, updateProgress);
+    await run(controller.signal, updateProgress, visit);
+    stages.push('ready');
+    publish('done');
   } catch (error) {
+    publish(controller.signal.aborted ? 'cancelled' : 'failed');
     handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify });
   } finally {
     if (abortController.current === controller) abortController.current = null;
@@ -205,14 +216,14 @@ function startSynthesisGeneration(ctx) {
     abortController: ctx.abortController, request: ctx.request, setBusy: ctx.setBusy, setBusyMeta: ctx.setBusyMeta,
     setActiveCharacterId: ctx.setActiveCharacterId, setStatus: ctx.setStatus,
     onFailure: ctx.onFailure, onValidationFieldError: ctx.onValidationFieldError,
-    onNotify: ctx.onNotify, onUnlockSound: ctx.onUnlockSound,
-    run: (signal, updateProgress) => executeSynthesisRequest({
+    onNotify: ctx.onNotify, onUnlockSound: ctx.onUnlockSound, onWorkflowRun: ctx.onWorkflowRun,
+    run: (signal, updateProgress, onWorkflowStage) => executeSynthesisRequest({
       synthesizeSpeech: ctx.synthesizeSpeech,
       request: { ...ctx.request, models, isOnline },
       signal,
       onReferenceUploaded: ctx.onReferenceUploaded,
       onCompleted: ctx.onCompleted,
-      updateProgress, setStatus: ctx.setStatus, commitRecording: ctx.commitRecording, setLastSeed: ctx.setLastSeed, onNotify: ctx.onNotify,
+      updateProgress, onWorkflowStage, setStatus: ctx.setStatus, commitRecording: ctx.commitRecording, setLastSeed: ctx.setLastSeed, onNotify: ctx.onNotify,
     }),
   });
 }
@@ -252,7 +263,7 @@ function buildRegeneratedTake(recording, existingTakes) {
   return { ...recording, id: candidateId };
 }
 
-export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify, onUnlockSound, offlineReadiness = null, models = null, isOnline = undefined }) {
+export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify, onUnlockSound, onWorkflowRun, offlineReadiness = null, models = null, isOnline = undefined }) {
   const { synthesizeSpeech } = useStudioServices();
   const abortController = useRef(null);
   const [busy, setBusy] = useState(false);
@@ -404,7 +415,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     exportNarration,
     runGeneration: args => startSynthesisGeneration({
       ...args, busy, abortController, synthesizeSpeech, setBusy, setBusyMeta, setActiveCharacterId,
-      setStatus, commitRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound,
+      setStatus, commitRecording, setLastSeed, onFailure, onValidationFieldError, onNotify, onUnlockSound, onWorkflowRun,
       offlineReadiness: args.offlineReadiness ?? offlineReadiness,
       models: args.models ?? models,
       isOnline: typeof args.isOnline === 'boolean' ? args.isOnline : isOnline,

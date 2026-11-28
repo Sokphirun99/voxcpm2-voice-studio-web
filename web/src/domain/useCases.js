@@ -149,6 +149,7 @@ async function runChunkedSynthesis(params) {
     });
     activeRef = step.activeRef;
   }
+  params.onWorkflowStage?.('finish');
   const merged = await concatenateWavBlobsWithPauses(chunks.map(chunk => ({ blob: chunk.blob, pauseAfterMs: chunk.pauseAfterMs })), SINGLE_VOICE_PAUSE_MS);
   return { blob: merged, seed: firstSeed, anchorBlob: blobs[0], anchorTranscript: params.chunks[0], uploadedFileData: activeRef, chunks };
 }
@@ -269,7 +270,7 @@ async function resolveSpeechStageRules({ glossaryRepository, terminologyReposito
  * @returns {Promise<object>} Recording metadata and uploaded FileData cache.
  */
 async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synthesisCache = null, glossaryRepository = null, terminologyRepository = null, seedGenerator }, params) {
-  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, sourceLanguage = '', signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
+  const { script, character, anchor = null, cachedUpload = null, guidance, steps, seed, autoFormatKhmer = false, styleMode, customStyle = '', denoiseReference = false, masterAudio = true, sourceLanguage = '', signal, onProgress, onWorkflowStage, onReferenceUploaded, models, isOnline } = params || {};
   assertOfflineReadyIfSpecified('tts', models, isOnline);
   const { rules, effectiveTerms } = await resolveSpeechStageRules({ glossaryRepository, terminologyRepository }, params);
   const payload = validateGenerationInput(
@@ -281,10 +282,13 @@ async function executeSpeechSynthesis({ speechGateway, audioMaster = null, synth
   const chunks = segments.map(segment => segment.text);
   const pausesAfterMs = segments.map(segment => segment.pauseAfterMs);
   const cacheSpec = { ...payload, characterId: character.id, anchor, denoiseReference: Boolean(denoiseReference), masterAudio: Boolean(masterAudio) };
+  onWorkflowStage?.('cache');
   const { cacheKey, hit } = await tryLookupSynthesisCache({ synthesisCache, cacheSpec, signal });
   if (hit) return attachRecordingMetrics(buildCachedSynthesisResult({ hit, payload, character, chunks, cachedUpload, masterAudio }), startedAt);
+  if (anchor && (anchor.blob || cachedUpload)) onWorkflowStage?.('reference');
   const { fileData: initialRef, wasCached } = await resolveInitialReference({ speechGateway, anchor, cachedUpload, signal, onReferenceUploaded });
-  const combined = await runChunkedSynthesis({ speechGateway, payload: { ...payload, characterId: character.id }, chunks, pausesAfterMs, anchor, initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onReferenceUploaded });
+  onWorkflowStage?.('generate');
+  const combined = await runChunkedSynthesis({ speechGateway, payload: { ...payload, characterId: character.id }, chunks, pausesAfterMs, anchor, initialRef, wasCached, denoiseReference: Boolean(denoiseReference), signal, onProgress, onWorkflowStage, onReferenceUploaded });
   const polished = await applySynthesisMastering({ blob: combined.blob, anchorBlob: combined.anchorBlob, masterAudio: Boolean(masterAudio), audioMaster, signal });
   if (synthesisCache && cacheKey) await synthesisCache.putCachedAudio(cacheKey, polished.blob, { characterId: character.id, seed: combined.seed });
   const transcript = hasPauseMarkers(payload.text) ? stripPauseMarkers(payload.text) : payload.text;
@@ -543,7 +547,7 @@ async function masterMultiSpeakerTrack(blob, audioMaster, options, signal) {
  * @returns {Promise<object>} Combined recording and per-segment results.
  */
 export async function executeMultiSpeakerSynthesis(deps, params) {
-  const { segments, characters = [], defaultCharacter, anchors = {}, cachedUploads = {}, options = {}, pronunciationRules, terminology, projectTerminology, sourceLanguage, signal, onProgress, onReferenceUploaded, models, isOnline } = params || {};
+  const { segments, characters = [], defaultCharacter, anchors = {}, cachedUploads = {}, options = {}, pronunciationRules, terminology, projectTerminology, sourceLanguage, signal, onProgress, onWorkflowStage, onReferenceUploaded, models, isOnline } = params || {};
   const activeSegments = validateMultiSpeakerSegments(segments);
   const resolvedOptions = {
     ...options,
@@ -553,9 +557,11 @@ export async function executeMultiSpeakerSynthesis(deps, params) {
     ...(sourceLanguage !== undefined ? { sourceLanguage } : {}),
   };
   const defaultPauseMs = typeof resolvedOptions.defaultPauseSeconds === 'number' ? Math.round(resolvedOptions.defaultPauseSeconds * 1000) : SINGLE_VOICE_PAUSE_MS;
+  onWorkflowStage?.('generate');
   const { chunks, segmentResults } = await synthesizeMultiSpeakerSegments(deps, {
     segments: activeSegments, characters, defaultCharacter, anchors, cachedUploads, options: resolvedOptions, signal, onProgress, onReferenceUploaded, models, isOnline, defaultPauseMs,
   });
+  onWorkflowStage?.('finish');
   const stitchedBlob = await concatenateWavBlobsWithPauses(chunks, defaultPauseMs);
   const { blob: combinedBlob, mastered } = await masterMultiSpeakerTrack(stitchedBlob, deps.audioMaster, options, signal);
   const totalDuration = await readRecordingDurationSeconds(combinedBlob);

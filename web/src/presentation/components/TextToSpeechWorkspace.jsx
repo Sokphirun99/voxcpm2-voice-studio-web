@@ -759,6 +759,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     onValidationFieldError: field => focusValidationField({ scriptRef, transcriptRef }, field),
     onNotify: shared.onNotify,
     onUnlockSound: shared.onUnlockSound,
+    onWorkflowRun: shared.onWorkflowRun,
     offlineReadiness: shared?.offlineReadiness,
   });
   const hasScript = Boolean(script.trim());

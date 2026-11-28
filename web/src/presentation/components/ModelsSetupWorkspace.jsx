@@ -4,6 +4,7 @@
 
 import React from 'react';
 import { useModelDiagnostics } from '../hooks/useModelDiagnostics.js';
+import { SpeechWorkflow } from './SpeechWorkflow.jsx';
 import { Icon } from './Icon.jsx';
 
 const MODEL_STATE_LABELS = Object.freeze({
@@ -268,12 +269,13 @@ function resolveHeroOverall(diagnostics) {
   return diagnostics?.overall || diagnostics?.offlineReadiness || null;
 }
 
-function ModelsWorkspaceContent({ diagnostics, error }) {
+function ModelsWorkspaceContent({ diagnostics, error, speechWorkflowRun }) {
   const heroOverall = resolveHeroOverall(diagnostics);
   return (
     <div className="models-workspace-content">
       {error && <div className="models-error-alert" role="alert">{error}</div>}
       <ReadinessHeroBanner overall={heroOverall} />
+      <SpeechWorkflow run={speechWorkflowRun} />
       <InstructionsPanel instructions={diagnostics?.instructions} />
       <div className="models-overview">
         <ServicesSection services={diagnostics?.services} />
@@ -294,12 +296,12 @@ function ModelsWorkspaceContent({ diagnostics, error }) {
  * @param {{ hidden?: boolean, diagnosticsGateway?: object, initialDiagnostics?: object|null }} props - Workspace props.
  * @returns {React.ReactElement} Models setup workspace.
  */
-export function ModelsSetupWorkspace({ hidden = false, diagnosticsGateway = null, initialDiagnostics = null }) {
+export function ModelsSetupWorkspace({ hidden = false, diagnosticsGateway = null, initialDiagnostics = null, speechWorkflowRun = null }) {
   const state = useModelDiagnostics({ gateway: diagnosticsGateway, initialDiagnostics, active: !hidden });
   return (
     <div className="workspace-panel models-workspace" id="models-workspace-pane" hidden={hidden} tabIndex={-1} aria-label="Models &amp; Setup">
       <ModelsSetupToolbar loading={state.loading} lastRefreshedAt={state.lastRefreshedAt} onRefresh={state.refresh} />
-      <ModelsWorkspaceContent diagnostics={state.diagnostics} error={state.error} />
+      <ModelsWorkspaceContent diagnostics={state.diagnostics} error={state.error} speechWorkflowRun={speechWorkflowRun} />
     </div>
   );
 }

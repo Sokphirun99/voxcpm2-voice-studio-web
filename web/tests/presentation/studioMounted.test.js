@@ -421,12 +421,15 @@ test('mounted Studio auto-locks Take 1 voice for Take 2, ignores duplicate submi
       speechForm.dispatchEvent({ type: 'submit', bubbles: true });
     });
     assert.equal(synthCalls.length, 1);
+    assert.equal(container.querySelector('#speech-workflow-generate').getAttribute('data-state'), 'running');
     assert.equal(synthCalls[0].instruction, CHAR_NISA.description);
 
     await act(async () => {
       takeGate.resolve();
       await new Promise(r => setTimeout(r, 15));
     });
+    assert.equal(container.querySelector('#speech-workflow-ready').getAttribute('data-state'), 'done');
+    assert.equal(container.querySelector('#speech-workflow-reference').getAttribute('data-state'), 'skipped');
     assert.equal(anchorMap.has(CHAR_NISA.id), true);
     assert.match(container.querySelector('#active-character-card').textContent, /Voice locked/);
     assert.match(container.querySelector('#generation-status').textContent, /\d+(?:ms|s) · \d+ B/);
