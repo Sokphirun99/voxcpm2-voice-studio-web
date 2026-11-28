@@ -222,20 +222,17 @@ function ProjectCard({ project, onOpen, onRename, onDuplicate, onDelete }) {
   );
 }
 
-function EmptyProjectsView({ onCreateOpen }) {
+function EmptyProjectsView() {
   return (
     <div className="projects-empty" role="status">
       <Icon name="folder" className="empty-icon" />
       <p className="empty-title">No projects found</p>
       <p className="empty-description">Create a project or clear filters to start.</p>
-      <button type="button" className="button button-primary" onClick={onCreateOpen}>
-        Create project
-      </button>
     </div>
   );
 }
 
-function ProjectsContent({ loading, projects, onOpen, onRename, onDuplicate, onDelete, onCreateOpen }) {
+function ProjectsContent({ loading, projects, onOpen, onRename, onDuplicate, onDelete }) {
   if (loading && projects.length === 0) {
     return (
       <div className="projects-loading" role="status">
@@ -245,7 +242,7 @@ function ProjectsContent({ loading, projects, onOpen, onRename, onDuplicate, onD
     );
   }
   if (projects.length === 0) {
-    return <EmptyProjectsView onCreateOpen={onCreateOpen} />;
+    return <EmptyProjectsView />;
   }
   return (
     <div className="projects-grid" role="list" aria-label="Projects list">
@@ -441,7 +438,6 @@ function ProjectsBannerAndContent({ api }) {
         onRename={api.openRenameModal}
         onDuplicate={api.duplicateProject}
         onDelete={api.openDeleteModal}
-        onCreateOpen={api.openCreateModal}
       />
     </>
   );

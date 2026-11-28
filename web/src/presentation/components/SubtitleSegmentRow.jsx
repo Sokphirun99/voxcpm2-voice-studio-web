@@ -564,6 +564,8 @@ const REMEDY_ACTION_LABELS = Object.freeze({
   split_segment: 'Split cue',
   focus_text: 'Type text',
   focus_translation: 'Type text',
+  retranslate_segment: 'Re-translate',
+  dismiss_stale_translation: 'Keep translation',
   adjust_timing: 'Adjust timing',
   extend_duration: 'Adjust timing',
   assign_voice: 'Assign voice',
@@ -579,13 +581,27 @@ const REMEDY_ACTION_LABELS = Object.freeze({
   apply_terminology_translation: 'Apply translation term',
 });
 
+const STALE_TRANSLATION_REMEDIES = Object.freeze([
+  Object.freeze({
+    action: 'retranslate_segment',
+    label: 'Re-translate',
+    title: 'Re-translate this cue from the updated source text',
+  }),
+  Object.freeze({
+    action: 'dismiss_stale_translation',
+    label: 'Keep translation',
+    title: 'Keep existing translation and clear stale warning',
+  }),
+]);
+
 function resolveRemedyLabel(issue) {
   return REMEDY_ACTION_LABELS[issue.remedyAction] || 'Fix';
 }
 
 function MismatchRemedyButtons({ issue, remedies, busy, onTriggerRemedy }) {
+  const groupLabel = issue.type === 'stale_translation' ? 'Stale translation actions' : 'Duration mismatch remedies';
   return (
-    <div className="subtitle-validation-remedies" role="group" aria-label="Duration mismatch remedies">
+    <div className="subtitle-validation-remedies" role="group" aria-label={groupLabel}>
       {remedies.map(rem => (
         <button
           key={rem.action}
@@ -603,10 +619,17 @@ function MismatchRemedyButtons({ issue, remedies, busy, onTriggerRemedy }) {
   );
 }
 
+function resolveMultiRemedies(issue) {
+  if (issue.type === 'speech_exceeds_interval' && Array.isArray(issue.metadata?.availableRemedies) && issue.metadata.availableRemedies.length > 0) {
+    return issue.metadata.availableRemedies;
+  }
+  if (issue.type === 'stale_translation') return STALE_TRANSLATION_REMEDIES;
+  return null;
+}
+
 function ValidationAlertPill({ issue, onTriggerRemedy, busy }) {
   const isError = issue.severity === 'error';
-  const multiRemedies = issue.type === 'speech_exceeds_interval' && Array.isArray(issue.metadata?.availableRemedies) && issue.metadata.availableRemedies.length > 0
-    ? issue.metadata.availableRemedies : null;
+  const multiRemedies = resolveMultiRemedies(issue);
   const pillClass = `subtitle-validation-pill is-${isError ? 'error' : 'warning'}${multiRemedies ? ' has-multi-remedies' : ''}`;
   const iconName = isError ? 'alert_circle' : 'warning';
   return (
@@ -650,8 +673,10 @@ function executeMismatchRemedy(action, issue, context) {
 }
 
 function executeRemedyAction(issue, actionOverride, context) {
-  const { segment, prevSegment, nextSegment, onUpdateTiming, activeText, onUpdate, useTranslation, onSplit, textarea, onOpenTiming, onAssignVoice, onApplyTerminologySpelling, onApplyTerminologyTranslation } = context;
+  const { segment, prevSegment, nextSegment, onUpdateTiming, activeText, onUpdate, useTranslation, onSplit, textarea, onOpenTiming, onAssignVoice, onApplyTerminologySpelling, onApplyTerminologyTranslation, onRetranslateSegment, onDismissStaleTranslation } = context;
   const action = actionOverride || issue.remedyAction;
+  if (action === 'retranslate_segment') return onRetranslateSegment?.(segment.id);
+  if (action === 'dismiss_stale_translation') return onDismissStaleTranslation?.(segment.id);
   if (action === 'apply_terminology_spelling') return onApplyTerminologySpelling?.(segment.id);
   if (action === 'apply_terminology_translation') return onApplyTerminologyTranslation?.(segment.id);
   if (action === 'resolve_overlap') {
@@ -666,6 +691,130 @@ function executeRemedyAction(issue, actionOverride, context) {
   if (action === 'adjust_timing' || action === 'extend_duration') return onOpenTiming();
   if (action === 'assign_voice') return onAssignVoice?.(segment.id);
   return executeMismatchRemedy(action, issue, context);
+}
+
+function isSubtitleTakeOutdated(take, activeText) {
+  const takeText = typeof take?.settings?.text === 'string' ? take.settings.text.trim() : '';
+  return Boolean(takeText && takeText !== String(activeText || '').trim());
+}
+
+function formatSubtitleTakeTitle(take, isOutdated) {
+  const parts = [];
+  if (isOutdated) parts.push('Outdated');
+  const s = take?.settings || {};
+  if (s.characterName) parts.push(s.characterName);
+  else if (s.voiceId) parts.push(`Voice: ${s.voiceId}`);
+  if (s.seed != null) parts.push(`Seed: ${s.seed}`);
+  if (s.text) parts.push(`"${s.text}"`);
+  return parts.length > 0 ? parts.join(' · ') : 'Persisted subtitle voice take';
+}
+
+function handleSubtitleTakeChipKey(event, { disabled, onChipClick, onTogglePlay, onDelete }) {
+  if (disabled || event.target !== event.currentTarget) return;
+  if (event.isComposing || event.keyCode === 229 || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    onChipClick();
+  } else if ((event.key === 'p' || event.key === 'P') && onTogglePlay) {
+    event.preventDefault();
+    onTogglePlay();
+  } else if ((event.key === 'Delete' || event.key === 'Backspace') && onDelete) {
+    event.preventDefault();
+    onDelete();
+  }
+}
+
+function SubtitleTakeChip({
+  take,
+  takeIndex,
+  activeText,
+  isPlaying,
+  disabled,
+  onSelect,
+  onTogglePlay,
+  onDelete,
+}) {
+  const takeNumber = takeIndex + 1;
+  const isSelected = Boolean(take.isSelected);
+  const isOutdated = isSubtitleTakeOutdated(take, activeText);
+  const duration = Number(take.duration);
+  const voiceName = take.settings?.characterName || '';
+  const onChipClick = () => { if (!disabled && !isSelected && onSelect) onSelect(); };
+  const chipClasses = `segment-take-chip${isSelected ? ' is-selected' : ''}${isPlaying ? ' is-playing' : ''}${isOutdated ? ' is-outdated' : ''}`;
+  const ariaState = `Take ${takeNumber}${isSelected ? ' (active)' : ''}${isPlaying ? ' (playing)' : ''}${isOutdated ? ' (outdated)' : ''}`;
+  return (
+    <div
+      className={chipClasses}
+      role="button"
+      tabIndex={disabled ? -1 : 0}
+      aria-disabled={disabled || undefined}
+      aria-pressed={isSelected}
+      aria-label={ariaState}
+      title={formatSubtitleTakeTitle(take, isOutdated)}
+      onClick={onChipClick}
+      onKeyDown={event => handleSubtitleTakeChipKey(event, { disabled, onChipClick, onTogglePlay, onDelete })}
+    >
+      {onTogglePlay && (
+        <button
+          type="button"
+          className={`button icon-button segment-take-play-btn ${isPlaying ? 'is-playing' : ''}`}
+          title={isPlaying ? `Stop Take ${takeNumber}` : `Play Take ${takeNumber}`}
+          aria-label={isPlaying ? `Stop Take ${takeNumber}` : `Play Take ${takeNumber}`}
+          disabled={disabled}
+          onClick={event => { event.stopPropagation(); onTogglePlay(); }}
+        >
+          <Icon name={isPlaying ? 'stop_fill' : 'play_fill'} />
+        </button>
+      )}
+      <span className="segment-take-label">Take {takeNumber}</span>
+      {voiceName ? <span className="segment-take-duration">{voiceName}</span> : null}
+      {Number.isFinite(duration) && duration > 0 && (
+        <span className="segment-take-duration">{duration.toFixed(1)}s</span>
+      )}
+      {isSelected && <span className="segment-take-active-badge" title="Active take used in dubbing">Active</span>}
+      {isOutdated && <span className="segment-take-outdated-badge" title="Cue text changed since this take was generated">Outdated</span>}
+      {onDelete && (
+        <button
+          type="button"
+          className="button icon-button segment-take-delete-btn"
+          title={`Delete Take ${takeNumber}`}
+          aria-label={`Delete Take ${takeNumber}`}
+          disabled={disabled}
+          onClick={event => { event.stopPropagation(); onDelete(); }}
+        >
+          <Icon name="close" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SubtitleTakesTray({ segment, activeText, playingTakeId, disabled, onSelectTake, onTogglePlayTake, onDeleteTake }) {
+  const takes = (Array.isArray(segment?.takes) ? segment.takes : []).filter(t => Boolean(t?.audioAssetId));
+  if (takes.length < 2) return null;
+  return (
+    <div className="segment-takes-tray subtitle-takes-tray" role="group" aria-label={`Audio takes for cue ${segment.id}`}>
+      <span className="segment-takes-label">Takes ({takes.length}):</span>
+      <div className="segment-takes-list">
+        {takes.map((take, idx) => {
+          const takeId = take.id || take.takeId || '';
+          return (
+            <SubtitleTakeChip
+              key={takeId || `${segment.id}-take-${idx}`}
+              take={take}
+              takeIndex={idx}
+              activeText={activeText}
+              isPlaying={Boolean(takeId && playingTakeId === takeId)}
+              disabled={disabled}
+              onSelect={onSelectTake && takeId ? () => onSelectTake(segment.id, takeId) : null}
+              onTogglePlay={onTogglePlayTake && takeId ? () => onTogglePlayTake(segment.id, takeId) : null}
+              onDelete={onDeleteTake && takeId ? () => onDeleteTake(segment.id, takeId) : null}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function resolveRowClass(isActive, isSelected, validationIssues) {
@@ -706,10 +855,12 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   isVoiceStale = false,
   isGeneratingVoice = false,
   isPlayingVoice = false,
+  playingTakeId = '',
   voiceDisabled = false,
   onToggleSelect,
   onSeek,
   onUpdate,
+  onCommitHistoryBoundary = null,
   onUpdateTiming,
   onUpdatePause = null,
   onExtendToSpeech = null,
@@ -725,9 +876,14 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
   onDelete,
   onApplySuggestion,
   onDismissSuggestion,
+  onRetranslateSegment = null,
+  onDismissStaleTranslation = null,
   onGenerateVoice,
   onTogglePlayVoice,
   onDownloadVoice,
+  onSelectTake = null,
+  onTogglePlayTake = null,
+  onDeleteTake = null,
   onAssignVoice = null,
   onApplyTerminologySpelling = null,
   onApplyTerminologyTranslation = null,
@@ -776,6 +932,8 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
       onAssignVoice,
       onApplyTerminologySpelling,
       onApplyTerminologyTranslation,
+      onRetranslateSegment,
+      onDismissStaleTranslation,
     });
   };
 
@@ -831,6 +989,7 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
         value={activeText}
         disabled={busy}
         onChange={e => onUpdate(segment.id, useTranslation ? { translatedText: e.target.value } : { text: e.target.value })}
+        onBlur={() => onCommitHistoryBoundary?.()}
       />
       {!useTranslation && (
         <SegmentVerificationBanner
@@ -854,6 +1013,15 @@ export const SubtitleSegmentRow = memo(function SubtitleSegmentRow({
         onRemoveVoice={onRemoveVoice ? () => onRemoveVoice(segment.id) : null}
         onRevokeSpill={onRevokeSpill ? () => onRevokeSpill(segment.id) : null}
         onUndoTrimVoice={onUndoTrimVoice ? () => onUndoTrimVoice(segment.id) : null}
+      />
+      <SubtitleTakesTray
+        segment={segment}
+        activeText={activeText}
+        playingTakeId={playingTakeId}
+        disabled={busy || voiceDisabled}
+        onSelectTake={onSelectTake}
+        onTogglePlayTake={onTogglePlayTake}
+        onDeleteTake={onDeleteTake}
       />
     </article>
   );

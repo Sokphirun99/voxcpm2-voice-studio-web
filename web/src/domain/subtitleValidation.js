@@ -4,7 +4,7 @@
 
 import { MISMATCH_REMEDY_TYPES, detectDurationMismatches } from './durationMismatch.js';
 import { countGraphemes } from './presets.js';
-import { MIN_SPLIT_GAP_SEC, detectCueOverlaps, roundToMs } from './subtitles.js';
+import { MIN_SPLIT_GAP_SEC, detectCueOverlaps, isSegmentTranslationStale, roundToMs } from './subtitles.js';
 import { inspectSegmentTerminology } from './terminology.js';
 
 export const VALIDATION_MIN_DURATION_SEC = 0.2;
@@ -30,6 +30,7 @@ export const SUBTITLE_ISSUE_TYPES = Object.freeze({
   TOO_MANY_LINES: 'too_many_lines',
   READING_SPEED_FAST: 'reading_speed_fast',
   UNTRANSLATED: 'untranslated',
+  STALE_TRANSLATION: 'stale_translation',
   UNASSIGNED_VOICE: 'unassigned_voice',
   SPEECH_EXCEEDS_INTERVAL: 'speech_exceeds_interval',
   TERMINOLOGY_SPELLING: 'terminology_spelling',
@@ -44,6 +45,8 @@ export const REMEDY_ACTIONS = Object.freeze({
   SPLIT_SEGMENT: 'split_segment',
   EXTEND_DURATION: 'extend_duration',
   FOCUS_TRANSLATION: 'focus_translation',
+  RETRANSLATE_SEGMENT: 'retranslate_segment',
+  DISMISS_STALE_TRANSLATION: 'dismiss_stale_translation',
   ASSIGN_VOICE: 'assign_voice',
   APPLY_TERMINOLOGY_SPELLING: 'apply_terminology_spelling',
   APPLY_TERMINOLOGY_TRANSLATION: 'apply_terminology_translation',
@@ -109,6 +112,19 @@ export function validateSegmentText(seg, options = {}) {
       segmentId: seg.id, type: SUBTITLE_ISSUE_TYPES.UNTRANSLATED, severity: SUBTITLE_ISSUE_SEVERITIES.WARNING,
       message: 'Translation text is missing for this cue.', remedyAction: REMEDY_ACTIONS.FOCUS_TRANSLATION,
       remedyHint: 'Provide translated text or run translation on this segment.',
+    }));
+  }
+  if (primaryText && isSegmentTranslationStale(seg)) {
+    issues.push(createIssue({
+      segmentId: seg.id,
+      type: SUBTITLE_ISSUE_TYPES.STALE_TRANSLATION,
+      severity: SUBTITLE_ISSUE_SEVERITIES.WARNING,
+      message: 'Source text changed since translation.',
+      remedyAction: REMEDY_ACTIONS.RETRANSLATE_SEGMENT,
+      remedyHint: 'Re-translate this cue or review and keep the existing translation.',
+      metadata: typeof seg.translatedFromText === 'string'
+        ? { previousSourceText: seg.translatedFromText }
+        : null,
     }));
   }
   return issues;

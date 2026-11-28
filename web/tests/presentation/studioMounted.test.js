@@ -907,6 +907,16 @@ test('mounted Studio regenerates only segment 2 of a chunked script and swaps th
     assert.notEqual(secondDownloadUrl, firstDownloadUrl);
     assert.equal(revokedUrls.includes(firstDownloadUrl), true);
 
+    // Non-destructive chunk regeneration preserves Take 1 alongside Take 2 for A/B comparison
+    const takePills = container.querySelectorAll('.take-pill');
+    assert.equal(takePills.length, 2, 'Regenerating a segment must add a new take instead of overwriting Take 1');
+    assert.equal(takePills[1].getAttribute('aria-pressed'), 'true');
+    await act(async () => {
+      takePills[0].dispatchEvent({ type: 'click', bubbles: true });
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(container.querySelector('#duration').textContent, '0:04');
+
     await act(async () => { root.unmount(); });
     root = null;
     assert.equal(container.querySelector('.segments-drawer'), null);

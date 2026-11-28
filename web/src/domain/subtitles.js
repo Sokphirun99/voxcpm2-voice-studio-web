@@ -36,6 +36,17 @@ export {
   trimClipWavToInterval,
 } from './durationMismatch.js';
 export {
+  MAX_SUBTITLE_HISTORY_ENTRIES,
+  UNDO_TYPING_COALESCE_MS,
+  clearSubtitleHistoryCoalesce,
+  createEmptySubtitleHistory,
+  createSubtitleHistorySnapshot,
+  pushSubtitleHistoryEntry,
+  redoSubtitleHistory,
+  restoreSubtitleSnapshotTakes,
+  undoSubtitleHistory,
+} from './subtitleHistory.js';
+export {
   MAX_CHARS_PER_LINE,
   MAX_LINE_BREAKS,
   MAX_READING_SPEED_CPS,
@@ -820,6 +831,7 @@ export function resolveCueOverlaps(segments, options = {}) {
   const { resolutionMode = OVERLAP_RESOLVE_MODES.TRIM_PREVIOUS, minDuration = MIN_SPLIT_GAP_SEC, minGap = 0 } = options;
   if (!Array.isArray(segments) || segments.length < 2) return segments || [];
   const out = [segments[0]];
+  let changed = false;
   for (let i = 1; i < segments.length; i++) {
     const prev = out[i - 1];
     const cur = segments[i];
@@ -827,11 +839,12 @@ export function resolveCueOverlaps(segments, options = {}) {
       const [fixedPrev, fixedCur] = resolveOverlapPair(prev, cur, { resolutionMode, minDuration, minGap });
       out[i - 1] = fixedPrev;
       out.push(fixedCur);
+      changed = true;
     } else {
       out.push(cur);
     }
   }
-  return out;
+  return changed ? out : segments;
 }
 
 /**
@@ -874,8 +887,10 @@ function computeClampedCueTimes(rawStart, rawEnd, bounds, minDuration) {
 
 function applyTimingWithOverlapMode(list, idx, params) {
   const { rawStart, rawEnd, bounds, minDuration, overlapMode, minGap } = params;
+  const cur = list[idx];
   if (overlapMode === OVERLAP_BEHAVIOR_MODES.PREVENT) {
     const clamped = computeClampedCueTimes(rawStart, rawEnd, bounds, minDuration);
+    if (clamped.start === cur.start && clamped.end === cur.end) return list;
     return list.map((seg, i) => (i === idx ? { ...seg, ...clamped } : seg));
   }
   const nextEnd = Math.max(roundToMs(rawStart + minDuration), rawEnd);
@@ -887,6 +902,7 @@ function applyTimingWithOverlapMode(list, idx, params) {
     const updated = list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
     return shiftSubsequentCues(updated, idx + 1, delta, true);
   }
+  if (rawStart === cur.start && nextEnd === cur.end) return list;
   return list.map((seg, i) => (i === idx ? { ...seg, start: rawStart, end: nextEnd } : seg));
 }
 
@@ -925,6 +941,122 @@ export function deleteSubtitleSegment(segments, segId) {
 }
 
 /**
+ * Checks whether a subtitle segment's translation is stale relative to its source text.
+ * Inputs: subtitle `segment` record.
+ * Outputs: boolean true when `translatedText` exists and source text changed after translation.
+ * Side effects: none.
+ * Failure modes: returns `false` for null, invalid, or untranslated cues.
+ * @param {object|null|undefined} segment - Subtitle cue record.
+ * @returns {boolean} True when translation is outdated.
+ */
+export function isSegmentTranslationStale(segment) {
+  if (!segment || typeof segment !== 'object') return false;
+  const translated = typeof segment.translatedText === 'string' ? segment.translatedText.trim() : '';
+  if (!translated) return false;
+  if (segment.translationStale) return true;
+  if (typeof segment.translatedFromText === 'string') {
+    const source = typeof segment.text === 'string' ? segment.text.trim() : '';
+    return segment.translatedFromText.trim() !== source;
+  }
+  return false;
+}
+
+function stripTranslationSyncFields(segment) {
+  if (!('translationStale' in segment) && !('translatedFromText' in segment)) return segment;
+  const { translationStale: _stale, translatedFromText: _from, ...rest } = segment;
+  return rest;
+}
+
+function syncSourceEditTranslationState(segment, nextBase, prevText, nextText) {
+  const baseline = typeof segment.translatedFromText === 'string' ? segment.translatedFromText : prevText;
+  const isStale = nextText.trim() !== baseline.trim();
+  const clean = stripTranslationSyncFields(nextBase);
+  return {
+    ...clean,
+    translatedFromText: baseline,
+    ...(isStale ? { translationStale: true } : {}),
+  };
+}
+
+function areSegmentFieldsIdentical(a, b) {
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every(k => Object.prototype.hasOwnProperty.call(b, k) && Object.is(a[k], b[k]));
+}
+
+/**
+ * Applies a partial edit to a subtitle segment while keeping stale-translation flags consistent.
+ * Inputs: `segment` record and `patch` fields (`text`, `translatedText`, `speakerId`, `translationStale`, etc.).
+ * Outputs: Updated immutable segment object (returns `segment` reference if unchanged).
+ * Side effects: none.
+ * Failure modes: returns `segment` unchanged when `segment` or `patch` is invalid.
+ * @param {object} segment - Existing subtitle segment.
+ * @param {object} [patch={}] - Partial field updates.
+ * @returns {object} Updated subtitle segment.
+ */
+export function applySubtitleSegmentPatch(segment, patch = {}) {
+  if (!segment || typeof segment !== 'object' || !patch || typeof patch !== 'object') return segment;
+  const prevText = typeof segment.text === 'string' ? segment.text : '';
+  const nextBase = { ...segment, ...patch };
+  const nextText = typeof nextBase.text === 'string' ? nextBase.text : '';
+  const nextTranslated = typeof nextBase.translatedText === 'string' ? nextBase.translatedText : '';
+  const hasTranslation = Boolean(nextTranslated.trim());
+
+  let result = nextBase;
+  if ('translatedText' in patch) {
+    const clean = stripTranslationSyncFields(nextBase);
+    if (!hasTranslation) {
+      result = clean;
+    } else {
+      const explicitStale = patch.translationStale === true;
+      const keepBaseline = patch.keepTranslationBaseline === true && typeof segment.translatedFromText === 'string';
+      const nextFrom = keepBaseline ? segment.translatedFromText : nextText;
+      result = { ...clean, translatedFromText: nextFrom, ...(explicitStale ? { translationStale: true } : {}) };
+    }
+  } else if (patch.translationStale === false && !('text' in patch)) {
+    if (!isSegmentTranslationStale(segment) && !('translationStale' in segment)) {
+      const { translationStale: _drop, ...withoutStale } = nextBase;
+      result = withoutStale;
+    } else {
+      const clean = stripTranslationSyncFields(nextBase);
+      result = hasTranslation ? { ...clean, translatedFromText: nextText } : clean;
+    }
+  } else if ('text' in patch) {
+    if (nextText === prevText) {
+      result = hasTranslation ? nextBase : stripTranslationSyncFields(nextBase);
+    } else {
+      result = hasTranslation
+        ? syncSourceEditTranslationState(segment, nextBase, prevText, nextText)
+        : stripTranslationSyncFields(nextBase);
+    }
+  }
+  if ('keepTranslationBaseline' in result) {
+    const { keepTranslationBaseline: _drop, ...rest } = result;
+    result = rest;
+  }
+  return areSegmentFieldsIdentical(segment, result) ? segment : result;
+}
+
+function buildMergedTranslationFields(cur, next, mergedText, mergedTranslated, join) {
+  if (!mergedTranslated.trim()) return {};
+  const curBase = cur.translatedText?.trim()
+    ? (typeof cur.translatedFromText === 'string' ? cur.translatedFromText : cur.text)
+    : '';
+  const nextBase = next.translatedText?.trim()
+    ? (typeof next.translatedFromText === 'string' ? next.translatedFromText : next.text)
+    : '';
+  const mergedBase = join(curBase, nextBase);
+  const isStale = isSegmentTranslationStale(cur)
+    || isSegmentTranslationStale(next)
+    || (Boolean(mergedBase) && mergedBase.trim() !== mergedText.trim());
+  return {
+    translatedFromText: mergedBase,
+    ...(isStale ? { translationStale: true } : {}),
+  };
+}
+
+/**
  * Merges a segment with its immediate successor, joining original and translated lines cleanly.
  * @param {Array<object>} segments - Subtitle segments.
  * @param {string} segId - Target segment ID.
@@ -937,14 +1069,17 @@ export function mergeSubtitleSegmentWithNext(segments, segId) {
   const cur = list[idx];
   const next = list[idx + 1];
   const join = (a, b) => [String(a || '').trim(), String(b || '').trim()].filter(Boolean).join(' ');
-  const merged = {
+  const mergedText = join(cur.text, next.text);
+  const mergedTranslated = join(cur.translatedText, next.translatedText);
+  const base = stripTranslationSyncFields({
     ...cur,
     start: Math.min(cur.start, next.start),
     end: Math.max(cur.end, next.end),
-    text: join(cur.text, next.text),
-    translatedText: join(cur.translatedText, next.translatedText),
-  };
-  return [...list.slice(0, idx), merged, ...list.slice(idx + 2)];
+    text: mergedText,
+    translatedText: mergedTranslated,
+  });
+  const syncFields = buildMergedTranslationFields(cur, next, mergedText, mergedTranslated, join);
+  return [...list.slice(0, idx), { ...base, ...syncFields }, ...list.slice(idx + 2)];
 }
 
 function splitTextGraphemeSafe(text, ratio) {
@@ -984,6 +1119,17 @@ function computeSplitTimestamp(start, end, ratio) {
   return Math.max(safeStart + 0.001, Math.min(safeEnd - 0.001, rawSplit));
 }
 
+function resolveSplitHalfTranslationFields(translated, text, wasStale, prevFromText) {
+  if (!String(translated || '').trim()) return {};
+  if (wasStale) {
+    return {
+      translationStale: true,
+      ...(typeof prevFromText === 'string' ? { translatedFromText: prevFromText } : {}),
+    };
+  }
+  return { translatedFromText: text };
+}
+
 /**
  * Splits a segment proportionally across time and grapheme-safe text boundaries.
  * @param {Array<object>} segments - Subtitle segments.
@@ -1002,8 +1148,18 @@ export function splitSubtitleSegment(segments, segId, { ratio = 0.5, nextId } = 
   const [trA, trB] = splitTextGraphemeSafe(seg.translatedText, safeRatio);
   if (!textB && !trB) return list;
   const freshId = nextId || buildUniqueSegmentId(list, seg.id);
-  const first = { ...seg, end: splitTime, text: textA || seg.text, translatedText: trA };
-  const second = { ...seg, id: freshId, start: splitTime, text: textB, translatedText: trB, ...(Array.isArray(seg.takes) ? { takes: [] } : {}) };
+  const wasStale = isSegmentTranslationStale(seg);
+  const cleanSeg = stripTranslationSyncFields(seg);
+  const firstText = textA || seg.text;
+  const first = {
+    ...cleanSeg, end: splitTime, text: firstText, translatedText: trA,
+    ...resolveSplitHalfTranslationFields(trA, firstText, wasStale, seg.translatedFromText),
+  };
+  const second = {
+    ...cleanSeg, id: freshId, start: splitTime, text: textB, translatedText: trB,
+    ...(Array.isArray(seg.takes) ? { takes: [] } : {}),
+    ...resolveSplitHalfTranslationFields(trB, textB, wasStale, seg.translatedFromText),
+  };
   return [...list.slice(0, idx), first, second, ...list.slice(idx + 1)];
 }
 
@@ -1048,7 +1204,7 @@ export function replaceTextInSegments({ segments = [], findText = '', replaceTex
     matchCount += hits.length;
     segmentCount += 1;
     const replaced = active.replace(matcher, () => replaceText);
-    return useTranslation ? { ...seg, translatedText: replaced } : { ...seg, text: replaced };
+    return applySubtitleSegmentPatch(seg, useTranslation ? { translatedText: replaced } : { text: replaced });
   });
   return { segments: next, matchCount, segmentCount };
 }
@@ -1075,7 +1231,7 @@ export function applySpellingTermsToSegments(segments, effectiveTerms, { sourceL
     const corrected = applySpellingTerms(seg.text || '', effectiveTerms, { sourceLanguage });
     if (corrected === (seg.text || '')) return seg;
     updatedIds.push(seg.id);
-    return { ...seg, text: corrected };
+    return applySubtitleSegmentPatch(seg, { text: corrected });
   });
   return { segments: updatedIds.length ? next : segments, updatedCount: updatedIds.length, updatedIds };
 }

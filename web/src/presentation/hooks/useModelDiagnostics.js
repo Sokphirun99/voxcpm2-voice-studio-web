@@ -2,7 +2,7 @@
  * @fileoverview React hook coordinating service probes, model readiness polling, and diagnostic state.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useStudioServices } from '../StudioContext.jsx';
 
 function resolveGateway(customGateway) {
@@ -13,33 +13,42 @@ function resolveGateway(customGateway) {
   }
 }
 
+const DIAGNOSTICS_REFRESH_MS = 5_000;
+
 function useAutoRefresh(refresh, active) {
   useEffect(() => {
-    let mounted = true;
-    const run = async () => {
-      if (mounted && active) await refresh();
+    if (!active) return;
+    const check = () => {
+      if (!globalThis.document?.hidden) void refresh({ background: true });
     };
-    void run();
+    check();
+    const timer = setInterval(check, DIAGNOSTICS_REFRESH_MS);
+    const document = globalThis.document;
+    document?.addEventListener('visibilitychange', check);
     return () => {
-      mounted = false;
+      clearInterval(timer);
+      document?.removeEventListener('visibilitychange', check);
     };
   }, [refresh, active]);
 }
 
-function createRefreshHandler({ gateway, setLoading, setError, setDiagnostics, setLastRefreshedAt }) {
-  return async () => {
+function createRefreshHandler({ gateway, setLoading, setError, setDiagnostics, setLastRefreshedAt, inFlight }) {
+  return async ({ background = false } = {}) => {
     if (!gateway?.getAggregatedDiagnostics) {
       setLoading(false);
       return;
     }
-    setLoading(true);
-    setError(null);
+    if (inFlight.current) return;
+    inFlight.current = true;
+    if (!background) setLoading(true);
     try {
       setDiagnostics(await gateway.getAggregatedDiagnostics());
       setLastRefreshedAt(new Date().toLocaleTimeString());
+      setError(null);
     } catch (err) {
       setError(err?.message || 'Failed to refresh model diagnostics.');
     } finally {
+      inFlight.current = false;
       setLoading(false);
     }
   };
@@ -49,7 +58,7 @@ function createRefreshHandler({ gateway, setLoading, setError, setDiagnostics, s
  * Coordinates fetching and refreshing aggregated system diagnostics.
  * Inputs: optional `{ gateway, initialDiagnostics, active }` overrides.
  * Outputs: `{ diagnostics, loading, error, refresh, lastRefreshedAt }`.
- * Side effects: executes async diagnostic probes on mount and on explicit refresh.
+ * Side effects: executes async diagnostic probes while the workspace is active and on explicit refresh.
  * Failure modes: sets `error` message and keeps last valid diagnostics.
  * @param {{ gateway?: object, initialDiagnostics?: object|null, active?: boolean }} [options] - Diagnostic options.
  * @returns {object} Diagnostic state and controls.
@@ -61,8 +70,9 @@ export function useModelDiagnostics({ gateway: customGateway, initialDiagnostics
   const [error, setError] = useState(null);
   const [lastRefreshedAt, setLastRefreshedAt] = useState(initialDiagnostics ? 'Initial' : null);
 
+  const inFlight = useRef(false);
   const refresh = useCallback(
-    createRefreshHandler({ gateway, setLoading, setError, setDiagnostics, setLastRefreshedAt }),
+    createRefreshHandler({ gateway, setLoading, setError, setDiagnostics, setLastRefreshedAt, inFlight }),
     [gateway]
   );
   useAutoRefresh(refresh, active);

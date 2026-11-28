@@ -22,7 +22,6 @@ import {
   resolveSpeakerLabel,
   validateSubtitleSegments,
 } from '../../domain/subtitles.js';
-import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
 import {
   EXPORT_PRESET_IDS,
   VIDEO_AUDIO_MODES,
@@ -413,125 +412,6 @@ function SubtitleSettingsForm({ ctrl, modelHints = [] }) {
   );
 }
 
-function ProjectSelector({ ctrl }) {
-  const { state, projectId, projectRepository, loadProjectFromSnapshot, flushProjectSave } = ctrl;
-  const [projects, setProjects] = useState([]);
-  const [selectedProjectId, setSelectedProjectId] = useState(projectId || '');
-  const [newTitle, setNewTitle] = useState('');
-  const [error, setError] = useState('');
-  const [refreshKey, setRefreshKey] = useState(0);
-  const busy = Boolean(state.busyAction);
-
-  useEffect(() => {
-    if (!projectRepository) return undefined;
-    let mounted = true;
-    projectRepository.listProjects({ limit: 50, offset: 0 }).then(page => {
-      if (!mounted) return;
-      setProjects(page.items);
-      setSelectedProjectId(prev => {
-        const preferred = projectId || prev;
-        return preferred && page.items.some(project => project.id === preferred) ? preferred : '';
-      });
-    }).catch(err => {
-      if (mounted) setError(err?.message || 'Failed to load saved projects.');
-    });
-    return () => { mounted = false; };
-  }, [projectRepository, projectId, refreshKey]);
-
-  const handleLoadProject = async project => {
-    if (!project || !project.id || !projectRepository) return;
-    try {
-      await flushProjectSave?.();
-      const snapshot = await projectRepository.getProject(project.id);
-      if (!snapshot) {
-        setSelectedProjectId(projectId || '');
-        setError('Project not found.');
-        return;
-      }
-      loadProjectFromSnapshot(snapshot);
-      setSelectedProjectId(project.id);
-      setError('');
-    } catch (err) {
-      setSelectedProjectId(projectId || '');
-      setError(err?.message || 'Failed to open project.');
-    }
-  };
-
-  const handleDeleteProject = async project => {
-    if (!project || !project.id || !projectRepository) return;
-    const confirmFn = globalThis.confirm;
-    if (typeof confirmFn === 'function' && !confirmFn(`Delete project "${project.title}"?`)) return;
-    try {
-      await projectRepository.deleteProject(project.id);
-      setProjects(prev => prev.filter(item => item.id !== project.id));
-      if (projectId === project.id) ctrl.clearWorkspace();
-      if (selectedProjectId === project.id) setSelectedProjectId('');
-      setRefreshKey(k => k + 1);
-      setError('');
-    } catch (err) {
-      setError(err?.message || 'Failed to delete project.');
-    }
-  };
-
-  const handleNewProject = async () => {
-    const title = newTitle.trim();
-    if (!title) { setError('Enter a project title.'); return; }
-    if (!projectRepository) { setError('Project storage is unavailable.'); return; }
-    try {
-      await flushProjectSave?.();
-      const saved = await projectRepository.saveProject(createSubtitleProjectSnapshot({ title }));
-      setNewTitle('');
-      setError('');
-      setRefreshKey(k => k + 1);
-      if (saved.project?.id) {
-        loadProjectFromSnapshot(saved.project);
-        setSelectedProjectId(saved.project.id);
-      }
-    } catch (err) {
-      setError(err?.message || 'Failed to create project.');
-    }
-  };
-
-  return (
-    <div className="subtitle-project-selector">
-      <label className="subtitle-project-label" htmlFor="subtitle-project-select">Saved projects</label>
-      <div className="subtitle-project-row">
-        <select id="subtitle-project-select" disabled={busy} value={selectedProjectId} onChange={e => {
-          const id = e.target.value;
-          setSelectedProjectId(id);
-          if (!id) return;
-          const project = projects.find(p => p.id === id);
-          void handleLoadProject(project);
-        }}>
-          <option value="">Projects…</option>
-          {projects.map(project => (
-            <option key={project.id} value={project.id}>{project.title}</option>
-          ))}
-        </select>
-        <input
-          id="subtitle-new-project-title"
-          type="text"
-          placeholder="New project title"
-          value={newTitle}
-          disabled={busy}
-          onChange={e => setNewTitle(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') void handleNewProject(); }}
-        />
-        <button type="button" id="subtitle-new-project-btn" className="button button-secondary" disabled={busy || !newTitle.trim() || !projectRepository} onClick={() => void handleNewProject()}>
-          New
-        </button>
-        <button type="button" id="subtitle-delete-project-btn" className="button button-secondary" disabled={busy || !selectedProjectId} onClick={() => {
-          const selected = projects.find(project => project.id === selectedProjectId);
-          if (selected) void handleDeleteProject(selected);
-        }}>
-          Delete
-        </button>
-      </div>
-      {error && <span className="subtitle-project-error" role="alert">{error}</span>}
-    </div>
-  );
-}
-
 function FindReplaceBar({ busy, countMatches, onReplace }) {
   const [findText, setFindText] = useState('');
   const [replaceText, setReplaceText] = useState('');
@@ -717,7 +597,63 @@ function ValidationSummaryControls({ validation, onJumpNext, onJumpPrev, onFixOv
   );
 }
 
-export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
+function isEditableUndoTarget(target) {
+  if (!target || typeof target !== 'object') return false;
+  if (target.closest?.('.subtitle-find-bar, .subtitle-timing-bar, .subtitle-roster-input, [role="dialog"], dialog')) {
+    return true;
+  }
+  const tag = String(target.tagName || '').toUpperCase();
+  return (tag === 'INPUT' || tag === 'TEXTAREA' || Boolean(target.isContentEditable))
+    && !String(target.className || '').includes('subtitle-line-input');
+}
+
+function handleCueListKeyDown(event, { busy, ctrl }) {
+  if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.altKey || busy) return;
+  if (!(event.metaKey || event.ctrlKey)) return;
+  const target = event.target;
+  if (target?.closest?.('.subtitle-find-bar, .subtitle-timing-bar, .subtitle-roster-input')) return;
+  const key = String(event.key || '').toLowerCase();
+  if (key === 'z' && !event.shiftKey) {
+    if (!ctrl.canUndo) return;
+    event.preventDefault();
+    ctrl.undo?.();
+  } else if ((key === 'z' && event.shiftKey) || (key === 'y' && !event.shiftKey && !event.metaKey)) {
+    if (!ctrl.canRedo) return;
+    event.preventDefault();
+    ctrl.redo?.();
+  }
+}
+
+function SubtitleHistoryButtons({ busy, ctrl }) {
+  return (
+    <div className="subtitle-history-controls" role="group" aria-label="Subtitle edit history">
+      <button
+        type="button"
+        id="subtitle-undo-btn"
+        className="button subtle-button subtitle-cue-btn"
+        title="Undo subtitle edit (Ctrl/Cmd+Z)"
+        aria-label="Undo subtitle edit"
+        disabled={busy || !ctrl.canUndo}
+        onClick={() => ctrl.undo?.()}
+      >
+        <Icon name="undo" /><span>Undo</span>
+      </button>
+      <button
+        type="button"
+        id="subtitle-redo-btn"
+        className="button subtle-button subtitle-cue-btn"
+        title="Redo subtitle edit (Ctrl/Cmd+Shift+Z)"
+        aria-label="Redo subtitle edit"
+        disabled={busy || !ctrl.canRedo}
+        onClick={() => ctrl.redo?.()}
+      >
+        <Icon name="redo" /><span>Redo</span>
+      </button>
+    </div>
+  );
+}
+
+export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation, onOpenExportProject }) {
   const { segments, speakerNames, detectedLanguage, busyAction } = ctrl.state;
   const [showFind, setShowFind] = useState(false);
   const [showOnlyIssues, setShowOnlyIssues] = useState(false);
@@ -725,11 +661,28 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
   const busy = mediaBusy || voice.voiceBusy || voice.dubBusy;
   const selectedSet = new Set(voice.selectedIds);
   if (!segments.length) {
+    if (!ctrl.canUndo && !ctrl.canRedo) {
+      return (
+        <div className="subtitle-empty-state">
+          <Icon name="subtitles" />
+          <strong>No dialogue extracted yet</strong>
+          <p>Upload a video or audio clip and click Extract subtitles to generate clean, editable subtitles.</p>
+        </div>
+      );
+    }
     return (
-      <div className="subtitle-empty-state">
-        <Icon name="subtitles" />
-        <strong>No dialogue extracted yet</strong>
-        <p>Upload a video or audio clip and click Extract subtitles to generate clean, editable subtitles.</p>
+      <div className="subtitle-cue-list" onKeyDown={e => handleCueListKeyDown(e, { busy, ctrl })}>
+        <div className="subtitle-cue-meta">
+          <span>0 segments</span>
+          <div className="subtitle-cue-meta-right">
+            <SubtitleHistoryButtons busy={busy} ctrl={ctrl} />
+          </div>
+        </div>
+        <div className="subtitle-empty-state">
+          <Icon name="subtitles" />
+          <strong>All subtitle cues were removed</strong>
+          <p>Use Undo to restore removed cues, or extract subtitles again.</p>
+        </div>
       </div>
     );
   }
@@ -752,7 +705,7 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
     if (typeof document !== 'undefined') document.getElementById('subtitle-tts-voice')?.focus?.();
   };
   return (
-    <div className="subtitle-cue-list">
+    <div className="subtitle-cue-list" onKeyDown={e => handleCueListKeyDown(e, { busy, ctrl })}>
       <div className="subtitle-cue-meta">
         <span>
           {segments.length} {segments.length === 1 ? 'segment' : 'segments'}
@@ -777,6 +730,7 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
         />
         <div className="subtitle-cue-meta-right">
           {detectedLanguage ? <span>Detected: {detectedLanguage.toUpperCase()}</span> : null}
+          <SubtitleHistoryButtons busy={busy} ctrl={ctrl} />
           <button type="button" id="subtitle-find-toggle" className="button subtle-button subtitle-cue-btn"
             aria-expanded={showFind} onClick={() => setShowFind(v => !v)}>
             <Icon name="search" /><span>Find &amp; replace</span>
@@ -834,10 +788,12 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
               isVoiceStale={voice.isClipStale(seg)}
               isGeneratingVoice={voice.generatingSegmentId === seg.id}
               isPlayingVoice={voice.playingSegmentId === seg.id}
+              playingTakeId={voice.playingTake?.segmentId === seg.id ? voice.playingTake.takeId : ''}
               voiceDisabled={voice.voiceBusy}
               onToggleSelect={voice.toggleSelectSegment}
               onSeek={seconds => ctrl.seekToSegment(seconds, seg.id)}
               onUpdate={ctrl.updateSegment}
+              onCommitHistoryBoundary={ctrl.commitHistoryBoundary}
               onUpdateTiming={ctrl.updateSegmentTiming}
               onUpdatePause={ctrl.updateSegmentPause}
               onExtendToSpeech={ctrl.extendSegmentToSpeech}
@@ -853,9 +809,14 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
               onDelete={onDeleteSegment}
               onApplySuggestion={ctrl.applySegmentSuggestion}
               onDismissSuggestion={ctrl.dismissSegmentSuggestion}
+              onRetranslateSegment={segId => void ctrl.retranslateSegment?.(segId)}
+              onDismissStaleTranslation={ctrl.dismissStaleTranslation}
               onGenerateVoice={segment => void voice.generateSegmentVoice(segment)}
               onTogglePlayVoice={voice.togglePlaySegment}
               onDownloadVoice={segment => voice.downloadSegmentVoice(segment, realIndex)}
+              onSelectTake={voice.selectSegmentTake}
+              onTogglePlayTake={(segId, takeId) => void voice.togglePlaySegmentTake?.(segId, takeId)}
+              onDeleteTake={voice.deleteSegmentTake}
               onAssignVoice={() => handleAssignVoice(seg.id)}
               onApplyTerminologySpelling={segId => ctrl.applySpellingTerminology?.(segId)}
               onApplyTerminologyTranslation={segId => void ctrl.applyTranslationTerminology?.(segId)}
@@ -878,6 +839,8 @@ export function SubtitleCueList({ ctrl, voice, onDeleteSegment, validation }) {
         hasJobId={Boolean(ctrl.state.jobId)}
         hasAudioStream={ctrl.state.hasAudioStream !== false}
         burnInSupported={ctrl.health?.burnInSupported !== false}
+        consolidated={true}
+        onOpenExportProject={onOpenExportProject}
         onDownload={voice.downloadCombinedVoice}
         onDownloadAligned={() => void voice.downloadAlignedVoice?.()}
         onChangeDubAudioMode={voice.setDubAudioMode}
@@ -907,6 +870,7 @@ export function VideoSubtitleWorkspace({
   voiceCatalog = null,
   globalTerminology = null,
   actionsRef = null,
+  autoRestoreLatest = true,
   onRefreshEngine,
   onSendToTts,
   onStateChange,
@@ -920,7 +884,7 @@ export function VideoSubtitleWorkspace({
   const effectiveTermsRef = useRef([]);
   const [terminologyOpen, setTerminologyOpen] = useState(false);
   const [exportProjectOpen, setExportProjectOpen] = useState(false);
-  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden, effectiveTermsRef });
+  const ctrl = useVideoSubtitles({ onNotify, onUnlockSound, hidden, effectiveTermsRef, autoRestoreLatest });
   const effectiveSourceLanguage = (ctrl.state.detectedLanguage && ctrl.state.detectedLanguage !== 'auto')
     ? ctrl.state.detectedLanguage
     : ctrl.state.options.sourceLanguage;
@@ -1006,6 +970,8 @@ export function VideoSubtitleWorkspace({
     onChangeSpillApprovals,
     onAttachSegmentTake: ctrl.attachSegmentVoiceTake,
     onClearSegmentTakes: ctrl.clearSegmentVoiceTakes,
+    onSelectSegmentTake: ctrl.selectSegmentVoiceTake,
+    onDeleteSegmentTake: ctrl.deleteSegmentVoiceTake,
     projectId: activeProjectId,
     projectTitle: activeProjectTitle,
     productionJobs,
@@ -1058,6 +1024,17 @@ export function VideoSubtitleWorkspace({
     onStateChange?.({ busy, hasVideo: Boolean(state.videoFile || state.segments.length) });
   }, [busy, state.videoFile, state.segments.length, onStateChange]);
 
+  useEffect(() => {
+    if (hidden || exportProjectOpen || terminologyOpen || (!ctrl.canUndo && !ctrl.canRedo)) return undefined;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined;
+    const onDocKeyDown = event => {
+      if (isEditableUndoTarget(event.target)) return;
+      handleCueListKeyDown(event, { busy, ctrl: { canUndo: ctrl.canUndo, canRedo: ctrl.canRedo, undo: ctrl.undo, redo: ctrl.redo } });
+    };
+    document.addEventListener('keydown', onDocKeyDown);
+    return () => document.removeEventListener('keydown', onDocKeyDown);
+  }, [hidden, exportProjectOpen, terminologyOpen, busy, ctrl.canUndo, ctrl.canRedo, ctrl.undo, ctrl.redo]);
+
   const handleSelectFile = file => {
     if (!file) return;
     const outcome = ctrl.selectVideoFile(file);
@@ -1075,7 +1052,9 @@ export function VideoSubtitleWorkspace({
     voice.cancelVoiceGeneration();
   };
   const handleDeleteSegment = segId => {
-    voice.removeSegmentClip(segId);
+    if (voice.playingSegmentId === segId || voice.playingTake?.segmentId === segId) {
+      voice.stopPlayback?.();
+    }
     ctrl.deleteSegment(segId);
   };
   const handleSendToTts = () => {
@@ -1141,6 +1120,7 @@ export function VideoSubtitleWorkspace({
     dubMixSettings: voice.dubMixSettings,
     videoDuration: ctrl.mediaDuration,
     videoSize: state.videoSize,
+    videoFileSize: state.videoFile?.size || 0,
     isAudioOnly: state.isAudioOnly,
     hasAudioStream: state.hasAudioStream,
     hasLinkedVideo: Boolean(state.videoFile),
@@ -1297,7 +1277,6 @@ export function VideoSubtitleWorkspace({
             onSelectCue={cue => ctrl.seekToSegment(cue.start, cue.id)}
             onTogglePlayVoice={voice.togglePlaySegment}
           />
-          <ProjectSelector ctrl={ctrl} />
           <SubtitleSettingsForm ctrl={ctrl} modelHints={modelHints} />
           <SpeakerRosterCard
             speakers={speakers}
@@ -1308,7 +1287,7 @@ export function VideoSubtitleWorkspace({
           />
         </section>
         <section className="subtitle-right-pane studio-form" aria-label="Extracted dialogue subtitles">
-          <SubtitleCueList ctrl={ctrl} voice={voice} onDeleteSegment={handleDeleteSegment} validation={validation} />
+          <SubtitleCueList ctrl={ctrl} voice={voice} onDeleteSegment={handleDeleteSegment} validation={validation} onOpenExportProject={() => setExportProjectOpen(true)} />
         </section>
       </div>
       <SubtitleExportDock
@@ -1332,6 +1311,7 @@ export function VideoSubtitleWorkspace({
         onExportAlignedVoice={() => void voice.downloadAlignedVoice?.()}
         onOpenExportProject={() => setExportProjectOpen(true)}
         exportHistoryCount={(ctrl.exportHistory || []).length}
+        consolidated={true}
         onExportFile={ctrl.exportFile}
         onCopyDialogue={() => void ctrl.copyDialogue()}
         onBurnVideo={() => void ctrl.burnVideo()}
@@ -1345,6 +1325,7 @@ export function VideoSubtitleWorkspace({
           exportHistory={ctrl.exportHistory || []}
           busy={busy}
           onExportPreset={handleRunExportPreset}
+          onCancelExport={handleCancel}
           onClose={() => setExportProjectOpen(false)}
         />
       )}

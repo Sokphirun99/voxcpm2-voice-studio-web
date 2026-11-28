@@ -233,6 +233,25 @@ function prepareSegmentRun(args, defaults) {
  * @param {{ onFailure: () => void, onValidationFieldError?: (field: string) => void, onNotify?: Function, onUnlockSound?: Function, offlineReadiness?: object, models?: unknown, isOnline?: boolean }} params - Hook callbacks.
  * @returns {object} Synthesis state and actions.
  */
+/**
+ * Derives a unique non-destructive take ID for a chunk-regenerated recording so prior takes remain selectable.
+ * @param {object} recording - Regenerated recording entity.
+ * @param {object[]} existingTakes - Current session takes.
+ * @returns {object} Recording with a unique take ID.
+ */
+function buildRegeneratedTake(recording, existingTakes) {
+  if (!recording?.id) return recording;
+  const baseId = String(recording.id).replace(/-regen-\d+$/, '');
+  const existingIds = new Set((existingTakes || []).map(take => take?.id));
+  let seq = 1;
+  let candidateId = `${baseId}-regen-${seq}`;
+  while (existingIds.has(candidateId)) {
+    seq += 1;
+    candidateId = `${baseId}-regen-${seq}`;
+  }
+  return { ...recording, id: candidateId };
+}
+
 export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify, onUnlockSound, offlineReadiness = null, models = null, isOnline = undefined }) {
   const { synthesizeSpeech } = useStudioServices();
   const abortController = useRef(null);
@@ -277,15 +296,6 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
     });
   }, []);
 
-  const replaceTake = useCallback((takeId, nextRecording) => {
-    if (!takeId || !nextRecording?.id) return;
-    const currentTakes = takesRef.current;
-    if (!currentTakes.some(take => take.id === takeId)) return;
-    const nextTakes = currentTakes.map(take => (take.id === takeId ? nextRecording : take));
-    takesRef.current = nextTakes;
-    setTakes(nextTakes);
-  }, []);
-
   const regenerateChunk = useCallback(async ({ recording: target, index, text, character, anchor, cachedUpload, options, onCompleted, models: chunkModels, isOnline: chunkOnline }) => {
     if (!target?.id || abortController.current || regeneratingRef.current) return null;
     const controller = new AbortController();
@@ -302,15 +312,16 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
         models: effectiveModels, isOnline: online,
       });
       if (controller.signal.aborted || !result?.recording) return null;
-      replaceTake(target.id, result.recording);
-      if (result.recording.seed != null) setLastSeed(result.recording.seed);
-      const customMessage = await onCompleted?.(result);
-      const metrics = formatGenerationMetrics(result.recording);
+      const nextRecording = buildRegeneratedTake(result.recording, takesRef.current);
+      commitRecording(nextRecording);
+      if (nextRecording.seed != null) setLastSeed(nextRecording.seed);
+      const customMessage = await onCompleted?.({ ...result, recording: nextRecording });
+      const metrics = formatGenerationMetrics(nextRecording);
       const identity = character ? `${character.name} (${character.id})` : 'Voice';
       const message = customMessage || [`Segment ${index + 1} regenerated`, metrics, identity].filter(Boolean).join(' · ');
       setStatus({ message, error: false });
       onNotify?.({ kind: 'success', title: 'Segment updated', message });
-      return result.recording;
+      return nextRecording;
     } catch (error) {
       handleGenerationFailure(error, { setStatus, onFailure, onValidationFieldError, onNotify });
       return null;
@@ -319,7 +330,7 @@ export function useSpeechSynthesis({ onFailure, onValidationFieldError, onNotify
       regeneratingRef.current = null;
       setRegeneratingChunk(null);
     }
-  }, [synthesizeSpeech, replaceTake, onFailure, onValidationFieldError, onNotify, isOnline, models, offlineReadiness]);
+  }, [synthesizeSpeech, commitRecording, onFailure, onValidationFieldError, onNotify, isOnline, models, offlineReadiness]);
 
   const generateSegment = useCallback(async args => {
     const { segment, character } = args || {};

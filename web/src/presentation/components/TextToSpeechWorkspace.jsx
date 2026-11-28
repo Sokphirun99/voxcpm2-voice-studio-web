@@ -473,7 +473,7 @@ function applyProjectSnapshotToTts(snapshot, setters) {
   }
 }
 
-function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume }) {
+function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: propExternalScript = '', onConsumeExternalScript: propConsume, autoRestoreLatest = true }) {
   const {
     library, anchorApi, activeCharacter, activeAnchor,
     lockedSeeds, setLockedSeeds, characterActions,
@@ -620,7 +620,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
   }, [activeCharacter.id]);
 
   useEffect(() => {
-    if (!projectRepository) {
+    if (!autoRestoreLatest || !projectRepository) {
       setProjectsReady(true);
       return undefined;
     }
@@ -662,7 +662,7 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
     };
     void restoreLatestProject();
     return () => { active = false; };
-  }, [projectRepository, logger]);
+  }, [autoRestoreLatest, projectRepository, logger]);
 
   const terminologyCtrl = useTerminology({
     globalController: shared?.globalTerminology,
@@ -1132,8 +1132,8 @@ function useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript: 
  * @param {object} props - Workspace container props.
  * @returns {React.ReactElement} Text-to-Speech function workspace.
  */
-export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef, externalScript = '', onConsumeExternalScript }) {
-  const { state, ctrl } = useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript, onConsumeExternalScript });
+export function TextToSpeechWorkspace({ shared, notices, hidden = false, actionsRef, externalScript = '', onConsumeExternalScript, autoRestoreLatest = true }) {
+  const { state, ctrl } = useTextToSpeechWorkspace({ shared, hidden, actionsRef, externalScript, onConsumeExternalScript, autoRestoreLatest });
   const verification = useSpeechVerification({
     recording: ctrl.synthesis.recording,
     autoVerify: Boolean(state.options.verifyAudio),
@@ -1171,8 +1171,6 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
       <Toolbar busy={ctrl.synthesis.busy} generateDisabled={ctrl.generateDisabled}
         shortcut={isApplePlatform() ? '⌘ Enter' : 'Ctrl Enter'} onCancel={ctrl.synthesis.cancel}
         autosave={ctrl.autosave}
-        offlineReadiness={shared?.offlineReadiness}
-        onSelectModels={shared?.onSelectModels}
         onOpenExport={() => state.setExportModalOpen(true)}
         exportHistoryCount={ctrl.exportHistory.length} />
       <TtsSpeechForm state={state} ctrl={ctrl} voiceActions={voiceActions}
@@ -1217,6 +1215,7 @@ export function TextToSpeechWorkspace({ shared, notices, hidden = false, actions
           onExportPreset={async preset => {
             await state.handleExportNarration(preset.expectedOutput?.filename || '', { throwOnError: true });
           }}
+          onCancelExport={ctrl.synthesis.cancel}
           onClose={() => state.setExportModalOpen(false)}
         />
       )}

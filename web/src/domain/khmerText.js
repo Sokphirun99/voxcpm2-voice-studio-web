@@ -14,6 +14,10 @@ const KHMER_DIGIT_ZERO = 0x17e0;
 
 const KHMER_DIGITS = ['សូន្យ', 'មួយ', 'ពីរ', 'បី', 'បួន', 'ប្រាំ', 'ប្រាំមួយ', 'ប្រាំពីរ', 'ប្រាំបី', 'ប្រាំបួន'];
 const KHMER_TENS = ['', 'ដប់', 'ម្ភៃ', 'សាមសិប', 'សែសិប', 'ហាសិប', 'ហុកសិប', 'ចិតសិប', 'ប៉ែតសិប', 'កៅសិប'];
+const KHMER_MONTHS = Object.freeze([
+  '', 'មករា', 'កុម្ភៈ', 'មីនា', 'មេសា', 'ឧសភា', 'មិថុនា',
+  'កក្កដា', 'សីហា', 'កញ្ញា', 'តុលា', 'វិច្ឆិកា', 'ធ្នូ',
+]);
 
 /**
  * Normalizes Khmer Unicode sequences, strips invisible paste artifacts, and tidies spacing without altering digits.
@@ -139,6 +143,45 @@ function formatTemperatureTokenToKhmer(numRaw, unit) {
 }
 
 /**
+ * Converts a valid Gregorian date token into Khmer spoken calendar order (day, month, year).
+ * Invalid dates are returned unchanged instead of being partially interpreted as numbers.
+ * @param {string} _match - Full matched date.
+ * @param {string} first - First date component.
+ * @param {string} second - Second date component.
+ * @param {string} third - Third date component.
+ * @param {'dmy'|'ymd'} order - Input component order.
+ * @returns {string} Spoken Khmer date or the original date for invalid input.
+ */
+function formatKhmerCalendarDate(_match, first, second, third, order) {
+  const parts = [first, second, third].map(value => Number(toAsciiDigits(value)));
+  const [day, month, year] = order === 'dmy'
+    ? parts
+    : [parts[2], parts[1], parts[0]];
+  if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1) return _match;
+  const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (day > daysInMonth) return _match;
+  return `ថ្ងៃទី${integerToKhmerWords(day)} ខែ${KHMER_MONTHS[month]} ឆ្នាំ${integerToKhmerWords(year)}`;
+}
+
+/**
+ * Makes uppercase acronym/version boundaries explicit for Khmer speech expansion.
+ * Mixed-case product names such as `VoxCPM2` are intentionally left intact.
+ * @param {string} text - Normalized Khmer-context text.
+ * @returns {string} Text with acronym/version token boundaries.
+ */
+function separateAcronymVersionDigits(text) {
+  return text.replace(/\b([A-Z]{2,})-?(?=[0-9\u17E0-\u17E9])/g, '$1 ');
+}
+
+function renderDateMatch(match, first, second, third, order, source, offset) {
+  const formatted = formatKhmerCalendarDate(match, first, second, third, order);
+  if (formatted === match) return match;
+  const prefix = source.slice(Math.max(0, offset - 12), offset);
+  return /ថ្ងៃទី\s*$/.test(prefix) ? formatted.replace(/^ថ្ងៃទី/, '') : formatted;
+}
+
+/**
  * Expands currency (`$25`, `1500៛`), percentages (`50%`), time (`10:30`), temperature (`37°C`), and numbers into spoken Khmer words when Khmer text is present.
  * Inputs: script text string.
  * Outputs: Unicode-normalized text with Khmer-context numerals/currencies/times spoken out.
@@ -153,7 +196,21 @@ export function expandKhmerNumbers(rawText) {
   if (!KHMER_SCRIPT_PATTERN.test(text) && !/[\u17E0-\u17E9៛]/.test(text)) return text;
   const numPattern = '[0-9\u17E0-\u17E9]+(?:,[0-9\u17E0-\u17E9]{3})*(?:\\.[0-9\u17E0-\u17E9]+)?';
   const timePattern = '(?<![A-Za-z0-9_:.])([0-2]?[0-9]|[\u17E0-\u17E2]?[\u17E0-\u17E9]):([0-5][0-9]|[\u17E0-\u17E5][\u17E0-\u17E9])(?![A-Za-z0-9_:.])';
-  return preservePauseMarkers(text, masked => masked
+  const dateDigits = '[0-9\u17E0-\u17E9]';
+  const dmyDatePattern = new RegExp(`(?<![A-Za-z0-9_.])(${dateDigits}{1,2})\\/(${dateDigits}{1,2})\\/(${dateDigits}{4})(?![A-Za-z0-9_.])`, 'g');
+  const ymdDatePattern = new RegExp(`(?<![A-Za-z0-9_.])(${dateDigits}{4})-(${dateDigits}{1,2})-(${dateDigits}{1,2})(?![A-Za-z0-9_.])`, 'g');
+  const invalidDates = [];
+  const renderDate = (match, first, second, third, order, source, offset) => {
+    const rendered = renderDateMatch(match, first, second, third, order, source, offset);
+    if (rendered !== match) return rendered;
+    const placeholder = `INVALIDDATE${invalidDates.length}TOKEN`;
+    invalidDates.push([placeholder, match]);
+    return placeholder;
+  };
+  const prepared = separateAcronymVersionDigits(text)
+    .replace(dmyDatePattern, (match, day, month, year, offset, source) => renderDate(match, day, month, year, 'dmy', source, offset))
+    .replace(ymdDatePattern, (match, year, month, day, offset, source) => renderDate(match, year, month, day, 'ymd', source, offset));
+  const expanded = preservePauseMarkers(prepared, masked => masked
     .replace(new RegExp(`(${numPattern})\\s*°\\s*([CFcf])`, 'g'), (_, num, unit) => formatTemperatureTokenToKhmer(num, unit))
     .replace(new RegExp(timePattern, 'g'), formatTimeTokenToKhmer)
     .replace(new RegExp(`\\$\\s*(${numPattern})`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ដុល្លារ`)
@@ -161,6 +218,7 @@ export function expandKhmerNumbers(rawText) {
     .replace(new RegExp(`(${numPattern})\\s*៛`, 'g'), (_, num) => `${numberTokenToKhmer(num)}រៀល`)
     .replace(new RegExp(`(${numPattern})\\s*%`, 'g'), (_, num) => `${numberTokenToKhmer(num)}ភាគរយ`)
     .replace(new RegExp(`(?<![A-Za-z0-9_.])(${numPattern})(?![A-Za-z0-9_.])`, 'g'), (_, num) => numberTokenToKhmer(num)));
+  return invalidDates.reduce((result, [placeholder, original]) => result.replace(placeholder, original), expanded);
 }
 
 /**

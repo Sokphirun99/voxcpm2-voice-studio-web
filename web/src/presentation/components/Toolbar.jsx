@@ -24,7 +24,7 @@ function GenerateButton({ busy, generateDisabled, shortcut }) {
 /**
  * Renders the top workspace toolbar with synthesis submit, cancel, and autosave status controls.
  * Inputs: `{ busy, generateDisabled, shortcut, onCancel, autosave, offlineReadiness, onSelectModels }`.
- * Outputs: `<header className="studio-toolbar">` element.
+ * Outputs: `<header className="studio-toolbar tts-toolbar">` element.
  * Side effects: invokes `onCancel` when Cancel is clicked.
  * Failure modes: none.
  * @param {{ busy: boolean, generateDisabled: boolean, shortcut: string, onCancel: () => void, autosave?: object, offlineReadiness?: object, onSelectModels?: () => void }} props - Toolbar props.
@@ -32,7 +32,7 @@ function GenerateButton({ busy, generateDisabled, shortcut }) {
  */
 export function Toolbar({ busy, generateDisabled, shortcut, onCancel, autosave, offlineReadiness, onSelectModels, onOpenExport, exportHistoryCount = 0 }) {
   return (
-    <header className="studio-toolbar">
+    <header className="studio-toolbar tts-toolbar">
       <div className="toolbar-heading-group">
         <h1>Text to speech</h1>
         {autosave && <ProjectAutosaveBadge autosave={autosave} />}

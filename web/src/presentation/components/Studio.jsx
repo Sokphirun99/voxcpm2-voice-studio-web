@@ -2,7 +2,7 @@
  * @fileoverview Top-level Voice Studio shell coordinating top-level function workspaces and shared Character Domain state.
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { DEFAULT_CHARACTER_ID, findCharacterById } from '../../domain/voiceLibrary.js';
 import { clearLastActiveProject, getLastActiveProject, saveLastActiveProject } from '../../data/projectRecoveryStorage.js';
 import { useStudioServices } from '../StudioContext.jsx';
@@ -17,6 +17,7 @@ import { useVoiceAnchors } from '../hooks/useVoiceAnchors.js';
 import { useVoiceLibrary } from '../hooks/useVoiceLibrary.js';
 import { BatchJobsWorkspace } from './BatchJobsWorkspace.jsx';
 import { Icon } from './Icon.jsx';
+import { OfflineReadinessBadge } from './OfflineReadinessBadge.jsx';
 import { ModelsSetupWorkspace } from './ModelsSetupWorkspace.jsx';
 import { ProjectsWorkspace } from './ProjectsWorkspace.jsx';
 import { DEFAULT_WORKSPACES, Sidebar } from './Sidebar.jsx';
@@ -144,33 +145,6 @@ async function openWorkspaceProject({ project, repo, logger, ttsRef, subtitlesRe
   setActiveWorkspace('subtitles');
 }
 
-function useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace }) {
-  useEffect(() => {
-    let mounted = true;
-    const restoreActive = async () => {
-      const record = getLastActiveProject({ logger: services?.logger });
-      if (!record?.projectId || !services?.projectRepository) return;
-      try {
-        const project = await services.projectRepository.getProject(record.projectId);
-        if (!mounted || !project) return;
-        await openWorkspaceProject({
-          project,
-          repo: services.projectRepository,
-          logger: services.logger,
-          ttsRef,
-          subtitlesRef,
-          setActiveWorkspace,
-        });
-      } catch (err) {
-        services?.logger?.error?.('Studio.restoreLastActiveProject', err, { projectId: record.projectId });
-        clearLastActiveProject({ logger: services?.logger });
-      }
-    };
-    void restoreActive();
-    return () => { mounted = false; };
-  }, [services, ttsRef, subtitlesRef, setActiveWorkspace]);
-}
-
 /**
  * Coordinates the top-level Voice Studio function workspaces (`Text to speech`, `Video to subtitle`) and shared character data.
  * Inputs: none (consumes Studio services via hooks).
@@ -182,10 +156,8 @@ function useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActive
 export function Studio() {
   const ttsRef = useRef(null);
   const subtitlesRef = useRef(null);
-  const [activeWorkspace, setActiveWorkspace] = useState(() => {
-    const initial = getLastActiveProject();
-    return initial?.workspace === 'subtitles' ? 'subtitles' : 'tts';
-  });
+  const [activeWorkspace, setActiveWorkspace] = useState('projects');
+  const [sidebarOpen, setSidebarOpen] = useState(() => !globalThis.matchMedia?.('(max-width: 860px)').matches);
   const [externalScript, setExternalScript] = useState('');
   const [ttsState, setTtsState] = useState({ busy: false, hasScript: false, libraryOpen: false });
   const [subtitleState, setSubtitleState] = useState({ busy: false, hasVideo: false });
@@ -196,7 +168,6 @@ export function Studio() {
     glossaryRepository: services?.glossaryRepository,
     logger: services?.logger,
   });
-  useRestoreLastActiveProject({ services, ttsRef, subtitlesRef, setActiveWorkspace });
   const handleTtsStateChange = useCallback(next => {
     setTtsState(prev => (prev.busy === next.busy && prev.hasScript === next.hasScript && prev.libraryOpen === next.libraryOpen ? prev : next));
   }, []);
@@ -277,7 +248,6 @@ export function Studio() {
     characterActions: catalog.actions,
     refreshEngine,
     offlineReadiness,
-    onSelectModels: handleSelectModels,
     onTtsStateChange: handleTtsStateChange,
     onNotify: notifications.notify,
     onUnlockSound: notifications.unlockSound,
@@ -293,15 +263,38 @@ export function Studio() {
   }), [catalog.library.allVoices, catalog.anchorApi.anchors, catalog.activeCharacter.id, catalog.lockedSeeds]);
 
   return (
-    <div className="studio-window">
+    <div className={`studio-window${sidebarOpen ? '' : ' sidebar-collapsed'}`}>
       <Sidebar
         activeWorkspace={activeWorkspace}
         workspaces={DEFAULT_WORKSPACES}
-        onSelectWorkspace={id => selectWorkspace(id, setActiveWorkspace, ttsRef)}
+        onSelectWorkspace={id => {
+          selectWorkspace(id, setActiveWorkspace, ttsRef);
+          if (globalThis.matchMedia?.('(max-width: 860px)').matches) setSidebarOpen(false);
+        }}
         jobsBadgeCount={productionJobs.badgeCount}
-        soundMuted={notifications.soundMuted}
-        onToggleSoundMuted={notifications.toggleSoundMuted}
+        onClose={() => setSidebarOpen(false)}
       />
+      <div className="studio-sidebar-backdrop" aria-hidden="true" onClick={() => setSidebarOpen(false)} />
+      <header className="studio-compact-header">
+        {!sidebarOpen && (
+          <button type="button" className="button sidebar-open" aria-label="Open sidebar" aria-controls="studio-sidebar" aria-expanded={false} title="Open sidebar" onClick={() => setSidebarOpen(true)}>☰</button>
+        )}
+        <span>Voice Studio</span>
+        <div className="studio-header-actions">
+          <OfflineReadinessBadge readiness={offlineReadiness} onSelect={handleSelectModels} />
+          <button
+            type="button"
+            id="notification-sound-toggle"
+            className="button sound-toggle-button"
+            aria-label="Sound alerts"
+            aria-pressed={!notifications.soundMuted}
+            title={notifications.soundMuted ? 'Unmute completion alert sound' : 'Mute completion alert sound'}
+            onClick={notifications.toggleSoundMuted}
+          >
+            <Icon name={notifications.soundMuted ? 'volume_off' : 'volume_on'} />
+          </button>
+        </div>
+      </header>
       <main className="studio-workspace">
         <ProjectsWorkspace
           hidden={activeWorkspace !== 'projects'}
@@ -325,8 +318,6 @@ export function Studio() {
           onStateChange={handleSubtitleStateChange}
           onNotify={notifications.notify}
           onUnlockSound={notifications.unlockSound}
-          offlineReadiness={offlineReadiness}
-          onSelectModels={handleSelectModels}
         />
         <BatchJobsWorkspace
           hidden={activeWorkspace !== 'jobs'}

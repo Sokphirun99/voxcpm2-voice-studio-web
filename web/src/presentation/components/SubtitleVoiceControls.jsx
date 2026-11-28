@@ -440,12 +440,37 @@ function SubtitleVoiceDownloadActions({ busy, dubBusy, onDownload, onDownloadAli
   );
 }
 
-function SubtitleVoiceCardHeader({ activeClip, hasAligned, mode, onChangeMode, actionsProps, unresolvedMismatchCount = 0 }) {
+function SubtitleVoiceCardHeader({
+  activeClip,
+  hasAligned,
+  mode,
+  onChangeMode,
+  actionsProps,
+  unresolvedMismatchCount = 0,
+  consolidated = false,
+  onOpenExportProject = null,
+  exportDisabled = false,
+}) {
   return (
     <div className="subtitle-voice-output-head">
       <SubtitleVoiceHeaderCopy activeClip={activeClip} unresolvedMismatchCount={unresolvedMismatchCount} />
       {hasAligned && <SubtitleVoiceModeToggle mode={mode} onChangeMode={onChangeMode} />}
-      <SubtitleVoiceDownloadActions {...actionsProps} hasAligned={hasAligned} />
+      {consolidated && onOpenExportProject ? (
+        <div className="subtitle-voice-download-group">
+          <button
+            type="button"
+            id="subtitle-voice-export-btn"
+            className="button button-primary subtitle-voice-btn"
+            disabled={exportDisabled}
+            onClick={onOpenExportProject}
+          >
+            <Icon name="arrow_down_to_line" />
+            <span>Export audio / dubbed MP4</span>
+          </button>
+        </div>
+      ) : (
+        <SubtitleVoiceDownloadActions {...actionsProps} hasAligned={hasAligned} />
+      )}
     </div>
   );
 }
@@ -504,6 +529,8 @@ export function SubtitleVoiceOutputCard({
   hasJobId = false,
   hasAudioStream = true,
   burnInSupported = true,
+  consolidated = false,
+  onOpenExportProject = null,
   onDownload,
   onDownloadAligned,
   onChangeDubAudioMode,
@@ -537,6 +564,9 @@ export function SubtitleVoiceOutputCard({
         mode={effectiveMode}
         onChangeMode={setMode}
         unresolvedMismatchCount={unresolvedMismatchCount}
+        consolidated={consolidated}
+        onOpenExportProject={onOpenExportProject}
+        exportDisabled={controlsDisabled}
         actionsProps={{ busy, dubBusy, onDownload, onDownloadAligned, canExportAligned }}
       />
       <DurationMismatchExportBanner
@@ -546,20 +576,22 @@ export function SubtitleVoiceOutputCard({
         onFixSafeMismatches={onFixSafeMismatches}
       />
       <audio key={activeClip.url} controls className="subtitle-voice-audio" src={activeClip.url} preload="metadata" />
-      <SubtitleDubExportBar
-        dubAudioMode={dubAudioMode}
-        dubSubtitleMode={dubSubtitleMode}
-        dubMixSettings={dubMixSettings}
-        dubBusy={dubBusy}
-        controlsDisabled={controlsDisabled}
-        exportDisabled={dubDisabled}
-        disabledReason={dubDisabledReason}
-        onChangeDubAudioMode={onChangeDubAudioMode}
-        onChangeDubSubtitleMode={onChangeDubSubtitleMode}
-        onUpdateMix={onUpdateDubMixSetting}
-        onResetMix={onResetDubMixSettings}
-        onExportDub={onExportDub}
-      />
+      {!consolidated && (
+        <SubtitleDubExportBar
+          dubAudioMode={dubAudioMode}
+          dubSubtitleMode={dubSubtitleMode}
+          dubMixSettings={dubMixSettings}
+          dubBusy={dubBusy}
+          controlsDisabled={controlsDisabled}
+          exportDisabled={dubDisabled}
+          disabledReason={dubDisabledReason}
+          onChangeDubAudioMode={onChangeDubAudioMode}
+          onChangeDubSubtitleMode={onChangeDubSubtitleMode}
+          onUpdateMix={onUpdateDubMixSetting}
+          onResetMix={onResetDubMixSettings}
+          onExportDub={onExportDub}
+        />
+      )}
     </section>
   );
 }

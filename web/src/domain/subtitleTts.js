@@ -453,6 +453,16 @@ export async function assembleTimelineAlignedVoiceover(spec = {}) {
 
 export const MAX_SUBTITLE_SEGMENT_TAKES = 10;
 
+let subtitleTakeSeq = 0;
+
+function generateSubtitleTakeId(segmentId) {
+  subtitleTakeSeq += 1;
+  const suffix = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID().slice(0, 8)
+    : `${Date.now()}-${subtitleTakeSeq}`;
+  return `take-${segmentId}-${suffix}`;
+}
+
 function buildSubtitleTakeSettings(clipSpec) {
   return Object.freeze({
     text: typeof clipSpec.text === 'string' ? clipSpec.text : '',
@@ -470,12 +480,48 @@ function buildSelectedSubtitleTake(segmentId, clipSpec) {
     ? clipSpec.durationSeconds
     : null;
   return createSegmentTake({
-    id: clipSpec.takeId || `take-${segmentId}-${Date.now()}`,
+    id: clipSpec.takeId || generateSubtitleTakeId(segmentId),
     audioAssetId: clipSpec.audioAssetId,
     duration,
     isSelected: true,
     settings: buildSubtitleTakeSettings(clipSpec),
   });
+}
+
+function buildTakeSpecFromRecord(segment, take) {
+  if (!take?.audioAssetId) return null;
+  const settings = take.settings || {};
+  return Object.freeze({
+    takeId: take.id || take.takeId || '',
+    audioAssetId: take.audioAssetId,
+    durationSeconds: Number.isFinite(take.duration) && take.duration > 0 ? take.duration : null,
+    text: typeof settings.text === 'string' ? settings.text : '',
+    characterId: settings.voiceId || segment?.voiceId || '',
+    characterName: settings.characterName || '',
+    signature: typeof settings.signature === 'string' ? settings.signature : '',
+    seed: settings.seed ?? null,
+    preTrimAssetId: settings.preTrimAssetId || null,
+    preTrimDuration: Number.isFinite(settings.preTrimDuration) && settings.preTrimDuration > 0 ? settings.preTrimDuration : null,
+  });
+}
+
+/**
+ * Extracts a persisted audio take specification by take ID (or active take when omitted) from a subtitle segment.
+ * Inputs: subtitle `segment` object and optional `takeId`.
+ * Outputs: Frozen `{ takeId, audioAssetId, durationSeconds, text, characterId, characterName, signature, seed, preTrimAssetId, preTrimDuration }` or `null`.
+ * Side effects: none.
+ * Failure modes: returns `null` when no matching take with a durable `audioAssetId` exists.
+ * @param {object|null|undefined} segment - Subtitle cue record.
+ * @param {string} [takeId=''] - Target take identifier (defaults to active take).
+ * @returns {Readonly<object>|null} Take metadata or null.
+ */
+export function extractSubtitleTakeSpec(segment, takeId = '') {
+  const takes = Array.isArray(segment?.takes) ? segment.takes : [];
+  if (!takes.length) return null;
+  const target = takeId
+    ? takes.find(item => item?.id === takeId || item?.takeId === takeId)
+    : (takes.find(item => item?.isSelected) || takes[takes.length - 1]);
+  return buildTakeSpecFromRecord(segment, target);
 }
 
 /**
@@ -488,23 +534,7 @@ function buildSelectedSubtitleTake(segmentId, clipSpec) {
  * @returns {Readonly<object>|null} Active take metadata or null.
  */
 export function extractActiveSubtitleTakeSpec(segment) {
-  const takes = Array.isArray(segment?.takes) ? segment.takes : [];
-  if (!takes.length) return null;
-  const active = takes.find(item => item?.isSelected) || takes[takes.length - 1];
-  if (!active?.audioAssetId) return null;
-  const settings = active.settings || {};
-  return Object.freeze({
-    takeId: active.id || active.takeId || '',
-    audioAssetId: active.audioAssetId,
-    durationSeconds: Number.isFinite(active.duration) && active.duration > 0 ? active.duration : null,
-    text: typeof settings.text === 'string' ? settings.text : '',
-    characterId: settings.voiceId || segment.voiceId || '',
-    characterName: settings.characterName || '',
-    signature: typeof settings.signature === 'string' ? settings.signature : '',
-    seed: settings.seed ?? null,
-    preTrimAssetId: settings.preTrimAssetId || null,
-    preTrimDuration: Number.isFinite(settings.preTrimDuration) && settings.preTrimDuration > 0 ? settings.preTrimDuration : null,
-  });
+  return extractSubtitleTakeSpec(segment, '');
 }
 
 /**
@@ -551,6 +581,69 @@ export function clearSubtitleSegmentTakes(segments, segmentId) {
   const target = segments[idx];
   if (!Array.isArray(target.takes) || target.takes.length === 0) return segments;
   const updated = Object.freeze({ ...target, takes: Object.freeze([]), status: 'draft' });
+  return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+}
+
+function matchesSubtitleTakeId(take, takeId) {
+  return Boolean(take && takeId && (take.id === takeId || take.takeId === takeId));
+}
+
+/**
+ * Selects a specific persisted voiceover take on a subtitle segment immutably.
+ * Inputs: `segments` array, `segmentId`, and `takeId`.
+ * Outputs: Updated segments array with `isSelected` and `voiceId` updated on the target cue.
+ * Side effects: none.
+ * Failure modes: returns input segments unchanged when segment or take is missing or already active.
+ * @param {Array<object>} segments - Subtitle segments array.
+ * @param {string} segmentId - Target cue id.
+ * @param {string} takeId - Take id to activate.
+ * @returns {Array<object>} Updated segments array.
+ */
+export function selectSubtitleSegmentTake(segments, segmentId, takeId) {
+  if (!Array.isArray(segments) || !segmentId || !takeId) return Array.isArray(segments) ? segments : [];
+  const idx = segments.findIndex(seg => seg?.id === segmentId);
+  if (idx < 0) return segments;
+  const target = segments[idx];
+  const takes = Array.isArray(target.takes) ? target.takes : [];
+  const match = takes.find(t => matchesSubtitleTakeId(t, takeId));
+  if (!match || match.isSelected) return segments;
+  const nextTakes = Object.freeze(takes.map(t => Object.freeze({ ...t, isSelected: matchesSubtitleTakeId(t, takeId) })));
+  const nextVoiceId = match.settings?.voiceId || target.voiceId || null;
+  const updated = Object.freeze({ ...target, voiceId: nextVoiceId, status: 'ready', takes: nextTakes });
+  return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+}
+
+/**
+ * Deletes a persisted voiceover take from a subtitle segment, promoting the newest remaining take if the active take was deleted.
+ * Inputs: `segments` array, `segmentId`, and `takeId`.
+ * Outputs: Updated segments array.
+ * Side effects: none.
+ * Failure modes: returns input segments unchanged when segment or take is missing.
+ * @param {Array<object>} segments - Subtitle segments array.
+ * @param {string} segmentId - Target cue id.
+ * @param {string} takeId - Take id to remove.
+ * @returns {Array<object>} Updated segments array.
+ */
+export function deleteSubtitleSegmentTake(segments, segmentId, takeId) {
+  if (!Array.isArray(segments) || !segmentId || !takeId) return Array.isArray(segments) ? segments : [];
+  const idx = segments.findIndex(seg => seg?.id === segmentId);
+  if (idx < 0) return segments;
+  const target = segments[idx];
+  const takes = Array.isArray(target.takes) ? target.takes : [];
+  const victim = takes.find(t => matchesSubtitleTakeId(t, takeId));
+  if (!victim) return segments;
+  const remaining = takes.filter(t => !matchesSubtitleTakeId(t, takeId));
+  if (remaining.length === 0) {
+    const updated = Object.freeze({ ...target, takes: Object.freeze([]), status: 'draft' });
+    return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
+  }
+  const hasSelected = remaining.some(t => t?.isSelected);
+  const nextTakes = Object.freeze(remaining.map((t, i) => (
+    Object.freeze({ ...t, isSelected: hasSelected ? Boolean(t.isSelected) : i === remaining.length - 1 })
+  )));
+  const activeTake = nextTakes.find(t => t.isSelected) || nextTakes[nextTakes.length - 1];
+  const nextVoiceId = activeTake?.settings?.voiceId || target.voiceId || null;
+  const updated = Object.freeze({ ...target, voiceId: nextVoiceId, status: 'ready', takes: nextTakes });
   return [...segments.slice(0, idx), updated, ...segments.slice(idx + 1)];
 }
 

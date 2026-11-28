@@ -44,6 +44,7 @@ import {
   buildTimeAlignedDubDownloadFilename,
   buildVoiceoverDownloadFilename,
   extractActiveSubtitleTakeSpec,
+  extractSubtitleTakeSpec,
   normalizeSubtitleVoiceoverGapMs,
   resolveSubtitleSpeechText,
   selectOrderedSegments,
@@ -105,6 +106,7 @@ function buildClipRecord({ recording, text, character, signature, durationSecond
     durationSeconds: effectiveDur,
     signature,
     seed: recording.seed ?? null,
+    takeId: recording?.id || null,
     preTrimClip: null,
   };
 }
@@ -156,53 +158,159 @@ function handleVoiceError({ err, generatedCount, logger, onStatus, onNotify, onE
   if (!(err instanceof ValidationError)) onEngineFailure?.();
 }
 
-function useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, logger }) {
+function useClipPlayback({
+  segmentsRef,
+  segmentClips,
+  takeClipCacheRef,
+  assetRepository,
+  characters,
+  anchorTag,
+  pronunciationSignature,
+  mountedRef,
+  playingSegmentId,
+  setPlayingSegmentId,
+  playingTake,
+  setPlayingTake,
+  logger,
+}) {
   const audioRef = useRef(null);
+  const previewTakeUrlRef = useRef('');
+  const playSeqRef = useRef(0);
+  const pendingTakeRef = useRef({ segmentId: '', takeId: '' });
+
+  const revokePreviewTakeUrl = useCallback(() => {
+    if (!previewTakeUrlRef.current) return;
+    revokeBlobUrl(previewTakeUrlRef.current);
+    previewTakeUrlRef.current = '';
+  }, []);
+
+  const clearPlayingState = useCallback(() => {
+    setPlayingSegmentId('');
+    setPlayingTake({ segmentId: '', takeId: '' });
+  }, [setPlayingSegmentId, setPlayingTake]);
 
   const stopPlayback = useCallback(() => {
+    playSeqRef.current += 1;
+    pendingTakeRef.current = { segmentId: '', takeId: '' };
     const audio = audioRef.current;
     if (audio) {
       audio.pause?.();
       audio.currentTime = 0;
     }
-    setPlayingSegmentId('');
-  }, [setPlayingSegmentId]);
+    revokePreviewTakeUrl();
+    clearPlayingState();
+  }, [revokePreviewTakeUrl, clearPlayingState]);
+
+  const cancelPendingTakePlayback = useCallback((segId, takeId = '') => {
+    const pending = pendingTakeRef.current;
+    if (pending.segmentId !== segId) return;
+    if (takeId && pending.takeId !== takeId) return;
+    playSeqRef.current += 1;
+    pendingTakeRef.current = { segmentId: '', takeId: '' };
+  }, []);
 
   useEffect(() => () => {
+    playSeqRef.current += 1;
+    pendingTakeRef.current = { segmentId: '', takeId: '' };
     const audio = audioRef.current;
     if (audio) {
       audio.pause?.();
       audio.src = '';
       audioRef.current = null;
     }
-  }, []);
+    revokePreviewTakeUrl();
+  }, [revokePreviewTakeUrl]);
 
-  const togglePlaySegment = useCallback(segId => {
-    const clip = segmentClips[segId];
-    if (!clip?.url || typeof Audio === 'undefined') return;
-    if (playingSegmentId === segId) {
-      stopPlayback();
-      return;
-    }
+  const ensureAudioElement = useCallback(() => {
     if (!audioRef.current) {
       audioRef.current = new Audio();
-      audioRef.current.addEventListener?.('ended', () => setPlayingSegmentId(''));
-      audioRef.current.addEventListener?.('error', () => setPlayingSegmentId(''));
+      audioRef.current.addEventListener?.('ended', () => {
+        revokePreviewTakeUrl();
+        clearPlayingState();
+      });
+      audioRef.current.addEventListener?.('error', () => {
+        revokePreviewTakeUrl();
+        clearPlayingState();
+      });
     }
-    const audio = audioRef.current;
+    return audioRef.current;
+  }, [revokePreviewTakeUrl, clearPlayingState]);
+
+  const startAudioUrl = useCallback((url, nextSegmentId, nextTake) => {
+    const audio = ensureAudioElement();
     audio.pause?.();
-    audio.src = clip.url;
-    setPlayingSegmentId(segId);
+    audio.src = url;
+    setPlayingSegmentId(nextSegmentId);
+    setPlayingTake(nextTake);
     const playPromise = audio.play?.();
     if (playPromise && typeof playPromise.catch === 'function') {
       playPromise.catch(err => {
         logger?.debug?.('useSubtitleVoiceover.play', err?.message || 'Playback interrupted');
-        setPlayingSegmentId('');
+        revokePreviewTakeUrl();
+        clearPlayingState();
       });
     }
-  }, [segmentClips, playingSegmentId, setPlayingSegmentId, stopPlayback, logger]);
+  }, [ensureAudioElement, setPlayingSegmentId, setPlayingTake, logger, revokePreviewTakeUrl, clearPlayingState]);
 
-  return { togglePlaySegment, stopPlayback };
+  const togglePlaySegment = useCallback(segId => {
+    const clip = segmentClips[segId];
+    if (!clip?.url || typeof Audio === 'undefined') return;
+    if (playingSegmentId === segId && !playingTake.takeId) {
+      stopPlayback();
+      return;
+    }
+    playSeqRef.current += 1;
+    revokePreviewTakeUrl();
+    startAudioUrl(clip.url, segId, { segmentId: '', takeId: '' });
+  }, [segmentClips, playingSegmentId, playingTake.takeId, stopPlayback, revokePreviewTakeUrl, startAudioUrl]);
+
+  const resolveTakeAudioClip = useCallback(async (seg, spec) => {
+    const cached = takeClipCacheRef.current.get(spec.audioAssetId);
+    if (cached?.blob) return cached;
+    if (!assetRepository?.getAssetBinary) return null;
+    const hydrated = await buildHydratedSubtitleClip({
+      seg, spec, assetRepository, characters, anchorTag, pronunciationSignature, logger, withUrl: false,
+    });
+    if (hydrated?.blob && spec.audioAssetId) {
+      takeClipCacheRef.current.set(spec.audioAssetId, hydrated);
+    }
+    return hydrated;
+  }, [takeClipCacheRef, assetRepository, characters, anchorTag, pronunciationSignature, logger]);
+
+  const togglePlaySegmentTake = useCallback(async (segId, takeId) => {
+    if (typeof Audio === 'undefined' || !segId || !takeId) return;
+    if (playingTake.segmentId === segId && playingTake.takeId === takeId) {
+      stopPlayback();
+      return;
+    }
+    const seg = (segmentsRef.current || []).find(item => item?.id === segId);
+    const spec = extractSubtitleTakeSpec(seg, takeId);
+    if (!spec?.audioAssetId) return;
+    const activeClip = segmentClips[segId];
+    if (activeClip?.url && activeClip.audioAssetId === spec.audioAssetId) {
+      playSeqRef.current += 1;
+      revokePreviewTakeUrl();
+      startAudioUrl(activeClip.url, '', { segmentId: segId, takeId });
+      return;
+    }
+    const seq = ++playSeqRef.current;
+    pendingTakeRef.current = { segmentId: segId, takeId };
+    try {
+      const clip = await resolveTakeAudioClip(seg, spec);
+      if (!mountedRef.current || seq !== playSeqRef.current || !clip?.blob) return;
+      pendingTakeRef.current = { segmentId: '', takeId: '' };
+      const previewUrl = createBlobUrl(clip.blob);
+      if (!previewUrl) return;
+      revokePreviewTakeUrl();
+      previewTakeUrlRef.current = previewUrl;
+      startAudioUrl(previewUrl, '', { segmentId: segId, takeId });
+    } catch (err) {
+      if (seq === playSeqRef.current) pendingTakeRef.current = { segmentId: '', takeId: '' };
+      logger?.warn?.('useSubtitleVoiceover.playTake', err?.message || 'Could not play subtitle take', { segId, takeId });
+    }
+  }, [playingTake.segmentId, playingTake.takeId, stopPlayback, segmentsRef, segmentClips, revokePreviewTakeUrl, startAudioUrl, resolveTakeAudioClip, mountedRef, logger]);
+
+  return { togglePlaySegment, togglePlaySegmentTake, stopPlayback, cancelPendingTakePlayback };
 }
 
 function useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseGapMs, logger }) {
@@ -1077,7 +1185,7 @@ async function fetchOptionalPreTrimClip(assetRepository, spec, logger) {
   };
 }
 
-async function buildHydratedSubtitleClip({ seg, spec, assetRepository, characters, anchorTag, pronunciationSignature, logger }) {
+async function buildHydratedSubtitleClip({ seg, spec, assetRepository, characters, anchorTag, pronunciationSignature, logger, withUrl = true }) {
   const fetched = await assetRepository.getAssetBinary(spec.audioAssetId);
   if (!fetched?.bytes) return null;
   const blob = new Blob([fetched.bytes], { type: fetched.mimeType || 'audio/wav' });
@@ -1088,46 +1196,56 @@ async function buildHydratedSubtitleClip({ seg, spec, assetRepository, character
     text, characterId: character.id, anchorTag, pronunciationTag: pronunciationSignature,
   });
   const preTrimClip = await fetchOptionalPreTrimClip(assetRepository, spec, logger);
+  const base = buildClipRecord({ recording: { blob, seed: spec.seed, audioDurationSeconds: durationSeconds }, text, character, signature, durationSeconds });
+  if (!withUrl && base.url) revokeBlobUrl(base.url);
   return {
-    ...buildClipRecord({ recording: { blob, seed: spec.seed, audioDurationSeconds: durationSeconds }, text, character, signature, durationSeconds }),
+    ...base,
+    url: withUrl ? base.url : '',
     takeId: spec.takeId || null,
     audioAssetId: spec.audioAssetId,
     preTrimClip,
   };
 }
 
-function hydrateSingleSegmentTake({ inFlightRef, segmentsRef, segmentClipsRef, assetRepository, characters, anchorTag, pronunciationSignature, mountedRef, storeHydratedClip, logger, isCancelled }, seg, spec) {
+function hydrateSingleSegmentTake(ctx, seg, spec) {
+  const { inFlightRef, hydrationEpochRef, segmentsRef, segmentClipsRef, takeClipCacheRef, assetRepository, characters, anchorTag, pronunciationSignature, mountedRef, storeHydratedClip, logger } = ctx;
+  const cached = takeClipCacheRef?.current?.get(spec.audioAssetId);
+  if (cached?.blob) {
+    storeHydratedClip(seg.id, { ...cached, url: createBlobUrl(cached.blob) });
+    return;
+  }
   const cacheKey = `${seg.id}:${spec.audioAssetId}`;
   if (inFlightRef.current.has(cacheKey)) return;
   inFlightRef.current.add(cacheKey);
-  void buildHydratedSubtitleClip({ seg, spec, assetRepository, characters, anchorTag, pronunciationSignature, logger })
+  const startEpoch = hydrationEpochRef.current;
+  void buildHydratedSubtitleClip({ seg, spec, assetRepository, characters, anchorTag, pronunciationSignature, logger, withUrl: false })
     .then(clip => {
-      if (isCancelled() || !mountedRef.current || !clip) return;
+      if (!mountedRef.current || hydrationEpochRef.current !== startEpoch || !clip?.blob) return;
+      takeClipCacheRef?.current?.set(spec.audioAssetId, clip);
       const liveSeg = (segmentsRef.current || []).find(item => item?.id === seg.id);
       const liveSpec = extractActiveSubtitleTakeSpec(liveSeg);
       if (!liveSpec || liveSpec.audioAssetId !== spec.audioAssetId) return;
       if (segmentClipsRef.current[seg.id]?.audioAssetId === spec.audioAssetId) return;
-      storeHydratedClip(seg.id, clip);
+      storeHydratedClip(seg.id, { ...clip, url: createBlobUrl(clip.blob) });
     })
     .catch(err => logger?.warn?.('useSubtitleVoiceover.hydratePersistedTake', err?.message || 'Could not restore take audio', { segId: seg.id, audioAssetId: spec.audioAssetId }))
     .finally(() => { inFlightRef.current.delete(cacheKey); });
 }
 
 function useHydratePersistedSubtitleTakes(opts) {
-  const { segments, segmentsRef, segmentClipsRef, assetRepository, characters, anchorTag, pronunciationSignature, generatingSegmentId, mountedRef, storeHydratedClip, logger } = opts;
+  const { segments, hydrationEpochRef, segmentsRef, segmentClipsRef, takeClipCacheRef, assetRepository, characters, anchorTag, pronunciationSignature, generatingSegmentId, mountedRef, storeHydratedClip, logger } = opts;
   const inFlightRef = useRef(new Set());
   useEffect(() => {
-    if (!assetRepository?.getAssetBinary || !Array.isArray(segments) || segments.length === 0) return undefined;
-    let cancelled = false;
-    const ctx = { inFlightRef, segmentsRef, segmentClipsRef, assetRepository, characters, anchorTag, pronunciationSignature, mountedRef, storeHydratedClip, logger, isCancelled: () => cancelled };
+    if (!Array.isArray(segments) || segments.length === 0) return;
+    const ctx = { inFlightRef, hydrationEpochRef, segmentsRef, segmentClipsRef, takeClipCacheRef, assetRepository, characters, anchorTag, pronunciationSignature, mountedRef, storeHydratedClip, logger };
     for (const seg of segments) {
       const spec = extractActiveSubtitleTakeSpec(seg);
       if (!spec?.audioAssetId || generatingSegmentId === seg.id) continue;
       if (segmentClipsRef.current[seg.id]?.audioAssetId === spec.audioAssetId) continue;
+      if (!takeClipCacheRef?.current?.has(spec.audioAssetId) && !assetRepository?.getAssetBinary) continue;
       hydrateSingleSegmentTake(ctx, seg, spec);
     }
-    return () => { cancelled = true; };
-  }, [segments, segmentsRef, segmentClipsRef, assetRepository, characters, anchorTag, pronunciationSignature, generatingSegmentId, mountedRef, storeHydratedClip, logger]);
+  }, [segments, hydrationEpochRef, segmentsRef, segmentClipsRef, takeClipCacheRef, assetRepository, characters, anchorTag, pronunciationSignature, generatingSegmentId, mountedRef, storeHydratedClip, logger]);
 }
 
 export function useSubtitleVoiceover({
@@ -1163,6 +1281,8 @@ export function useSubtitleVoiceover({
   onChangeSpillApprovals = null,
   onAttachSegmentTake = null,
   onClearSegmentTakes = null,
+  onSelectSegmentTake = null,
+  onDeleteSegmentTake = null,
   projectId = '',
   projectTitle = '',
   productionJobs = null,
@@ -1203,6 +1323,7 @@ export function useSubtitleVoiceover({
   const [dubMixSettingsState, setDubMixSettingsState] = useState(() => normalizeDubMixSettings(dubMixSettingsProp));
   const [dubBusy, setDubBusy] = useState(false);
   const [playingSegmentId, setPlayingSegmentId] = useState('');
+  const [playingTake, setPlayingTake] = useState({ segmentId: '', takeId: '' });
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [generatingSegmentId, setGeneratingSegmentId] = useState('');
   const [batchProgress, setBatchProgress] = useState(null);
@@ -1268,13 +1389,29 @@ export function useSubtitleVoiceover({
   const segmentsRef = useRef(segments);
   segmentsRef.current = segments;
   const clipUrlsRef = useRef(new Map());
+  const takeClipCacheRef = useRef(new Map());
+  const hydrationEpochRef = useRef(0);
   const cachedUploadsRef = useRef({});
   const abortRef = useRef(null);
   const mountedRef = useRef(true);
   const userCancelledRef = useRef(false);
 
   const { selectedIds, toggleSelectSegment, toggleSelectAll, clearSelection } = useVoiceSelectionState(segments);
-  const { togglePlaySegment, stopPlayback } = useClipPlayback({ segmentClips, playingSegmentId, setPlayingSegmentId, logger });
+  const { togglePlaySegment, togglePlaySegmentTake, stopPlayback, cancelPendingTakePlayback } = useClipPlayback({
+    segmentsRef,
+    segmentClips,
+    takeClipCacheRef,
+    assetRepository,
+    characters,
+    anchorTag,
+    pronunciationSignature,
+    mountedRef,
+    playingSegmentId,
+    setPlayingSegmentId,
+    playingTake,
+    setPlayingTake,
+    logger,
+  });
   const { combinedClip, clearCombined } = useCombinedVoiceoverState({ segments, selectedIds, segmentClips, pauseGapMs, logger });
   const { alignedClip, isAlignmentSettled, clearAligned } = useAlignedVoiceoverState({
     segments,
@@ -1290,8 +1427,31 @@ export function useSubtitleVoiceover({
     const prevUrl = clipUrlsRef.current.get(segId);
     if (prevUrl) revokeBlobUrl(prevUrl);
     clipUrlsRef.current.set(segId, clip.url);
+    if (clip?.audioAssetId && clip?.blob) {
+      takeClipCacheRef.current.set(clip.audioAssetId, { ...clip, url: '' });
+    }
     setSegmentClips(prev => ({ ...prev, [segId]: clip }));
   }, []);
+
+  const dropSegmentClipEntry = useCallback((segId, { clearSpill = true } = {}) => {
+    const prevUrl = clipUrlsRef.current.get(segId);
+    if (prevUrl) {
+      revokeBlobUrl(prevUrl);
+      clipUrlsRef.current.delete(segId);
+    }
+    setSegmentClips(prev => {
+      if (!(segId in prev)) return prev;
+      const { [segId]: _removed, ...rest } = prev;
+      return rest;
+    });
+    if (clearSpill) {
+      setSpillApprovals(prev => {
+        if (!(segId in prev)) return prev;
+        const { [segId]: _removed, ...rest } = prev;
+        return rest;
+      });
+    }
+  }, [setSpillApprovals]);
 
   const storeClip = useCallback((segId, clip) => {
     storeHydratedClip(segId, clip);
@@ -1303,26 +1463,59 @@ export function useSubtitleVoiceover({
   }, [storeHydratedClip, setSpillApprovals]);
 
   const removeSegmentClip = useCallback(segId => {
-    if (playingSegmentId === segId) stopPlayback();
-    const prevUrl = clipUrlsRef.current.get(segId);
-    if (prevUrl) {
-      revokeBlobUrl(prevUrl);
-      clipUrlsRef.current.delete(segId);
-    }
-    setSegmentClips(prev => {
-      if (!(segId in prev)) return prev;
-      const { [segId]: _removed, ...rest } = prev;
-      return rest;
-    });
-    setSpillApprovals(prev => {
-      if (!(segId in prev)) return prev;
-      const { [segId]: _removed, ...rest } = prev;
-      return rest;
-    });
+    cancelPendingTakePlayback(segId);
+    if (playingSegmentId === segId || playingTake.segmentId === segId) stopPlayback();
+    dropSegmentClipEntry(segId);
     onClearSegmentTakes?.(segId);
-  }, [playingSegmentId, stopPlayback, setSpillApprovals, onClearSegmentTakes]);
+  }, [playingSegmentId, playingTake.segmentId, cancelPendingTakePlayback, stopPlayback, dropSegmentClipEntry, onClearSegmentTakes]);
+
+  const selectSegmentTake = useCallback((segId, takeId) => {
+    if (!segId || !takeId) return false;
+    const seg = (segmentsRef.current || []).find(item => item?.id === segId);
+    const spec = extractSubtitleTakeSpec(seg, takeId);
+    if (!spec) return false;
+    cancelPendingTakePlayback(segId);
+    if (playingSegmentId === segId || playingTake.segmentId === segId) stopPlayback();
+    onSelectSegmentTake?.(segId, takeId);
+    const cached = spec.audioAssetId ? takeClipCacheRef.current.get(spec.audioAssetId) : null;
+    if (cached?.blob) {
+      storeClip(segId, { ...cached, url: createBlobUrl(cached.blob) });
+    } else {
+      dropSegmentClipEntry(segId);
+    }
+    return true;
+  }, [playingSegmentId, playingTake.segmentId, cancelPendingTakePlayback, stopPlayback, onSelectSegmentTake, storeClip, dropSegmentClipEntry]);
+
+  const deleteSegmentTake = useCallback((segId, takeId) => {
+    if (!segId || !takeId) return false;
+    const seg = (segmentsRef.current || []).find(item => item?.id === segId);
+    const takes = Array.isArray(seg?.takes) ? seg.takes : [];
+    const targetTake = takes.find(t => t?.id === takeId || t?.takeId === takeId);
+    if (!targetTake) return false;
+    cancelPendingTakePlayback(segId, takeId);
+    if (playingTake.segmentId === segId && playingTake.takeId === takeId) stopPlayback();
+    if (targetTake.isSelected && playingSegmentId === segId) stopPlayback();
+    const remaining = takes.filter(t => t?.id !== takeId && t?.takeId !== takeId);
+    onDeleteSegmentTake?.(segId, takeId);
+    if (remaining.length === 0) {
+      dropSegmentClipEntry(segId);
+      return true;
+    }
+    if (targetTake.isSelected) {
+      const nextActive = remaining.find(t => t?.isSelected) || remaining[remaining.length - 1];
+      const nextAssetId = nextActive?.audioAssetId || '';
+      const cached = nextAssetId ? takeClipCacheRef.current.get(nextAssetId) : null;
+      if (cached?.blob) {
+        storeClip(segId, { ...cached, url: createBlobUrl(cached.blob) });
+      } else {
+        dropSegmentClipEntry(segId);
+      }
+    }
+    return true;
+  }, [playingSegmentId, playingTake.segmentId, playingTake.takeId, cancelPendingTakePlayback, stopPlayback, onDeleteSegmentTake, dropSegmentClipEntry, storeClip]);
 
   const clearInMemoryVoiceover = useCallback(() => {
+    hydrationEpochRef.current += 1;
     abortRef.current?.abort();
     stopPlayback();
     clearSelection();
@@ -1330,6 +1523,7 @@ export function useSubtitleVoiceover({
     clearAligned();
     for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
     clipUrlsRef.current.clear();
+    takeClipCacheRef.current.clear();
     setSegmentClips({});
     if (spillApprovalsProp === undefined) setSpillApprovalsState({});
   }, [stopPlayback, clearSelection, clearCombined, clearAligned, spillApprovalsProp]);
@@ -1347,7 +1541,7 @@ export function useSubtitleVoiceover({
   }, [transcriptEpoch, clearInMemoryVoiceover]);
 
   useHydratePersistedSubtitleTakes({
-    segments, segmentsRef, segmentClipsRef, assetRepository, characters, anchorTag,
+    segments, hydrationEpochRef, segmentsRef, segmentClipsRef, takeClipCacheRef, assetRepository, characters, anchorTag,
     pronunciationSignature, generatingSegmentId, mountedRef, storeHydratedClip, logger,
   });
 
@@ -1378,9 +1572,11 @@ export function useSubtitleVoiceover({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      hydrationEpochRef.current += 1;
       abortRef.current?.abort();
       for (const url of clipUrlsRef.current.values()) revokeBlobUrl(url);
       clipUrlsRef.current.clear();
+      takeClipCacheRef.current.clear();
     };
   }, []);
 
@@ -1727,12 +1923,16 @@ export function useSubtitleVoiceover({
     combinedClip,
     alignedClip,
     playingSegmentId,
+    playingTake,
     voiceBusy,
     generatingSegmentId,
     batchProgress,
     isClipStale,
     togglePlaySegment,
+    togglePlaySegmentTake,
     stopPlayback,
+    selectSegmentTake,
+    deleteSegmentTake,
     removeSegmentClip,
     resetVoiceover,
     downloadSegmentVoice,

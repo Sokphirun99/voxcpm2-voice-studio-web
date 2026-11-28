@@ -12,13 +12,16 @@ import {
   adjustCuePause,
   adjustSubtitleSegmentTiming,
   applySpellingTermsToSegments,
+  applySubtitleSegmentPatch,
   applyTranslationTermsToSegments,
   buildBoundedTtsHandoff,
   buildDialogueText,
   buildSrt,
   buildVtt,
+  clearSubtitleHistoryCoalesce,
   collectUniqueSpeakers,
   countTextMatchesInSegments,
+  createEmptySubtitleHistory,
   deleteSubtitleSegment,
   extendAllSafeMismatches,
   extendCueAndShiftLater,
@@ -31,11 +34,14 @@ import {
   parseSubtitleFileText,
   pickDefaultTargetLanguage,
   pickSegmentText,
+  pushSubtitleHistoryEntry,
+  redoSubtitleHistory,
   replaceTextInSegments,
   resolveCueOverlaps,
   resolveTargetLanguageMeta,
   shiftCueStartEarlier,
   splitSubtitleSegment,
+  undoSubtitleHistory,
 } from '../../domain/subtitles.js';
 import { ValidationError } from '../../domain/errors.js';
 import {
@@ -57,8 +63,10 @@ import {
   SUBTITLE_VOICEOVER_PAUSE_MS,
   attachSubtitleClipTake,
   clearSubtitleSegmentTakes,
+  deleteSubtitleSegmentTake,
   normalizeSpillApprovalsMap,
   normalizeSubtitleVoiceoverGapMs,
+  selectSubtitleSegmentTake,
 } from '../../domain/subtitleTts.js';
 import { assertFeatureOfflineReady } from '../../domain/offlineReadiness.js';
 import { createSubtitleProjectSnapshot } from '../../domain/projects.js';
@@ -112,12 +120,27 @@ function normalizeRestoredSubtitleOptions(rawOpts, baseOpts) {
   };
 }
 
+function commitUndoableState(prev, nextSlice, { coalesceKey = null } = {}) {
+  const nextSegments = nextSlice.segments ?? prev.segments;
+  const nextHasTranslation = nextSlice.hasTranslation ?? prev.hasTranslation;
+  const nextTranslatedLanguage = nextSlice.translatedLanguage ?? prev.translatedLanguage;
+  const nextHistory = pushSubtitleHistoryEntry(
+    prev.history,
+    { segments: prev.segments, hasTranslation: prev.hasTranslation, translatedLanguage: prev.translatedLanguage },
+    { segments: nextSegments, hasTranslation: nextHasTranslation, translatedLanguage: nextTranslatedLanguage },
+    { coalesceKey }
+  );
+  return { ...prev, ...nextSlice, history: nextHistory };
+}
+
 function mergeTranslatedCueList(prevSegments, resSegments) {
   if (!Array.isArray(resSegments)) return prevSegments;
   const byId = new Map((prevSegments || []).map(seg => [seg?.id, seg]));
   return resSegments.map(item => {
     const existing = item?.id ? byId.get(item.id) : null;
-    return existing ? { ...existing, ...item } : item;
+    if (!existing) return item;
+    const nextTranslated = typeof item.translatedText === 'string' ? item.translatedText : existing.translatedText;
+    return applySubtitleSegmentPatch(existing, { ...item, translatedText: nextTranslated });
   });
 }
 
@@ -454,6 +477,7 @@ function applyExtractedSubtitleResult(prev, res, targetLanguage, elapsed) {
     hasTranslation: hasSegmentTranslation,
     translatedLanguage: hasSegmentTranslation ? (resolvedTarget || prev.options.targetLanguage) : '',
     speakerNames: {},
+    history: createEmptySubtitleHistory(),
     options: {
       ...prev.options,
       targetLanguage: nextTargetOption,
@@ -590,8 +614,7 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
         const summary = `Translated dialogue lines to ${targetMeta.shortLabel} in ${elapsedSecs()}s.`;
         setState(prev => {
           const nextSegments = mergeTranslatedCueList(prev.segments, res.segments);
-          return {
-            ...prev,
+          return commitUndoableState(prev, {
             segments: nextSegments,
             hasTranslation: nextSegments.length > 0,
             translatedLanguage: nextSegments.length > 0 ? targetLanguage : '',
@@ -602,12 +625,74 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
             },
             busyAction: '',
             status: { message: summary, error: false },
-          };
+          });
         });
         onNotify?.({ kind: 'success', title: `${targetMeta.shortLabel} translation ready`, message: summary });
       },
     });
   }, [state.segments, state.detectedLanguage, state.options.sourceLanguage, state.options.targetLanguage, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
+
+  const retranslateSegment = useCallback(async segId => {
+    const live = stateRef?.current ?? state;
+    if (!segId || live.busyAction) return false;
+    const targetSeg = (live.segments || []).find(seg => seg?.id === segId);
+    if (!targetSeg || !String(targetSeg.text || '').trim()) return false;
+    const sourceLang = live.detectedLanguage && live.detectedLanguage !== 'auto'
+      ? live.detectedLanguage
+      : live.options.sourceLanguage;
+    const targetLanguage = normalizeTargetLanguageCode(live.translatedLanguage || live.options.targetLanguage);
+    if (isSameSubtitleLanguage(sourceLang, targetLanguage)) {
+      const msg = 'Choose a target language different from the source language.';
+      setState(prev => ({ ...prev, status: { message: msg, error: true } }));
+      onNotify?.({ kind: 'error', title: 'Translation unavailable', message: msg });
+      return false;
+    }
+    const targetMeta = resolveTargetLanguageMeta(targetLanguage);
+    let updated = false;
+    await runSubtitleTask({
+      abortRef, setState, setBusyMeta, busyAction: 'translate',
+      baseMessage: `Re-translating cue into ${targetMeta.shortLabel}…`,
+      cancelMessage: 'Cue re-translation cancelled.',
+      errorTitle: 'Cue re-translation failed',
+      fallbackError: 'Could not re-translate cue.',
+      onError: () => void refreshHealth(),
+      onNotify, onUnlockSound,
+      run: async (signal, elapsedSecs) => {
+        const isOnline = typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true;
+        assertFeatureOfflineReady({ featureId: 'translation', models: health.models, isOnline });
+        const res = await gateway.translateSegments({
+          segments: [targetSeg],
+          sourceLanguage: (!sourceLang || sourceLang === 'auto') ? 'en' : sourceLang,
+          targetLanguage,
+          terminology: toMediaTerminologyPayload(effectiveTermsRef?.current),
+          signal,
+        });
+        assertNotAborted(signal);
+        markOnline();
+        const match = (res?.segments || []).find(item => item?.id === segId) || res?.segments?.[0];
+        const nextTranslated = typeof match?.translatedText === 'string' ? match.translatedText : '';
+        if (!nextTranslated.trim()) {
+          throw new Error('Translator returned an empty translation for this cue.');
+        }
+        const msg = `Re-translated cue into ${targetMeta.shortLabel} in ${elapsedSecs()}s.`;
+        setState(prev => {
+          const nextSegments = prev.segments.map(seg => (
+            seg.id === segId ? applySubtitleSegmentPatch(seg, { translatedText: nextTranslated }) : seg
+          ));
+          return commitUndoableState(prev, {
+            segments: nextSegments,
+            hasTranslation: prev.hasTranslation || Boolean(nextTranslated.trim()),
+            translatedLanguage: prev.translatedLanguage || targetLanguage,
+            busyAction: '',
+            status: { message: msg, error: false },
+          });
+        });
+        updated = true;
+        onNotify?.({ kind: 'success', title: 'Cue re-translated', message: msg });
+      },
+    });
+    return updated;
+  }, [state, stateRef, health.models, gateway, effectiveTermsRef, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
   const burnVideo = useCallback(async (overrides = null) => {
     const throwOnError = Boolean(overrides?.throwOnError);
@@ -695,13 +780,16 @@ function useSubtitleAsyncActions({ state, stateRef, setState, setBusyMeta, setAc
     });
   }, [state, mediaDuration, effectiveIncludeSpeaker, hasSubtitleText, health.burnInSupported, gateway, abortRef, setState, setBusyMeta, refreshHealth, markOnline, onNotify, onUnlockSound]);
 
-  return { cancel, extractSubtitles, translateNow, burnVideo };
+  return { cancel, extractSubtitles, translateNow, retranslateSegment, burnVideo };
 }
 
 function runTimingTransform({ stateRef, setState, onNotify, transform, successMessage }) {
   try {
     const nextSegments = transform(stateRef.current.segments);
-    setState(prev => ({ ...prev, segments: nextSegments, status: { message: successMessage, error: false } }));
+    setState(prev => commitUndoableState(prev, {
+      segments: nextSegments,
+      status: { message: successMessage, error: false },
+    }));
     return true;
   } catch (err) {
     const message = err?.message || 'Could not update cue timing.';
@@ -711,54 +799,91 @@ function runTimingTransform({ stateRef, setState, onNotify, transform, successMe
   }
 }
 
+function resolveUpdateSegmentCoalesceKey(segId, patch) {
+  if (!patch || typeof patch !== 'object') return null;
+  const keys = Object.keys(patch);
+  if (keys.length !== 1) return null;
+  if (keys[0] === 'text') return `text:${segId}`;
+  if (keys[0] === 'translatedText') return `translated:${segId}`;
+  return null;
+}
+
+function mapSegmentIfChanged(segments, segId, mapper) {
+  let changed = false;
+  const next = segments.map(seg => {
+    if (seg.id !== segId) return seg;
+    const updated = mapper(seg);
+    if (updated === seg) return seg;
+    changed = true;
+    return updated;
+  });
+  return changed ? next : segments;
+}
+
 function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegmentId, useTranslation, mediaDuration, onNotify }) {
   const updateSegment = useCallback((segId, patch) => {
-    setState(prev => ({
-      ...prev,
-      hasTranslation: prev.hasTranslation || Boolean(patch?.translatedText?.trim()),
-      segments: prev.segments.map(seg => (seg.id === segId ? { ...seg, ...patch } : seg)),
-    }));
+    const coalesceKey = resolveUpdateSegmentCoalesceKey(segId, patch);
+    setState(prev => {
+      const nextSegments = mapSegmentIfChanged(prev.segments, segId, seg => applySubtitleSegmentPatch(seg, patch));
+      if (nextSegments === prev.segments) return prev;
+      return commitUndoableState(prev, {
+        hasTranslation: prev.hasTranslation || Boolean(patch?.translatedText?.trim()),
+        segments: nextSegments,
+      }, { coalesceKey });
+    });
+  }, [setState]);
+
+  const dismissStaleTranslation = useCallback(segId => {
+    setState(prev => {
+      const nextSegments = mapSegmentIfChanged(prev.segments, segId, seg => applySubtitleSegmentPatch(seg, { translationStale: false }));
+      if (nextSegments === prev.segments) return prev;
+      return commitUndoableState(prev, {
+        segments: nextSegments,
+        status: { message: 'Marked translation as up to date.', error: false },
+      });
+    });
   }, [setState]);
 
   const deleteSegment = useCallback(segId => {
     setActiveSegmentId(prev => (prev === segId ? '' : prev));
     setState(prev => {
       const nextSegments = deleteSubtitleSegment(prev.segments, segId);
+      if (nextSegments.length === prev.segments.length) return prev;
       const keepTrans = nextSegments.length > 0 && prev.hasTranslation;
-      return {
-        ...prev,
+      return commitUndoableState(prev, {
         segments: nextSegments,
         hasTranslation: keepTrans,
         translatedLanguage: keepTrans ? prev.translatedLanguage : '',
-      };
+      });
     });
   }, [setState, setActiveSegmentId]);
 
   const mergeSegmentWithNext = useCallback(segId => {
-    setState(prev => ({ ...prev, segments: mergeSubtitleSegmentWithNext(prev.segments, segId) }));
+    setState(prev => commitUndoableState(prev, {
+      segments: mergeSubtitleSegmentWithNext(prev.segments, segId),
+    }));
   }, [setState]);
 
   const splitSegment = useCallback((segId, ratio = 0.5) => {
-    setState(prev => ({ ...prev, segments: splitSubtitleSegment(prev.segments, segId, { ratio }) }));
+    setState(prev => commitUndoableState(prev, {
+      segments: splitSubtitleSegment(prev.segments, segId, { ratio }),
+    }));
   }, [setState]);
 
   const updateSegmentTiming = useCallback((segId, timingPatch, options = {}) => {
-    setState(prev => ({
-      ...prev,
+    setState(prev => commitUndoableState(prev, {
       segments: adjustSubtitleSegmentTiming(prev.segments, segId, timingPatch, options),
     }));
   }, [setState]);
 
   const updateSegmentPause = useCallback((segId, pauseSec, options = {}) => {
-    setState(prev => ({
-      ...prev,
+    setState(prev => commitUndoableState(prev, {
       segments: adjustCuePause(prev.segments, segId, pauseSec, options),
     }));
   }, [setState]);
 
   const resolveOverlaps = useCallback((options = {}) => {
-    setState(prev => ({
-      ...prev,
+    setState(prev => commitUndoableState(prev, {
       segments: resolveCueOverlaps(prev.segments, options),
     }));
   }, [setState]);
@@ -791,29 +916,31 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
     const result = extendAllSafeMismatches(stateRef.current.segments, mismatches, { mediaDuration });
     if (!result.fixedCount) return 0;
     const msg = `Extended ${result.fixedCount} ${result.fixedCount === 1 ? 'cue' : 'cues'} to fit speech.`;
-    setState(prev => ({ ...prev, segments: result.segments, status: { message: msg, error: false } }));
+    setState(prev => commitUndoableState(prev, { segments: result.segments, status: { message: msg, error: false } }));
     onNotify?.({ kind: 'success', title: 'Cues updated', message: msg });
     return result.fixedCount;
   }, [stateRef, setState, mediaDuration, onNotify]);
 
   const applySegmentSuggestion = useCallback(segId => {
-    setState(prev => ({
-      ...prev,
-      segments: prev.segments.map(seg => (
-        seg.id === segId && seg.altText?.trim()
-          ? { ...seg, text: seg.altText.trim(), altText: '', verifyReason: '' }
+    setState(prev => {
+      const nextSegments = mapSegmentIfChanged(prev.segments, segId, seg => (
+        seg.altText?.trim()
+          ? applySubtitleSegmentPatch(seg, { text: seg.altText.trim(), altText: '', verifyReason: '' })
           : seg
-      )),
-    }));
+      ));
+      if (nextSegments === prev.segments) return prev;
+      return commitUndoableState(prev, { segments: nextSegments });
+    });
   }, [setState]);
 
   const dismissSegmentSuggestion = useCallback(segId => {
-    setState(prev => ({
-      ...prev,
-      segments: prev.segments.map(seg => (
-        seg.id === segId ? { ...seg, altText: '', verifyReason: '' } : seg
-      )),
-    }));
+    setState(prev => {
+      const nextSegments = mapSegmentIfChanged(prev.segments, segId, seg => (
+        (seg.altText || seg.verifyReason) ? { ...seg, altText: '', verifyReason: '' } : seg
+      ));
+      if (nextSegments === prev.segments) return prev;
+      return commitUndoableState(prev, { segments: nextSegments });
+    });
   }, [setState]);
 
   const countMatches = useCallback(
@@ -827,8 +954,7 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
       setState(prev => ({ ...prev, status: { message: `No matches found for "${findText}".`, error: false } }));
       return { matchCount: 0, segmentCount: 0 };
     }
-    setState(prev => ({
-      ...prev,
+    setState(prev => commitUndoableState(prev, {
       segments: replaceTextInSegments({ segments: prev.segments, findText, replaceText, useTranslation, caseSensitive }).segments,
       status: { message: `Replaced ${result.matchCount} occurrence(s) across ${result.segmentCount} segment(s).`, error: false },
     }));
@@ -849,8 +975,72 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
     });
   }, [setState]);
 
+  const selectSegmentVoiceTake = useCallback((segId, takeId) => {
+    setState(prev => {
+      const nextSegments = selectSubtitleSegmentTake(prev.segments, segId, takeId);
+      return nextSegments === prev.segments ? prev : { ...prev, segments: nextSegments };
+    });
+  }, [setState]);
+
+  const deleteSegmentVoiceTake = useCallback((segId, takeId) => {
+    setState(prev => {
+      const nextSegments = deleteSubtitleSegmentTake(prev.segments, segId, takeId);
+      return nextSegments === prev.segments ? prev : { ...prev, segments: nextSegments };
+    });
+  }, [setState]);
+
+  const commitHistoryBoundary = useCallback(() => {
+    setState(prev => {
+      const nextHistory = clearSubtitleHistoryCoalesce(prev.history);
+      return nextHistory === prev.history ? prev : { ...prev, history: nextHistory };
+    });
+  }, [setState]);
+
+  const undo = useCallback(() => {
+    if (!stateRef.current.history?.past?.length) return false;
+    setState(prev => {
+      const res = undoSubtitleHistory(prev.history, {
+        segments: prev.segments,
+        hasTranslation: prev.hasTranslation,
+        translatedLanguage: prev.translatedLanguage,
+      });
+      if (!res.applied || !res.snapshot) return prev;
+      return {
+        ...prev,
+        segments: res.snapshot.segments,
+        hasTranslation: res.snapshot.hasTranslation,
+        translatedLanguage: res.snapshot.translatedLanguage,
+        history: res.history,
+        status: { message: 'Undid last subtitle edit.', error: false },
+      };
+    });
+    return true;
+  }, [stateRef, setState]);
+
+  const redo = useCallback(() => {
+    if (!stateRef.current.history?.future?.length) return false;
+    setState(prev => {
+      const res = redoSubtitleHistory(prev.history, {
+        segments: prev.segments,
+        hasTranslation: prev.hasTranslation,
+        translatedLanguage: prev.translatedLanguage,
+      });
+      if (!res.applied || !res.snapshot) return prev;
+      return {
+        ...prev,
+        segments: res.snapshot.segments,
+        hasTranslation: res.snapshot.hasTranslation,
+        translatedLanguage: res.snapshot.translatedLanguage,
+        history: res.history,
+        status: { message: 'Redid subtitle edit.', error: false },
+      };
+    });
+    return true;
+  }, [stateRef, setState]);
+
   return {
     updateSegment,
+    dismissStaleTranslation,
     deleteSegment,
     mergeSegmentWithNext,
     splitSegment,
@@ -867,6 +1057,11 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
     findAndReplace,
     attachSegmentVoiceTake,
     clearSegmentVoiceTakes,
+    selectSegmentVoiceTake,
+    deleteSegmentVoiceTake,
+    commitHistoryBoundary,
+    undo,
+    redo,
   };
 }
 
@@ -879,7 +1074,7 @@ function useSegmentEditingActions({ segments, stateRef, setState, setActiveSegme
  * @param {{ onStateChange?: Function, onNotify?: Function, onUnlockSound?: Function }} [config] - Hook callbacks.
  * @returns {object} Subtitle workspace controller bundle.
  */
-export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidden = false, effectiveTermsRef = null } = {}) {
+export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidden = false, effectiveTermsRef = null, autoRestoreLatest = true } = {}) {
   const internalTermsRef = useRef([]);
   const activeEffectiveTermsRef = effectiveTermsRef || internalTermsRef;
   const services = useStudioServices();
@@ -910,6 +1105,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     speakerNames: {},
     terminology: createEmptyProjectTerminology(),
     exportHistory: [],
+    history: createEmptySubtitleHistory(),
     projectId: '',
     projectTitle: '',
     revision: 1,
@@ -1022,6 +1218,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
         translatedLanguage: keepExistingWork ? prev.translatedLanguage : '',
         speakerNames: keepExistingWork ? prev.speakerNames : {},
         exportHistory: keepExistingWork ? prev.exportHistory : [],
+        history: keepExistingWork ? prev.history : createEmptySubtitleHistory(),
         busyAction: '',
         options: {
           ...prev.options,
@@ -1062,6 +1259,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
         hasTranslation: false,
         translatedLanguage: '',
         speakerNames,
+        history: createEmptySubtitleHistory(),
         options: { ...prev.options, previewMode: 'original', spillApprovals: DEFAULT_OPTIONS.spillApprovals },
         status: { message: `Imported ${segments.length} subtitle cues from ${file.name}.`, error: false },
       }));
@@ -1106,6 +1304,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       speakerNames: {},
       terminology: createEmptyProjectTerminology(),
       exportHistory: [],
+      history: createEmptySubtitleHistory(),
       projectId: '',
       projectTitle: '',
       busyAction: '',
@@ -1339,6 +1538,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : {},
       terminology: normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology),
       exportHistory: normalizeExportHistory(snapshot.exportHistory ?? payload.exportHistory ?? payload.subtitleOptions?.exportHistory),
+      history: createEmptySubtitleHistory(),
       options: normalizeRestoredSubtitleOptions(payload.subtitleOptions, prev.options),
       status: { message: `Project loaded: ${title}`, error: false },
     }));
@@ -1362,6 +1562,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
         hasTranslation: payload.hasTranslation !== undefined ? Boolean(payload.hasTranslation) : prev.hasTranslation,
         translatedLanguage: payload.translatedLanguage || prev.translatedLanguage,
         speakerNames: typeof payload.speakerNames === 'object' && payload.speakerNames ? payload.speakerNames : prev.speakerNames,
+        history: nextSegments !== null ? createEmptySubtitleHistory() : prev.history,
         options: rawOpts ? normalizeRestoredSubtitleOptions(rawOpts, prev.options) : prev.options,
         terminology: snapshot.terminology !== undefined || payload.terminology !== undefined
           ? normalizeProjectTerminology(snapshot.terminology ?? payload.terminology ?? payload.subtitleOptions?.terminology)
@@ -1374,7 +1575,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
   }, []);
 
   useEffect(() => {
-    if (!projectRepository) {
+    if (!autoRestoreLatest || !projectRepository) {
       setState(prev => ({ ...prev, projectsReady: true }));
       return undefined;
     }
@@ -1397,7 +1598,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     };
     void restoreLatestProject();
     return () => { active = false; };
-  }, [projectRepository, loadProjectFromSnapshot, services]);
+  }, [autoRestoreLatest, projectRepository, loadProjectFromSnapshot, services]);
 
   const buildProjectSnapshot = useCallback(() => createSubtitleProjectSnapshot({
     id: state.projectId || undefined,
@@ -1547,7 +1748,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       return 0;
     }
     const msg = `Applied approved spelling to ${result.updatedCount} ${result.updatedCount === 1 ? 'cue' : 'cues'}.`;
-    setState(prev => ({ ...prev, segments: result.segments, status: { message: msg, error: false } }));
+    setState(prev => commitUndoableState(prev, { segments: result.segments, status: { message: msg, error: false } }));
     onNotify?.({ kind: 'success', title: 'Spelling terminology applied', message: msg });
     return result.updatedCount;
   }, [activeEffectiveTermsRef, stateRef, onNotify]);
@@ -1558,6 +1759,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     const sourceLang = resolveSubtitleSourceLanguage(current);
     const targetLang = current.translatedLanguage || normalizeTargetLanguageCode(current.options.targetLanguage);
     const origById = new Map(current.segments.map(seg => [seg.id, seg.translatedText || '']));
+    const origSourceById = new Map(current.segments.map(seg => [seg.id, seg.text || '']));
     const localResult = applyTranslationTermsToSegments(current.segments, terms, { sourceLanguage: sourceLang, targetLanguage: targetLang, segmentId });
     const updatesById = collectTranslatedUpdates(current.segments, localResult.segments);
     const unresolved = localResult.segments.filter(seg => (
@@ -1565,6 +1767,7 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       inspectSegmentTerminology(seg, terms, { sourceLanguage: sourceLang, targetLanguage: targetLang }).translationGaps.length > 0
     ));
     let mtError = null;
+    const retranslatedIds = new Set();
     const mediaTerms = unresolved.length > 0 ? toMediaTerminologyPayload(terms) : null;
     if (unresolved.length > 0 && mediaTerms && gateway?.translateSegments && !current.busyAction) {
       try {
@@ -1575,7 +1778,10 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
           terminology: mediaTerms,
         });
         for (const item of (res?.segments || [])) {
-          if (item?.id && typeof item.translatedText === 'string') updatesById.set(item.id, item.translatedText);
+          if (item?.id && typeof item.translatedText === 'string') {
+            updatesById.set(item.id, item.translatedText);
+            retranslatedIds.add(item.id);
+          }
         }
       } catch (err) {
         mtError = err;
@@ -1589,9 +1795,8 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
       return inspectSegmentTerminology(candidate, terms, { sourceLanguage: sourceLang, targetLanguage: targetLang }).translationGaps.length > 0;
     }).length;
     const outcome = buildTranslationTermOutcome({ changedCount: changedIds.length, mtError, unresolvedCount });
-    setState(prev => ({
-      ...prev,
-      segments: changedIds.length > 0 ? mergeTranslationUpdates(prev.segments, updatesById, origById) : prev.segments,
+    setState(prev => commitUndoableState(prev, {
+      segments: changedIds.length > 0 ? mergeTranslationUpdates(prev.segments, updatesById, origById, retranslatedIds, origSourceById) : prev.segments,
       status: outcome.status,
     }));
     if (outcome.notify) onNotify?.(outcome.notify);
@@ -1652,6 +1857,10 @@ export function useVideoSubtitles({ onStateChange, onNotify, onUnlockSound, hidd
     exportFile,
     copyDialogue,
     getTtsHandoff,
+    canUndo: (state.history?.past?.length || 0) > 0,
+    canRedo: (state.history?.future?.length || 0) > 0,
+    undoCount: state.history?.past?.length || 0,
+    redoCount: state.history?.future?.length || 0,
     ...editActions,
     ...asyncActions,
   };
@@ -1675,15 +1884,25 @@ function collectTranslatedUpdates(prevSegments, nextSegments) {
   return updates;
 }
 
-function mergeTranslationUpdates(prevSegments, updatesById, origById) {
+function mergeTranslationUpdates(prevSegments, updatesById, origById, retranslatedIds = null, origSourceById = null) {
   let changed = false;
   const segments = prevSegments.map(seg => {
     if (!updatesById.has(seg.id)) return seg;
     const nextText = updatesById.get(seg.id);
     if (nextText === (seg.translatedText || '')) return seg;
     if ((seg.translatedText || '') !== (origById.get(seg.id) || '')) return seg;
+    const sourceChangedInFlight = Boolean(origSourceById && (seg.text || '') !== (origSourceById.get(seg.id) || ''));
+    const wasRetranslated = Boolean(retranslatedIds?.has(seg.id));
+    if (wasRetranslated && sourceChangedInFlight) return seg;
     changed = true;
-    return { ...seg, translatedText: nextText };
+    if ((!wasRetranslated && seg.translationStale) || sourceChangedInFlight) {
+      return applySubtitleSegmentPatch(seg, {
+        translatedText: nextText,
+        translationStale: true,
+        keepTranslationBaseline: true,
+      });
+    }
+    return applySubtitleSegmentPatch(seg, { translatedText: nextText });
   });
   return changed ? segments : prevSegments;
 }

@@ -236,6 +236,20 @@ const ICON_PATHS = {
       <path d="M17 10H21.4C21.7314 10 22 9.73137 22 9.4V5" />
     </g>
   ),
+  // Iconoir: undo
+  undo: (
+    <g {...STROKE_STYLE}>
+      <path d="M4 9H15C18.3137 9 21 11.6863 21 15C21 18.3137 18.3137 21 15 21H8" />
+      <path d="M8 5L4 9L8 13" />
+    </g>
+  ),
+  // Iconoir: redo
+  redo: (
+    <g {...STROKE_STYLE}>
+      <path d="M20 9H9C5.68629 9 3 11.6863 3 15C3 18.3137 5.68629 21 9 21H16" />
+      <path d="M16 5L20 9L16 13" />
+    </g>
+  ),
   // Iconoir: cpu
   cpu: (
     <g {...STROKE_STYLE}>

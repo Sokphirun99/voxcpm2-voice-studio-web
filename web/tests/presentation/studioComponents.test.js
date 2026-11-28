@@ -854,18 +854,19 @@ test('VideoSubtitleWorkspace SSR renders uploader, options, empty cue state, and
     assert.equal(html.includes('for="subtitle-detect-speakers"'), false);
     assert.equal(html.includes('for="subtitle-include-speaker"'), false);
     assert.ok(html.includes('id="subtitle-extract-btn"'));
-    assert.ok(html.includes('id="subtitle-burn-btn"'));
+    assert.ok(html.includes('id="subtitle-export-project-btn"'));
     assert.ok(html.includes('id="subtitle-send-tts-btn"'));
-    assert.ok(html.includes('Download .vtt'));
+    assert.equal(html.includes('id="subtitle-project-select"'), false);
+    assert.equal(html.includes('id="subtitle-burn-btn"'), false);
+    assert.ok(html.includes('Export project'));
     assert.ok(html.includes('No dialogue extracted yet'));
   });
 });
 
-test('ToastRegion, LiveStatusText, and Sidebar sound toggle SSR render accessible markup', async () => {
+test('ToastRegion and LiveStatusText SSR render accessible markup', async () => {
   await withViteSsr(async vite => {
     const { ToastRegion } = await vite.ssrLoadModule('/src/presentation/components/ToastRegion.jsx');
     const { LiveStatusText } = await vite.ssrLoadModule('/src/presentation/components/LiveStatusText.jsx');
-    const { Sidebar } = await vite.ssrLoadModule('/src/presentation/components/Sidebar.jsx');
 
     assert.equal(renderToStaticMarkup(React.createElement(ToastRegion, { toasts: [] })), '');
 
@@ -893,17 +894,6 @@ test('ToastRegion, LiveStatusText, and Sidebar sound toggle SSR render accessibl
       })
     );
     assert.ok(statusHtml.includes('Working ('));
-
-    const sidebarHtml = renderToStaticMarkup(
-      React.createElement(Sidebar, {
-        activeWorkspace: 'tts',
-        onSelectWorkspace() {},
-        soundMuted: true,
-        onToggleSoundMuted() {},
-      })
-    );
-    assert.ok(sidebarHtml.includes('id="notification-sound-toggle"'));
-    assert.ok(sidebarHtml.includes('Sound muted'));
   });
 });
 
@@ -984,10 +974,16 @@ test('studio.css keeps toasts off top toolbar and configures independent scroll 
   assert.match(css, /\.subtitle-tts-speaker-wrap select\s*\{[^}]*max-width:\s*180px/);
 
   const mobileToastSection = css.slice(css.lastIndexOf('@media (max-width: 640px)'));
+  const firstMobileSectionStart = css.indexOf('@media (max-width: 640px)');
+  const secondMobileSectionStart = css.indexOf('@media (max-width: 640px)', firstMobileSectionStart + 1);
+  const mobileToolbarSection = css.slice(firstMobileSectionStart, secondMobileSectionStart);
   const mobileToastMatch = mobileToastSection.match(/\.studio-toast-region\s*\{([^}]+)\}/);
   assert.ok(mobileToastMatch);
   assert.match(mobileToastMatch[1], /bottom:\s*auto/);
   assert.match(mobileToastMatch[1], /top:\s*calc\(114px/);
+  assert.match(mobileToolbarSection, /\.subtitle-workspace \.studio-toolbar\s*\{[^}]*flex-direction:\s*column/);
+  assert.match(mobileToolbarSection, /\.subtitle-workspace \.toolbar-actions\s*\{[^}]*display:\s*grid/);
+  assert.match(mobileToolbarSection, /\.subtitle-workspace #subtitle-terminology-btn\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/);
   assert.match(mobileToastSection, /\.subtitle-left-pane,\s*\.subtitle-right-pane\s*\{[^}]*flex:\s*0\s+0\s+auto/);
   assert.match(mobileToastSection, /\.subtitle-left-pane,\s*\.subtitle-right-pane\s*\{[^}]*min-height:\s*auto/);
   assert.match(mobileToastSection, /\.subtitle-tts-speaker-wrap select\s*\{[^}]*max-width:\s*none/);
@@ -998,6 +994,10 @@ test('studio.css keeps toasts off top toolbar and configures independent scroll 
   assert.match(subtitleGridMatch[1], /overflow:\s*hidden/);
 
   const tabletSection = css.slice(css.lastIndexOf('@media (max-width: 860px)'));
+  const tabletNavigationSection = css.slice(css.indexOf('@media (max-width: 860px)'), firstMobileSectionStart);
+  assert.match(tabletNavigationSection, /\.studio-sidebar\s*\{[^}]*position:\s*absolute/);
+  assert.match(tabletNavigationSection, /\.studio-sidebar-backdrop\s*\{[^}]*inset:\s*0/);
+  assert.match(tabletNavigationSection, /\.studio-page \.workspace-nav\s*\{[^}]*min-height:\s*44px/);
   const tabletGridMatch = tabletSection.match(/\.subtitle-grid\s*\{([^}]+)\}/);
   assert.ok(tabletGridMatch);
   assert.match(tabletGridMatch[1], /grid-template-rows:\s*auto/);

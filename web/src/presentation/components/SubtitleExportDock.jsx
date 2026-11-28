@@ -84,6 +84,7 @@ export function SubtitleExportDock({
   onExportAlignedVoice = null,
   onOpenExportProject = null,
   exportHistoryCount = 0,
+  consolidated = false,
   onExportFile,
   onCopyDialogue,
   onBurnVideo,
@@ -100,20 +101,33 @@ export function SubtitleExportDock({
   return (
     <section className="playback subtitle-dock" aria-label="Subtitle export" data-idle={isDockIdle ? 'true' : 'false'}>
       <div className="subtitle-dock-actions">
-        <ExportFormatButtons hasSegments={hasSegments} busy={busy} onExportFile={onExportFile} onCopyDialogue={onCopyDialogue} />
+        {consolidated ? (
+          <div className="subtitle-export-group">
+            <button type="button" className="button button-secondary" aria-label="Copy dialogue" title="Copy dialogue"
+              disabled={!hasSegments || busy} onClick={onCopyDialogue}>
+              <Icon name="copy" /><span>Copy</span>
+            </button>
+          </div>
+        ) : (
+          <ExportFormatButtons hasSegments={hasSegments} busy={busy} onExportFile={onExportFile} onCopyDialogue={onCopyDialogue} />
+        )}
         <div className="subtitle-export-primary">
-          <button type="button" id="subtitle-burn-btn" className="button button-secondary"
-            title={burnTitle} disabled={!hasSegments || !hasSubtitleText || !hasVideoJob || !canBurn || isAudioOnly || busy} onClick={onBurnVideo}>
-            <Icon name="arrow_down_to_line" />
-            <span>{busyAction === 'burn' ? 'Rendering MP4...' : 'Export burned MP4'}</span>
-          </button>
-          <ExportAlignedDubButton
-            hasAlignedVoice={hasAlignedVoice}
-            canExportAlignedVoice={canExportAlignedVoice}
-            unresolvedMismatchCount={unresolvedMismatchCount}
-            busy={busy}
-            onExportAlignedVoice={onExportAlignedVoice}
-          />
+          {!consolidated && (
+            <>
+              <button type="button" id="subtitle-burn-btn" className="button button-secondary"
+                title={burnTitle} disabled={!hasSegments || !hasSubtitleText || !hasVideoJob || !canBurn || isAudioOnly || busy} onClick={onBurnVideo}>
+                <Icon name="arrow_down_to_line" />
+                <span>{busyAction === 'burn' ? 'Rendering MP4...' : 'Export burned MP4'}</span>
+              </button>
+              <ExportAlignedDubButton
+                hasAlignedVoice={hasAlignedVoice}
+                canExportAlignedVoice={canExportAlignedVoice}
+                unresolvedMismatchCount={unresolvedMismatchCount}
+                busy={busy}
+                onExportAlignedVoice={onExportAlignedVoice}
+              />
+            </>
+          )}
           {onOpenExportProject && (
             <button
               type="button"

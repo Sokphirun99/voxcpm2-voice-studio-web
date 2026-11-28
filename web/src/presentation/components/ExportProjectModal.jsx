@@ -84,6 +84,12 @@ function PresetSpecsList({ expected }) {
         <dt>Codec</dt>
         <dd>{codecDisplay}</dd>
       </div>
+      {expected.quality && (
+        <div className="export-preset-spec-row">
+          <dt>Quality</dt>
+          <dd title={expected.quality}>{expected.quality}</dd>
+        </div>
+      )}
       <div className="export-preset-spec-row">
         <dt>Duration</dt>
         <dd>{formatDurationLabel(expected.durationSeconds)}</dd>
@@ -91,6 +97,14 @@ function PresetSpecsList({ expected }) {
       <div className="export-preset-spec-row">
         <dt>Language</dt>
         <dd>{formatLanguageSummary(expected)}</dd>
+      </div>
+      <div className="export-preset-spec-row">
+        <dt>Est. size</dt>
+        <dd>{expected.estimatedSizeLabel || '—'}</dd>
+      </div>
+      <div className="export-preset-spec-row">
+        <dt>Destination</dt>
+        <dd title={expected.locationLabel || 'Browser downloads folder'}>{expected.locationLabel || 'Browser downloads folder'}</dd>
       </div>
       {expected.audioModeLabel && (
         <div className="export-preset-spec-row">
@@ -229,6 +243,13 @@ function ExportDubMixControls({ draft, setDraft }) {
 }
 
 function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOption }) {
+  const isCustomAdvanced = (
+    draft.dubAudioMode !== VIDEO_AUDIO_MODES.DUCK
+    || draft.dubSubtitleMode !== DEFAULT_DUB_SUBTITLE_MODE
+    || hasCustomDubMixSettings(draft.dubMixSettings)
+    || Boolean(draft.includeSpeaker)
+    || Boolean(draft.includeLanguageSuffix)
+  );
   return (
     <>
       <label className="export-control-field" htmlFor="export-language-mode">
@@ -243,53 +264,61 @@ function SubtitleExportControls({ draft, setDraft, hasTranslation, showSpeakerOp
           {hasTranslation && <option value="bilingual">Bilingual (Original + Translation)</option>}
         </select>
       </label>
-      <label className="export-control-field" htmlFor="export-dub-audio-mode">
-        <span>Dubbed MP4 audio mode</span>
-        <select
-          id="export-dub-audio-mode"
-          value={draft.dubAudioMode}
-          onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, dubAudioMode: val })); }}
-        >
-          {VIDEO_EXPORT_AUDIO_MODE_OPTIONS.map(opt => (
-            <option key={opt.id} value={opt.id}>{opt.label}</option>
-          ))}
-        </select>
-      </label>
-      <label className="export-control-field" htmlFor="export-dub-subtitle-mode">
-        <span>Dubbed MP4 subtitles</span>
-        <select
-          id="export-dub-subtitle-mode"
-          value={draft.dubSubtitleMode}
-          onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, dubSubtitleMode: val })); }}
-        >
-          {VIDEO_SUBTITLE_MODE_OPTIONS.map(opt => (
-            <option key={opt.id} value={opt.id}>{opt.label}</option>
-          ))}
-        </select>
-      </label>
-      <ExportDubMixControls draft={draft} setDraft={setDraft} />
-      <div className="export-control-toggles">
-        {showSpeakerOption && (
-          <label className="export-checkbox-label" htmlFor="export-include-speaker">
-            <input
-              id="export-include-speaker"
-              type="checkbox"
-              checked={draft.includeSpeaker}
-              onChange={e => { const checked = e.target.checked; setDraft(prev => ({ ...prev, includeSpeaker: checked })); }}
-            />
-            <span>Include speaker labels</span>
+      <details className="export-advanced-details">
+        <summary className="export-advanced-summary">
+          <span>Advanced export options{isCustomAdvanced ? ' (customized)' : ''}</span>
+          <Icon name="chevron_down" />
+        </summary>
+        <div className="export-advanced-body">
+          <label className="export-control-field" htmlFor="export-dub-audio-mode">
+            <span>Dubbed MP4 audio mode</span>
+            <select
+              id="export-dub-audio-mode"
+              value={draft.dubAudioMode}
+              onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, dubAudioMode: val })); }}
+            >
+              {VIDEO_EXPORT_AUDIO_MODE_OPTIONS.map(opt => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
           </label>
-        )}
-        <label className="export-checkbox-label" htmlFor="export-language-suffix">
-          <input
-            id="export-language-suffix"
-            type="checkbox"
-            checked={draft.includeLanguageSuffix}
-            onChange={e => { const checked = e.target.checked; setDraft(prev => ({ ...prev, includeLanguageSuffix: checked })); }}
-          />
-          <span>Append language code to subtitle filename</span>
-        </label>
-      </div>
+          <label className="export-control-field" htmlFor="export-dub-subtitle-mode">
+            <span>Dubbed MP4 subtitles</span>
+            <select
+              id="export-dub-subtitle-mode"
+              value={draft.dubSubtitleMode}
+              onChange={e => { const val = e.target.value; setDraft(prev => ({ ...prev, dubSubtitleMode: val })); }}
+            >
+              {VIDEO_SUBTITLE_MODE_OPTIONS.map(opt => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
+          </label>
+          <ExportDubMixControls draft={draft} setDraft={setDraft} />
+          <div className="export-control-toggles">
+            {showSpeakerOption && (
+              <label className="export-checkbox-label" htmlFor="export-include-speaker">
+                <input
+                  id="export-include-speaker"
+                  type="checkbox"
+                  checked={draft.includeSpeaker}
+                  onChange={e => { const checked = e.target.checked; setDraft(prev => ({ ...prev, includeSpeaker: checked })); }}
+                />
+                <span>Include speaker labels</span>
+              </label>
+            )}
+            <label className="export-checkbox-label" htmlFor="export-language-suffix">
+              <input
+                id="export-language-suffix"
+                type="checkbox"
+                checked={draft.includeLanguageSuffix}
+                onChange={e => { const checked = e.target.checked; setDraft(prev => ({ ...prev, includeLanguageSuffix: checked })); }}
+              />
+              <span>Append language code to subtitle filename</span>
+            </label>
+          </div>
+        </div>
+      </details>
     </>
   );
 }
@@ -399,6 +428,11 @@ function useExportModalController({ dialogRef, open, workspace, context, busy, o
       .filter(sec => sec.items.length > 0)
   ), [evaluatedPresets]);
 
+  const activePreset = useMemo(
+    () => groupedSections.flatMap(sec => sec.items).find(item => item.id === activePresetId) || null,
+    [groupedSections, activePresetId]
+  );
+
   const requestClose = () => {
     if (closedRef.current || !open) return;
     closedRef.current = true;
@@ -413,19 +447,21 @@ function useExportModalController({ dialogRef, open, workspace, context, busy, o
     try {
       await onExportPreset(preset, draft);
     } catch (err) {
-      setModalError(err?.message || `Could not export ${preset.label}.`);
+      if (err?.name !== 'SynthesisCancelledError') {
+        setModalError(err?.message || `Could not export ${preset.label}.`);
+      }
     } finally {
       setActivePresetId('');
     }
   };
 
-  return { draft, setDraft, activePresetId, modalError, groupedSections, requestClose, handleRunPreset };
+  return { draft, setDraft, activePresetId, activePreset, modalError, groupedSections, requestClose, handleRunPreset };
 }
 
 /**
  * Renders the Export Project modal with category-grouped Audio, Subtitle, and MP4 presets,
- * expected output verification, warnings/blockers, and saved project export history.
- * Inputs: `{ open, workspace, context, exportHistory, busy, onExportPreset, onClose }`.
+ * expected output verification, warnings/blockers, active progress/cancel bar, and saved project export history.
+ * Inputs: `{ open, workspace, context, exportHistory, busy, onExportPreset, onCancelExport, onClose }`.
  * Outputs: `<dialog id="export-project-dialog">`.
  * Side effects: triggers file exports via `onExportPreset` and manages modal open/close state.
  * Failure modes: catches export failures and surfaces actionable alert text inside the modal.
@@ -439,12 +475,14 @@ export function ExportProjectModal({
   exportHistory = [],
   busy = false,
   onExportPreset,
+  onCancelExport = null,
   onClose,
 }) {
   const dialogRef = useRef(null);
   const {
-    draft, setDraft, activePresetId, modalError, groupedSections, requestClose, handleRunPreset,
+    draft, setDraft, activePresetId, activePreset, modalError, groupedSections, requestClose, handleRunPreset,
   } = useExportModalController({ dialogRef, open, workspace, context, busy, onExportPreset, onClose });
+  const isExportRunning = Boolean(busy || activePresetId);
 
   return (
     <dialog
@@ -463,7 +501,7 @@ export function ExportProjectModal({
         <div>
           <h2 id="export-project-title">Export project</h2>
           <p id="export-project-desc">
-            Choose an audio, subtitle, or supported MP4 preset and verify codec, duration, language, and filename before downloading.
+            Choose an audio, subtitle, or supported MP4 preset and verify codec, quality, size, duration, language, and filename before downloading.
           </p>
         </div>
         <div className="library-header-actions">
@@ -499,6 +537,22 @@ export function ExportProjectModal({
           />
         )}
       </div>
+
+      {isExportRunning && (
+        <div className="export-progress-banner" id="export-progress-banner" role="status" aria-live="polite">
+          <span>{activePreset ? `Exporting ${activePreset.label}…` : 'Preparing export…'}</span>
+          {onCancelExport && (
+            <button
+              type="button"
+              id="export-cancel-btn"
+              className="button subtle-button cancel-button"
+              onClick={onCancelExport}
+            >
+              <Icon name="stop_fill" /><span>Cancel export</span>
+            </button>
+          )}
+        </div>
+      )}
 
       {modalError && <p className="terminology-error" role="alert">{modalError}</p>}
 

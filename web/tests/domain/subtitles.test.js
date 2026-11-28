@@ -9,6 +9,8 @@ import {
   SOURCE_LANGUAGE_OPTIONS,
   TARGET_LANGUAGE_OPTIONS,
   adjustSubtitleSegmentTiming,
+  applySpellingTermsToSegments,
+  applySubtitleSegmentPatch,
   buildBoundedTtsHandoff,
   buildDialogueText,
   buildSrt,
@@ -25,6 +27,7 @@ import {
   groupLanguageOptions,
   isAudioOnlyFile,
   isSameSubtitleLanguage,
+  isSegmentTranslationStale,
   mergeSubtitleSegmentWithNext,
   normalizeTargetLanguageCode,
   parseEditableTimestamp,
@@ -344,4 +347,70 @@ test('buildSrt and buildVtt sanitize speaker names containing timing arrows or b
   assert.ok(srt.includes('[Host → Guest\n2] Hello\nWorld\n'));
   assert.equal(srt.includes('Host -->'), false);
   assert.equal(srt.includes('\n\nWorld'), false);
+});
+
+test('applySubtitleSegmentPatch, split, merge, replace, and terminology flag and clear stale translations', () => {
+  const initial = { id: 's1', start: 0, end: 2, text: 'Hello world.', translatedText: 'សួស្តីពិភពលោក។' };
+  assert.equal(isSegmentTranslationStale(initial), false);
+
+  const edited = applySubtitleSegmentPatch(initial, { text: 'Hello Cambodia.' });
+  assert.equal(isSegmentTranslationStale(edited), true);
+  assert.equal(edited.translatedFromText, 'Hello world.');
+
+  // Reverting text back to original clears stale automatically
+  const reverted = applySubtitleSegmentPatch(edited, { text: 'Hello world.' });
+  assert.equal(isSegmentTranslationStale(reverted), false);
+
+  // Dismissing stale keeps current translation and updates baseline
+  const dismissed = applySubtitleSegmentPatch(edited, { translationStale: false });
+  assert.equal(isSegmentTranslationStale(dismissed), false);
+  assert.equal(dismissed.translatedFromText, 'Hello Cambodia.');
+
+  // Re-translating clears stale and updates baseline
+  const retranslated = applySubtitleSegmentPatch(edited, { translatedText: 'សួស្តីកម្ពុជា។' });
+  assert.equal(isSegmentTranslationStale(retranslated), false);
+  assert.equal(retranslated.translatedFromText, 'Hello Cambodia.');
+
+  // Find & replace on source text marks translation stale
+  const replaced = replaceTextInSegments({
+    segments: [initial],
+    findText: 'world',
+    replaceText: 'friends',
+    useTranslation: false,
+  });
+  assert.equal(isSegmentTranslationStale(replaced.segments[0]), true);
+
+  // Terminology spelling correction on source text marks translation stale
+  const spelled = applySpellingTermsToSegments(
+    [{ id: 'sp-1', start: 0, end: 2, text: 'Visit Pnom Penh.', translatedText: 'ទៅទស្សនាភ្នំពេញ។' }],
+    [{ id: 't1', category: 'spelling', status: 'approved', enabled: true, term: 'Phnom Penh', variants: ['Pnom Penh'] }],
+    { sourceLanguage: 'en' }
+  );
+  assert.equal(isSegmentTranslationStale(spelled.segments[0]), true);
+
+  // Split & merge preserve stale status cleanly
+  const splitRes = splitSubtitleSegment([edited], 's1', { ratio: 0.5 });
+  assert.equal(splitRes.length, 2);
+  assert.equal(isSegmentTranslationStale(splitRes[0]), true);
+
+  const mergedRes = mergeSubtitleSegmentWithNext(
+    [
+      { id: 'm1', start: 0, end: 1, text: 'Hello', translatedText: 'សួស្តី' },
+      edited,
+    ],
+    'm1'
+  );
+  assert.equal(mergedRes.length, 1);
+  assert.equal(isSegmentTranslationStale(mergedRes[0]), true);
+});
+
+test('applySubtitleSegmentPatch, adjustSubtitleSegmentTiming, and resolveCueOverlaps return original references on no-ops', async () => {
+  const { adjustSubtitleSegmentTiming, resolveCueOverlaps } = await import('../../src/domain/subtitles.js');
+  const seg = { id: 's1', start: 0, end: 2, text: 'Hello', translatedText: 'សួស្តី' };
+  const list = [seg, { id: 's2', start: 2.5, end: 4, text: 'World' }];
+
+  assert.equal(applySubtitleSegmentPatch(seg, { text: 'Hello' }), seg);
+  assert.equal(applySubtitleSegmentPatch(seg, { translationStale: false }), seg);
+  assert.equal(adjustSubtitleSegmentTiming(list, 's1', { start: 0, end: 2 }), list);
+  assert.equal(resolveCueOverlaps(list), list);
 });

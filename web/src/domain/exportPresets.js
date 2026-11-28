@@ -73,6 +73,9 @@ export const DEFAULT_EXPORT_STEM = 'subtitle';
 export const DEFAULT_TTS_STEM = 'voxcpm2-narration';
 export const DUB_AAC_BITRATE_LABEL = 'AAC 192 kbps @ 48 kHz';
 export const MAX_DUB_EXPORT_CLIPS = 120;
+const WAV_BYTES_PER_SECOND = DEFAULT_WAV_SAMPLE_RATE * 2;
+const WAV_HEADER_BYTES = 44;
+const ESTIMATED_MP4_BYTES_PER_SECOND = 320000;
 
 const CATEGORY_AUDIO = 'audio';
 const CATEGORY_SUBTITLE = 'subtitle';
@@ -378,11 +381,59 @@ function estimateTtsSegmentsDuration(nonEmptySegments) {
   return total;
 }
 
-function buildExpectedOutput({ preset, filename, durationSeconds, language, codecOverride = '', videoMeta = null }) {
+/**
+ * Formats an estimated byte size into a compact human-readable string (`B`, `KB`, or `MB`).
+ * @param {number|null|undefined} bytes - Estimated byte count.
+ * @returns {string|null} Formatted size label or null when unavailable.
+ */
+export function formatEstimatedFileSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return null;
+  if (bytes < 1024) return `~${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `~${(bytes / 1024).toFixed(1)} KB`;
+  return `~${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function estimateWavBytes(durationSeconds) {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return null;
+  return Math.round(durationSeconds * WAV_BYTES_PER_SECOND) + WAV_HEADER_BYTES;
+}
+
+function estimateSubtitleBytes(segments, useTranslation, bilingual) {
+  if (!Array.isArray(segments) || segments.length === 0) return null;
+  const encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+  let total = 16;
+  for (const seg of segments) {
+    const text = pickSegmentText(seg, useTranslation, bilingual);
+    if (!text) continue;
+    const textBytes = encoder ? encoder.encode(text).length : text.length * 2;
+    total += textBytes + 34;
+  }
+  return total > 16 ? total : null;
+}
+
+function estimateVideoBytes(ctx, durationSeconds) {
+  if (Number.isFinite(ctx.videoFileSize) && ctx.videoFileSize > 0) return Math.round(ctx.videoFileSize);
+  if (Number.isFinite(durationSeconds) && durationSeconds > 0) return Math.round(durationSeconds * ESTIMATED_MP4_BYTES_PER_SECOND);
+  return null;
+}
+
+function resolvePresetQualityLabel(preset, videoMeta = null) {
+  if (preset.category === CATEGORY_AUDIO) return 'Lossless 48 kHz 16-bit PCM';
+  if (preset.category === CATEGORY_SUBTITLE) return 'UTF-8 clean text';
+  if (videoMeta?.subtitleMode === VIDEO_SUBTITLE_MODES.BURNED) return 'H.264 high-compatibility · AAC 192 kbps';
+  return 'MP4 (H.264/HEVC) · AAC 192 kbps';
+}
+
+function buildExpectedOutput({ preset, filename, durationSeconds, language, codecOverride = '', videoMeta = null, estimatedSizeBytes = null }) {
+  const safeBytes = Number.isFinite(estimatedSizeBytes) && estimatedSizeBytes > 0 ? Math.round(estimatedSizeBytes) : null;
   return Object.freeze({
     filename,
     format: preset.format,
     codec: codecOverride || preset.codec,
+    quality: resolvePresetQualityLabel(preset, videoMeta),
+    locationLabel: 'Browser downloads folder',
+    estimatedSizeBytes: safeBytes,
+    estimatedSizeLabel: formatEstimatedFileSize(safeBytes),
     sampleRate: preset.sampleRate,
     channels: preset.channels,
     durationSeconds: Number.isFinite(durationSeconds) && durationSeconds > 0 ? Math.round(durationSeconds * 100) / 100 : null,
@@ -417,7 +468,10 @@ function evaluateTtsNarrationPreset(preset, ctx, langInfo) {
   const activeDur = Number(activeRecording?.audioDurationSeconds ?? activeRecording?.duration) || 0;
   const duration = activeDur > 0 ? activeDur : estimateTtsSegmentsDuration(nonEmpty);
   const filename = formatPresetFilename(preset.id, { ...ctx, languageCode: langInfo.bcp47 });
-  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput: buildExpectedOutput({ preset, filename, durationSeconds: duration, language: langInfo }) };
+  const estimatedSizeBytes = (readyCount === 0 && Number(activeRecording?.blob?.size) > 0)
+    ? activeRecording.blob.size
+    : estimateWavBytes(duration);
+  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput: buildExpectedOutput({ preset, filename, durationSeconds: duration, language: langInfo, estimatedSizeBytes }) };
 }
 
 function resolveSubtitleAudioWarningsAndBlockers({ segments, targetInfo, isAligned, ctx }) {
@@ -453,7 +507,9 @@ function evaluateSubtitleAudioPreset(preset, ctx, langInfo) {
   const estDur = isAligned ? Math.max(mediaDur, clipDur) : clipDur;
   const audioLang = resolveAudioLanguageInfo(ctx, langInfo);
   const filename = formatPresetFilename(preset.id, { ...ctx, languageCode: audioLang.bcp47 });
-  const expectedOutput = buildExpectedOutput({ preset, filename, durationSeconds: estDur, language: audioLang });
+  const expectedOutput = buildExpectedOutput({
+    preset, filename, durationSeconds: estDur, language: audioLang, estimatedSizeBytes: estimateWavBytes(estDur),
+  });
   return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput };
 }
 
@@ -476,7 +532,8 @@ function evaluateSubtitleTextPreset(preset, ctx, langInfo) {
   }
   const durationSeconds = resolveSubtitleDuration(segments);
   const filename = formatPresetFilename(preset.id, { ...ctx, languageCode: langInfo.bcp47 });
-  const expectedOutput = buildExpectedOutput({ preset, filename, durationSeconds, language: langInfo });
+  const estimatedSizeBytes = estimateSubtitleBytes(segments, langInfo.useTranslation, langInfo.bilingual);
+  const expectedOutput = buildExpectedOutput({ preset, filename, durationSeconds, language: langInfo, estimatedSizeBytes });
   return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput };
 }
 
@@ -515,7 +572,15 @@ function evaluateVideoBurnedPreset(preset, ctx, langInfo) {
     subtitleMode: VIDEO_SUBTITLE_MODES.BURNED,
     subtitleModeLabel: formatVideoSubtitleModeSummary(VIDEO_SUBTITLE_MODES.BURNED, langInfo),
   };
-  return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput: buildExpectedOutput({ preset, filename, durationSeconds, language: langInfo, videoMeta }) };
+  return {
+    ...preset,
+    available: blockers.length === 0,
+    blockers,
+    warnings,
+    expectedOutput: buildExpectedOutput({
+      preset, filename, durationSeconds, language: langInfo, videoMeta, estimatedSizeBytes: estimateVideoBytes(ctx, durationSeconds),
+    }),
+  };
 }
 
 function resolveDubVideoSuffix(audioMode, subtitleMode) {
@@ -646,6 +711,7 @@ function evaluateVideoDubbedPreset(preset, ctx, langInfo) {
   const expectedOutput = buildExpectedOutput({
     preset, filename, durationSeconds, language: audioLang,
     codecOverride: resolveDubVideoCodec(safeSub, preset.codec), videoMeta,
+    estimatedSizeBytes: estimateVideoBytes(ctx, durationSeconds),
   });
   return { ...preset, available: blockers.length === 0, blockers, warnings, expectedOutput };
 }

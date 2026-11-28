@@ -94,20 +94,23 @@ function createDomShim() {
     }
     dispatchEvent(event) {
       event.target = event.target || this;
-      event.stopPropagation = event.stopPropagation || (() => {});
-      event.preventDefault = event.preventDefault || (() => {});
+      event.stopPropagation = event.stopPropagation || (() => { event._stopped = true; });
+      event.preventDefault = event.preventDefault || (() => { event.defaultPrevented = true; });
       const path = [];
       for (let cur = this; cur; cur = cur.parentNode) path.push(cur);
+      if (event.bubbles !== false && this.ownerDocument && path[path.length - 1] === docEl) path.push(this.ownerDocument);
       for (let i = path.length - 1; i >= 0; i--) {
+        if (event._stopped) break;
         event.currentTarget = path[i];
-        for (const fn of path[i].listeners.get(`cap:${event.type}`) || []) fn(event);
+        for (const fn of path[i].listeners?.get(`cap:${event.type}`) || []) fn(event);
       }
       for (let i = 0; i < path.length; i++) {
+        if (event._stopped) break;
         event.currentTarget = path[i];
-        for (const fn of path[i].listeners.get(`bub:${event.type}`) || []) fn(event);
+        for (const fn of path[i].listeners?.get(`bub:${event.type}`) || []) fn(event);
       }
       event.currentTarget = null;
-      return true;
+      return !event.defaultPrevented;
     }
     focus() {
       globalThis.document.activeElement = this;
@@ -125,16 +128,34 @@ function createDomShim() {
       if (this.tagName === 'A') return;
       this.dispatchEvent({ type: 'click', bubbles: true });
     }
+    matchesSingle(sel) {
+      if (this.nodeType !== 1) return false;
+      const trimmed = String(sel || '').trim();
+      if (!trimmed) return false;
+      if (trimmed === '[role="dialog"]') return this.getAttribute('role') === 'dialog';
+      if (trimmed.startsWith('#')) return this.id === trimmed.slice(1);
+      if (trimmed.startsWith('.')) return String(this.className || '').split(/\s+/).includes(trimmed.slice(1));
+      return this.tagName === trimmed.toUpperCase();
+    }
+    closest(sel) {
+      const parts = String(sel || '').split(',').map(s => s.trim()).filter(Boolean);
+      for (let cur = this; cur; cur = cur.parentNode) {
+        if (cur.nodeType === 1 && parts.some(part => cur.matchesSingle(part))) return cur;
+      }
+      return null;
+    }
+    contains(other) {
+      for (let cur = other; cur; cur = cur.parentNode) {
+        if (cur === this) return true;
+      }
+      return false;
+    }
     querySelectorAll(sel) {
       const out = [];
       const walk = node => {
         for (const c of node.childNodes) {
           if (c.nodeType !== 1) continue;
-          const match = sel.startsWith('#')
-            ? c.id === sel.slice(1)
-            : sel.startsWith('.')
-              ? String(c.className || '').split(/\s+/).includes(sel.slice(1))
-              : c.tagName === sel.toUpperCase();
+          const match = c.matchesSingle(sel);
           if (match) out.push(c);
           walk(c);
         }
@@ -221,6 +242,7 @@ function createDomShim() {
     navigator: { userAgent: 'Node' },
     ResizeObserver: class { observe() {} disconnect() {} },
   };
+  const docListeners = new Map();
   const doc = {
     nodeType: 9,
     defaultView: win,
@@ -228,6 +250,7 @@ function createDomShim() {
     head,
     body,
     documentElement: docEl,
+    listeners: docListeners,
     createElement: t => new MiniElement(t),
     createElementNS: (_ns, t) => new MiniElement(t),
     createTextNode: t => new MiniText(t),
@@ -236,8 +259,26 @@ function createDomShim() {
     getElementById: id => docEl.querySelector(`#${id}`),
     querySelector: sel => docEl.querySelector(sel),
     querySelectorAll: sel => docEl.querySelectorAll(sel),
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, fn, cap) {
+      const key = `${cap ? 'cap' : 'bub'}:${type}`;
+      if (!docListeners.has(key)) docListeners.set(key, []);
+      docListeners.get(key).push(fn);
+    },
+    removeEventListener(type, fn, cap) {
+      const key = `${cap ? 'cap' : 'bub'}:${type}`;
+      const list = docListeners.get(key);
+      if (list) docListeners.set(key, list.filter(i => i !== fn));
+    },
+    dispatchEvent(event) {
+      event.target = event.target || body;
+      event.stopPropagation = event.stopPropagation || (() => { event._stopped = true; });
+      event.preventDefault = event.preventDefault || (() => { event.defaultPrevented = true; });
+      event.currentTarget = doc;
+      for (const fn of docListeners.get(`cap:${event.type}`) || []) fn(event);
+      for (const fn of docListeners.get(`bub:${event.type}`) || []) fn(event);
+      event.currentTarget = null;
+      return !event.defaultPrevented;
+    },
   };
   win.document = doc;
   globalThis.window = win;
@@ -364,11 +405,13 @@ test('mounted Studio switches to Video to subtitle, extracts speakers, burns MP4
       renameInput.dispatchEvent({ type: 'input', bubbles: true, target: renameInput });
     });
 
-    const burnBtn = dom.container.querySelector('#subtitle-burn-btn');
-    await act(async () => { burnBtn.click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+    const burnDialog = subPanel.querySelector('#export-project-dialog');
+    await act(async () => { burnDialog.querySelector('#export-preset-btn-video_burned_mp4').click(); });
     assert.ok(burnRequest);
     assert.equal(burnRequest.speakerNames['speaker-1'], 'ពិធីករ');
     assert.equal(burnRequest.useTranslation, true);
+    await act(async () => { burnDialog.querySelector('#export-project-close-btn').click(); });
 
     const sendTtsBtn = dom.container.querySelector('#subtitle-send-tts-btn');
     await act(async () => { sendTtsBtn.click(); });
@@ -573,7 +616,11 @@ test('mounted Studio handles speaker ON/OFF, audio-only burn guard, playback syn
     assert.equal(transcribeCalls.at(-1).diarize, false);
     assert.equal(subPanel.querySelector('.subtitle-roster'), null);
     assert.equal(subPanel.querySelector('.subtitle-speaker-badge'), null);
-    assert.equal(subPanel.querySelector('#subtitle-burn-btn').disabled || subPanel.querySelector('#subtitle-burn-btn').hasAttribute('disabled'), true);
+    await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+    const audioOnlyDialog = subPanel.querySelector('#export-project-dialog');
+    const audioOnlyBurnBtn = audioOnlyDialog.querySelector('#export-preset-btn-video_burned_mp4');
+    assert.equal(audioOnlyBurnBtn.disabled || audioOnlyBurnBtn.hasAttribute('disabled'), true);
+    await act(async () => { audioOnlyDialog.querySelector('#export-project-close-btn').click(); });
 
     // Playback sync highlights matching active cue row
     const videoEl = subPanel.querySelector('video');
@@ -762,8 +809,11 @@ test('mounted Studio handles speaker ON/OFF, audio-only burn guard, playback syn
       fileInput.dispatchEvent({ type: 'change', bubbles: true });
     });
     await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
-    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+    const soloDialog = subPanel.querySelector('#export-project-dialog');
+    await act(async () => { soloDialog.querySelector('#export-preset-btn-video_burned_mp4').click(); });
     assert.equal(capturedBurnIncludeSpeaker, false);
+    await act(async () => { soloDialog.querySelector('#export-project-close-btn').click(); });
 
     // 9. Find & replace live match count + safe $ replacement + left-nudge duration preservation
     if (!subPanel.querySelector('#subtitle-find-input')) {
@@ -845,9 +895,14 @@ test('mounted Studio handles speaker ON/OFF, audio-only burn guard, playback syn
       soloRosterInput._value = 'អ្នកអត្ថាធិប្បាយ';
       soloRosterInput.dispatchEvent({ type: 'input', bubbles: true, target: soloRosterInput });
     });
-    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+    const rosterBurnDialog = subPanel.querySelector('#export-project-dialog');
+    const includeSpeakerBox = rosterBurnDialog.querySelector('#export-include-speaker');
+    assert.equal(includeSpeakerBox.checked, true);
+    await act(async () => { rosterBurnDialog.querySelector('#export-preset-btn-video_burned_mp4').click(); });
     assert.equal(soloBurnPayload.includeSpeaker, true);
     assert.equal(soloBurnPayload.speakerNames['speaker-1'], 'អ្នកអត្ថាធិប្បាយ');
+    await act(async () => { rosterBurnDialog.querySelector('#export-project-close-btn').click(); });
 
     await act(async () => {
       showSpeakerToggle.checked = false;
@@ -917,14 +972,15 @@ test('mounted Studio handles speaker ON/OFF, audio-only burn guard, playback syn
       return origCreateObjectURL(blob);
     };
     try {
-      for (const label of ['Download .srt', 'Download .vtt', 'Download .txt']) {
-        const btn = subPanel.querySelectorAll('button').find(b => b.textContent.includes(label));
-        await act(async () => { btn.click(); });
+      await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+      const emptyExportDlg = subPanel.querySelector('#export-project-dialog');
+      for (const presetId of ['subtitle_srt', 'subtitle_vtt', 'subtitle_txt']) {
+        const btn = emptyExportDlg.querySelector(`#export-preset-btn-${presetId}`);
+        assert.equal(Boolean(btn.disabled || btn.hasAttribute('disabled')), true);
         assert.equal(exportBlobCalls, 0);
-        const statusEl = subPanel.querySelector('.status');
-        assert.ok(statusEl.className.includes('is-error'));
-        assert.match(statusEl.textContent, /No subtitle text to export/);
       }
+      assert.match(emptyExportDlg.textContent, /Add or transcribe at least one subtitle cue before exporting/);
+      await act(async () => { emptyExportDlg.querySelector('#export-project-close-btn').click(); });
       const copyBtn = subPanel.querySelectorAll('button').find(b => b.getAttribute('aria-label') === 'Copy dialogue');
       await act(async () => { copyBtn.click(); });
       const copyStatusEl = subPanel.querySelector('.status');
@@ -990,9 +1046,12 @@ test('mounted Studio handles speaker ON/OFF, audio-only burn guard, playback syn
       pEndInput.dispatchEvent({ type: 'input', bubbles: true, target: pEndInput });
     });
     await act(async () => { pEndInput.blur(); });
-    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+    const precisionDialog = subPanel.querySelector('#export-project-dialog');
+    await act(async () => { precisionDialog.querySelector('#export-preset-btn-video_burned_mp4').click(); });
     assert.equal(precisionBurnPayload.segments[0].start, 0.123);
     assert.equal(precisionBurnPayload.segments[0].end, 2.7);
+    await act(async () => { precisionDialog.querySelector('#export-project-close-btn').click(); });
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();
@@ -1133,8 +1192,15 @@ test('VideoSubtitleWorkspace polls while offline, clears offline state on action
     assert.equal(createdVtts.length, 1);
 
     const textarea = dom.container.querySelector('.subtitle-line-input');
-    const burnBtn = dom.container.querySelector('#subtitle-burn-btn');
-    assert.equal(burnBtn.disabled || burnBtn.hasAttribute('disabled'), false);
+    const isBurnDisabledInModal = async () => {
+      await act(async () => { dom.container.querySelector('#subtitle-export-project-btn').click(); });
+      const dlg = dom.container.querySelector('#export-project-dialog');
+      const btn = dlg.querySelector('#export-preset-btn-video_burned_mp4');
+      const disabled = Boolean(btn.disabled || btn.hasAttribute('disabled'));
+      await act(async () => { dlg.querySelector('#export-project-close-btn').click(); });
+      return disabled;
+    };
+    assert.equal(await isBurnDisabledInModal(), false);
 
     // Rapid edits within 200ms do NOT regenerate VTT synchronously on every keystroke
     await act(async () => {
@@ -1158,20 +1224,20 @@ test('VideoSubtitleWorkspace polls while offline, clears offline state on action
     const latestVttText = await createdVtts[1].blob.text();
     assert.match(latestVttText, /Edited two/);
 
-    // Clearing text to whitespace immediately removes <track> and disables #subtitle-burn-btn
+    // Clearing text to whitespace immediately removes <track> and disables burned MP4 preset
     await act(async () => {
       textarea._value = '   \n  ';
       textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
     });
     assert.equal(dom.container.querySelector('track'), null);
-    assert.equal(burnBtn.disabled || burnBtn.hasAttribute('disabled'), true);
+    assert.equal(await isBurnDisabledInModal(), true);
 
-    // Restoring text re-enables #subtitle-burn-btn and restores <track> with mode === 'showing'
+    // Restoring text re-enables burned MP4 preset and restores <track> with mode === 'showing'
     await act(async () => {
       textarea._value = 'Restored caption';
       textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
     });
-    assert.equal(burnBtn.disabled || burnBtn.hasAttribute('disabled'), false);
+    assert.equal(await isBurnDisabledInModal(), false);
     const restoredTrack = dom.container.querySelector('track');
     assert.ok(restoredTrack);
     assert.equal(restoredTrack.track.mode, 'showing');
@@ -1199,18 +1265,21 @@ test('VideoSubtitleWorkspace polls while offline, clears offline state on action
 
     const origBurn = services.mediaSubtitleGateway.burnSubtitles;
     services.mediaSubtitleGateway.burnSubtitles = async () => { throw new Error('502'); };
+    await act(async () => { dom.container.querySelector('#subtitle-export-project-btn').click(); });
+    const burnCheckDialog = dom.container.querySelector('#export-project-dialog');
     await act(async () => {
-      burnBtn.click();
+      burnCheckDialog.querySelector('#export-preset-btn-video_burned_mp4').click();
       await new Promise(r => setTimeout(r, 15));
     });
     assert.ok(dom.container.querySelector('.engine-alert-popup'));
 
     services.mediaSubtitleGateway.burnSubtitles = origBurn;
     await act(async () => {
-      burnBtn.click();
+      burnCheckDialog.querySelector('#export-preset-btn-video_burned_mp4').click();
       await new Promise(r => setTimeout(r, 15));
     });
     assert.equal(dom.container.querySelector('.engine-alert-popup'), null);
+    await act(async () => { burnCheckDialog.querySelector('#export-project-close-btn').click(); });
 
     // 4. Active <track> src URL is NOT revoked prematurely while still displayed; previous VTT URLs ARE revoked
     const activeTrackSrc = dom.container.querySelector('track').getAttribute('src');
@@ -1402,10 +1471,13 @@ test('clearing the only Khmer translation textarea keeps translation mode sticky
       textarea._value = '';
       textarea.dispatchEvent({ type: 'input', bubbles: true, target: textarea });
     });
-    await act(async () => { subPanel.querySelector('#subtitle-burn-btn').click(); });
+    await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
+    const clearedBurnDialog = subPanel.querySelector('#export-project-dialog');
+    await act(async () => { clearedBurnDialog.querySelector('#export-preset-btn-video_burned_mp4').click(); });
     assert.equal(capturedBurn.useTranslation, true);
     assert.equal(capturedBurn.segments[0].text, 'Good evening.');
     assert.equal(capturedBurn.segments[0].translatedText, '');
+    await act(async () => { clearedBurnDialog.querySelector('#export-project-close-btn').click(); });
 
     // Re-extracting without translation resets sticky hasTranslation to false
     returnTranslation = false;
@@ -1940,7 +2012,7 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
     assert.match(outputCard.textContent, /Selected voiceover · 2 frames/);
     assert.match(outputCard.textContent, /Sovath/);
     assert.match(outputCard.textContent, /0\.2s gap/);
-    assert.ok(outputCard.querySelector('#subtitle-download-voice-btn'));
+    assert.ok(outputCard.querySelector('#subtitle-voice-export-btn'));
 
     // 4b. Gap selector defaults to 0.2s (200ms) and dynamically re-stitches the combined WAV without re-synthesizing
     const gapSelect = subPanel.querySelector('#subtitle-tts-gap');
@@ -1969,16 +2041,14 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
     const durationAt1000ms = readWavDurationSeconds(await blobByUrl.get(urlAt1000ms).arrayBuffer());
     assert.ok(Math.abs(durationAt1000ms - (0.14 + 1.0 + 0.14)) < 0.001, `Expected 1.28s at 1000ms gap, got ${durationAt1000ms}`);
 
-    // 4c. Dubbed MP4 export controls inside #subtitle-voice-output: select Original audio mode, export <stem>-dubbed.mp4, and surface error toast on failure
-    const dubModeSelect = updatedOutput.querySelector('#subtitle-dub-audio-mode');
-    const dubBtn = updatedOutput.querySelector('#subtitle-export-dub-btn');
+    // 4c. Dubbed MP4 export controls inside consolidated ExportProjectModal: select Mute original mode, export <stem>-dubbed.mp4, and surface error inside modal on failure
+    await act(async () => { updatedOutput.querySelector('#subtitle-voice-export-btn').click(); });
+    const dubDialog = subPanel.querySelector('#export-project-dialog');
+    const dubModeSelect = dubDialog.querySelector('#export-dub-audio-mode');
+    const dubBtn = dubDialog.querySelector('#export-preset-btn-video_dubbed_mp4');
     assert.ok(dubModeSelect);
     assert.ok(dubBtn);
     assert.equal(dubModeSelect.value, 'duck');
-    assert.deepEqual(
-      dubModeSelect.querySelectorAll('option').map(opt => opt.textContent),
-      ['Duck (-16 dB)', 'Mute original', 'Keep original']
-    );
     assert.equal(dubBtn.disabled || dubBtn.hasAttribute('disabled'), false);
 
     await act(async () => {
@@ -2000,10 +2070,11 @@ test('mounted Studio supports per-frame and multi-selected subtitle Text-to-Spee
 
     shouldFailDub = true;
     await act(async () => {
-      subPanel.querySelector('#subtitle-export-dub-btn').click();
+      dubDialog.querySelector('#export-preset-btn-video_dubbed_mp4').click();
       await new Promise(r => setTimeout(r, 20));
     });
     assert.match(dom.container.querySelector('#studio-toast-region').textContent, /FFmpeg dubbing failed on server/);
+    await act(async () => { dubDialog.querySelector('#export-project-close-btn').click(); });
     shouldFailDub = false;
 
     // 5. Send selected to TTS sends ONLY selected frames (#1 and #3), skipping unselected #2
@@ -2333,8 +2404,11 @@ test('mounted VideoSubtitleWorkspace autosaves subtitle changes and restores on 
     assert.match(dom.container.querySelector('#subtitle-extract-btn').textContent, /Link video for burn-in/);
     await act(async () => { dom.container.querySelector('#subtitle-extract-btn').click(); });
     assert.equal(dom.container.querySelector('.subtitle-line-input').value, 'Updated subtitle text');
-    const burnButton = dom.container.querySelector('#subtitle-burn-btn');
+    await act(async () => { dom.container.querySelector('#subtitle-export-project-btn').click(); });
+    const relinkBurnDlg = dom.container.querySelector('#export-project-dialog');
+    const burnButton = relinkBurnDlg.querySelector('#export-preset-btn-video_burned_mp4');
     assert.equal(burnButton.disabled || burnButton.hasAttribute('disabled'), false);
+    await act(async () => { relinkBurnDlg.querySelector('#export-project-close-btn').click(); });
 
   } finally {
     await act(async () => { root?.unmount(); });
@@ -2499,8 +2573,11 @@ test('mounted subtitle import translates cues and generates per-frame voice with
       await new Promise(resolve => setTimeout(resolve, 0));
     });
     assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 2);
-    const burnButton = dom.container.querySelector('#subtitle-burn-btn');
+    await act(async () => { dom.container.querySelector('#subtitle-export-project-btn').click(); });
+    const importExportDlg = dom.container.querySelector('#export-project-dialog');
+    const burnButton = importExportDlg.querySelector('#export-preset-btn-video_burned_mp4');
     assert.equal(burnButton.disabled || burnButton.hasAttribute('disabled'), true);
+    await act(async () => { importExportDlg.querySelector('#export-project-close-btn').click(); });
     assert.ok(notices.some(notice => notice.title === 'Subtitles imported'));
 
     const sourceLanguage = dom.container.querySelector('#subtitle-source-lang');
@@ -2523,9 +2600,12 @@ test('mounted subtitle import translates cues and generates per-frame voice with
     assert.equal(voiceRequests.length, 1);
     assert.equal(voiceRequests[0].script, 'Translated: Hello there.');
     assert.ok(dom.container.querySelector('.subtitle-cue-audio-controls'));
-    const noJobDubBtn = dom.container.querySelector('#subtitle-export-dub-btn');
+    await act(async () => { dom.container.querySelector('#subtitle-voice-export-btn').click(); });
+    const noJobDlg = dom.container.querySelector('#export-project-dialog');
+    const noJobDubBtn = noJobDlg.querySelector('#export-preset-btn-video_dubbed_mp4');
     assert.ok(noJobDubBtn);
     assert.equal(noJobDubBtn.disabled || noJobDubBtn.hasAttribute('disabled'), true);
+    await act(async () => { noJobDlg.querySelector('#export-project-close-btn').click(); });
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();
@@ -2646,12 +2726,13 @@ test('mounted VideoSubtitleWorkspace detects R3-05 speech duration mismatches, b
     assert.ok(banner, 'Must display duration mismatch export banner');
     assert.match(banner.textContent, /Resolve 3 speech duration mismatches before final dub export/);
 
-    const dubBtn = dom.container.querySelector('#subtitle-export-dub-btn');
-    const alignedBtn = dom.container.querySelector('#subtitle-download-aligned-voice-btn');
-    const dockAlignedBtn = dom.container.querySelector('#subtitle-export-aligned-wav-btn');
+    await act(async () => { dom.container.querySelector('#subtitle-export-project-btn').click(); });
+    const blockedDialog = dom.container.querySelector('#export-project-dialog');
+    const dubBtn = blockedDialog.querySelector('#export-preset-btn-video_dubbed_mp4');
+    const alignedBtn = blockedDialog.querySelector('#export-preset-btn-subtitle_aligned_wav');
     assert.equal(Boolean(dubBtn.disabled || dubBtn.hasAttribute('disabled')), true);
     assert.equal(Boolean(alignedBtn.disabled || alignedBtn.hasAttribute('disabled')), true);
-    assert.equal(Boolean(dockAlignedBtn.disabled || dockAlignedBtn.hasAttribute('disabled')), true);
+    await act(async () => { blockedDialog.querySelector('#export-project-close-btn').click(); });
 
     const rows = dom.container.querySelectorAll('.subtitle-segment-row');
     assert.equal(rows.length, 3);
@@ -2703,16 +2784,18 @@ test('mounted VideoSubtitleWorkspace detects R3-05 speech duration mismatches, b
     assert.equal(dom.container.querySelector('.subtitle-mismatch-export-banner'), null);
     assert.ok(dom.container.querySelector('.is-clean'));
 
-    const readyDubBtn = dom.container.querySelector('#subtitle-export-dub-btn');
-    const readyDockAlignedBtn = dom.container.querySelector('#subtitle-export-aligned-wav-btn');
+    await act(async () => { dom.container.querySelector('#subtitle-voice-export-btn').click(); });
+    const readyDialog = dom.container.querySelector('#export-project-dialog');
+    const readyDubBtn = readyDialog.querySelector('#export-preset-btn-video_dubbed_mp4');
+    const readyAlignedBtn = readyDialog.querySelector('#export-preset-btn-subtitle_aligned_wav');
     assert.equal(Boolean(readyDubBtn.disabled || readyDubBtn.hasAttribute('disabled')), false);
-    assert.equal(Boolean(readyDockAlignedBtn.disabled || readyDockAlignedBtn.hasAttribute('disabled')), false);
+    assert.equal(Boolean(readyAlignedBtn.disabled || readyAlignedBtn.hasAttribute('disabled')), false);
 
     await act(async () => {
-      readyDockAlignedBtn.click();
+      readyAlignedBtn.click();
       await new Promise(r => setTimeout(r, 20));
     });
-    assert.equal(downloadedNames.includes('clip-selected-aligned-dub.wav'), true);
+    assert.equal(downloadedNames.includes('clip-time-aligned-dub.wav'), true);
 
     await act(async () => {
       readyDubBtn.click();
@@ -2723,6 +2806,7 @@ test('mounted VideoSubtitleWorkspace detects R3-05 speech duration mismatches, b
     assert.equal(dubCalls[0].clips[0].allowOverflow, true, 'Spill-approved Cue #1 must pass allowOverflow: true to /dub');
     assert.equal(dubCalls[0].clips[1].allowOverflow, undefined);
     assert.equal(dubCalls[0].clips[2].allowOverflow, undefined);
+    await act(async () => { readyDialog.querySelector('#export-project-close-btn').click(); });
     assert.equal(downloadedNames.includes('clip-dubbed.mp4'), true);
   } finally {
     URL.createObjectURL = origCreateObjectURL;
@@ -2863,6 +2947,435 @@ test('mounted VideoSubtitleWorkspace enforces transcribe duration bounds, revoke
     assert.equal(dom.container.querySelector('#subtitle-voice-output'), null, 'Fresh re-extract must reset prior voiceover clips');
     assert.equal(dom.container.querySelector('.subtitle-mismatch-export-banner'), null);
   } finally {
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace supports Undo/Redo across edits/split/merge/delete/timing, stale-translation remedies, and subtitle take switching', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  const origAudio = globalThis.Audio;
+  const playedUrls = [];
+  class FakeAudio {
+    constructor() { this.listeners = new Map(); this.currentTime = 0; this.src = ''; }
+    addEventListener(type, fn) { this.listeners.set(type, fn); }
+    pause() {}
+    play() { playedUrls.push(this.src); return Promise.resolve(); }
+  }
+  globalThis.Audio = FakeAudio;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    const assetsById = new Map();
+    let assetSeq = 0;
+    let takeSeq = 0;
+    const translateCalls = [];
+    const services = {
+      mediaSubtitleGateway: {
+        checkHealth: async () => ({ online: true, burnInSupported: true }),
+        transcribeVideo: async () => ({
+          jobId: 'job-ux201',
+          duration: 6.0,
+          language: 'en',
+          translatedLanguage: 'khm_Khmr',
+          isAudioOnly: false,
+          speakers: ['speaker-1'],
+          segments: [
+            { id: 'seg-1', start: 0.0, end: 2.0, speakerId: 'speaker-1', text: 'First line.', translatedText: 'បន្ទាត់ទី១។' },
+            { id: 'seg-2', start: 2.2, end: 4.5, speakerId: 'speaker-1', text: 'Second line.', translatedText: 'បន្ទាត់ទី២។' },
+          ],
+        }),
+        translateSegments: async req => {
+          translateCalls.push(req);
+          return {
+            segments: req.segments.map(s => ({ ...s, translatedText: `បកប្រែ:${s.text}` })),
+          };
+        },
+      },
+      synthesizeSpeech: {
+        execute: async cmd => {
+          takeSeq += 1;
+          return {
+            recording: {
+              id: `take-${takeSeq}`,
+              characterId: cmd.character.id,
+              characterName: cmd.character.name,
+              transcript: cmd.script,
+              blob: createValidTestWavBlob(600),
+              audioDurationSeconds: 0.6,
+              seed: 10 + takeSeq,
+            },
+            uploadedFileData: null,
+          };
+        },
+      },
+      assetRepository: {
+        uploadAsset: async ({ bytes, fileName, mimeType }) => {
+          assetSeq += 1;
+          const id = `00000000-0000-4000-8000-${String(assetSeq).padStart(12, '0')}`;
+          const buf = new Uint8Array(await bytes.arrayBuffer());
+          assetsById.set(id, { id, bytes: buf, fileName, mimeType });
+          return { asset: { id } };
+        },
+        getAssetBinary: async id => assetsById.get(id) || null,
+      },
+      logger: { debug() {}, warn() {}, error() {} },
+    };
+
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(VideoSubtitleWorkspace, { notices: null })));
+      await new Promise(r => setTimeout(r, 0));
+    });
+
+    const fileInput = dom.container.querySelector('#subtitle-video-input');
+    await act(async () => {
+      fileInput.files = [new File(['mp4'], 'ux201.mp4', { type: 'video/mp4' })];
+      fileInput.dispatchEvent({ type: 'change', bubbles: true });
+    });
+    await act(async () => {
+      dom.container.querySelector('#subtitle-extract-btn').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+
+    const undoBtn = () => dom.container.querySelector('#subtitle-undo-btn');
+    const redoBtn = () => dom.container.querySelector('#subtitle-redo-btn');
+    const isDisabled = el => Boolean(el?.disabled || el?.hasAttribute?.('disabled'));
+    assert.equal(isDisabled(undoBtn()), true);
+    assert.equal(isDisabled(redoBtn()), true);
+
+    // Switch preview to Original so source edits are visible, then edit Cue #1 source text
+    const previewSelect = dom.container.querySelectorAll('select')
+      .find(el => el.getAttribute('aria-label') === 'Preview language');
+    await act(async () => {
+      previewSelect._value = 'original';
+      previewSelect.dispatchEvent({ type: 'change', bubbles: true, target: previewSelect });
+    });
+
+    const getRow = idx => dom.container.querySelectorAll('.subtitle-segment-row')[idx];
+    const editTextarea = (row, nextVal) => {
+      const ta = row.querySelector('.subtitle-line-input');
+      ta._value = nextVal;
+      ta.dispatchEvent({ type: 'input', bubbles: true, target: ta });
+      ta.blur();
+    };
+
+    await act(async () => { editTextarea(getRow(0), 'First line edited.'); });
+    assert.equal(isDisabled(undoBtn()), false);
+
+    // 1. Stale translation warning appears with Re-translate and Keep translation buttons
+    assert.ok(getRow(0).textContent.includes('Source text changed since translation.'));
+    const keepBtn = getRow(0).querySelectorAll('.subtitle-validation-fix-btn')
+      .find(b => b.getAttribute('data-remedy-action') === 'dismiss_stale_translation');
+    assert.ok(keepBtn);
+    await act(async () => { keepBtn.click(); });
+    assert.equal(getRow(0).textContent.includes('Source text changed since translation.'), false);
+
+    // Edit again -> switch to Bilingual so stale pill stays visible -> empty retranslate must not wipe translation -> valid retranslate + immediate Undo restores stale flag
+    await act(async () => { editTextarea(getRow(0), 'First line final.'); });
+    await act(async () => {
+      previewSelect._value = 'bilingual';
+      previewSelect.dispatchEvent({ type: 'change', bubbles: true, target: previewSelect });
+    });
+    assert.ok(getRow(0).textContent.includes('Source text changed since translation.'));
+    const origTranslateSegs = services.mediaSubtitleGateway.translateSegments;
+    services.mediaSubtitleGateway.translateSegments = async () => ({ segments: [{ id: 'seg-1', translatedText: '' }] });
+    await act(async () => {
+      getRow(0).querySelectorAll('.subtitle-validation-fix-btn')
+        .find(b => b.getAttribute('data-remedy-action') === 'retranslate_segment').click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(getRow(0).querySelector('.subtitle-line-input').value, 'បន្ទាត់ទី១។', 'Empty retranslate must preserve prior translation');
+    assert.ok(getRow(0).textContent.includes('Source text changed since translation.'));
+
+    services.mediaSubtitleGateway.translateSegments = origTranslateSegs;
+    const retranslateBtn = getRow(0).querySelectorAll('.subtitle-validation-fix-btn')
+      .find(b => b.getAttribute('data-remedy-action') === 'retranslate_segment');
+    assert.ok(retranslateBtn);
+    await act(async () => {
+      retranslateBtn.click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(translateCalls.length, 1);
+    assert.equal(translateCalls[0].segments.length, 1);
+    assert.equal(translateCalls[0].segments[0].id, 'seg-1');
+    assert.equal(getRow(0).textContent.includes('Source text changed since translation.'), false);
+    assert.equal(getRow(0).querySelector('.subtitle-line-input').value, 'បកប្រែ:First line final.');
+
+    await act(async () => {
+      globalThis.document.dispatchEvent({ type: 'keydown', key: 'z', metaKey: true, bubbles: true, target: globalThis.document.body });
+    });
+    assert.ok(getRow(0).textContent.includes('Source text changed since translation.'), 'Undo after retranslate must restore stale warning');
+    assert.equal(getRow(0).querySelector('.subtitle-line-input').value, 'បន្ទាត់ទី១។');
+    await act(async () => { redoBtn().click(); });
+    assert.equal(getRow(0).textContent.includes('Source text changed since translation.'), false);
+    assert.equal(getRow(0).querySelector('.subtitle-line-input').value, 'បកប្រែ:First line final.');
+    await act(async () => {
+      previewSelect._value = 'original';
+      previewSelect.dispatchEvent({ type: 'change', bubbles: true, target: previewSelect });
+    });
+
+    // 2. Subtitle take-switcher UI: generate Take 1 and Take 2 on Cue #1, switch back to Take 1, play Take 2, delete Take 2
+    const getGenerateVoiceBtn = row => row.querySelector('.subtitle-cue-voice-btn');
+    await act(async () => {
+      getGenerateVoiceBtn(getRow(0)).click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(getRow(0).querySelector('.subtitle-takes-tray'), null, '1 take should not render multi-take tray');
+
+    const voiceSelect = dom.container.querySelector('#subtitle-tts-voice');
+    const secondVoice = BUILT_IN_VOICES[1]?.id || BUILT_IN_VOICES[0].id;
+    await act(async () => {
+      voiceSelect._value = secondVoice;
+      voiceSelect.dispatchEvent({ type: 'change', bubbles: true, target: voiceSelect });
+    });
+    await act(async () => {
+      getGenerateVoiceBtn(getRow(0)).click();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    const tray = getRow(0).querySelector('.subtitle-takes-tray');
+    assert.ok(tray, '2 takes must render subtitle take switcher tray');
+    assert.ok(tray.textContent.includes('Takes (2):'));
+    const chips = tray.querySelectorAll('.segment-take-chip');
+    assert.equal(chips.length, 2);
+    assert.ok(chips[1].textContent.includes('Active'));
+
+    // Click Take 1 chip to switch active take back to Take 1
+    await act(async () => {
+      chips[0].click();
+      await new Promise(r => setTimeout(r, 10));
+    });
+    const chipsAfterSwitch = getRow(0).querySelectorAll('.segment-take-chip');
+    assert.ok(chipsAfterSwitch[0].textContent.includes('Active'));
+    assert.equal(chipsAfterSwitch[1].textContent.includes('Active'), false);
+
+    // Play Take 2 directly from chip play button
+    const playTake2Btn = chipsAfterSwitch[1].querySelector('.segment-take-play-btn');
+    await act(async () => {
+      playTake2Btn.click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(playedUrls.length, 1);
+
+    // 3. Split, Merge, Timing Nudge, Delete -> Undo & Redo (preserving Cue #1 takes!)
+    await act(async () => {
+      const splitBtn = getRow(0).querySelectorAll('.subtitle-cue-btn').find(b => b.textContent.includes('Split'));
+      splitBtn.click();
+    });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 3);
+
+    await act(async () => { undoBtn().click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 2);
+    assert.ok(getRow(0).querySelector('.subtitle-takes-tray'), 'Undo split must keep live takes on Cue #1');
+
+    await act(async () => {
+      const mergeBtn = getRow(0).querySelectorAll('.subtitle-cue-btn').find(b => b.textContent.includes('Merge'));
+      mergeBtn.click();
+    });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 1);
+    await act(async () => { undoBtn().click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 2);
+
+    // Timing nudge +0.2s then Ctrl+Z undo & Ctrl+Shift+Z redo
+    const timeBtn = getRow(0).querySelectorAll('.subtitle-cue-btn').find(b => b.textContent.includes('Time'));
+    await act(async () => { timeBtn.click(); });
+    const nudgePlus = getRow(0).querySelectorAll('.subtitle-nudge-btn').find(b => b.textContent === '+0.2s');
+    await act(async () => { nudgePlus.click(); });
+    assert.equal(getRow(0).querySelectorAll('.subtitle-timing-input')[0].value, '00:00.2');
+
+    const cueList = dom.container.querySelector('.subtitle-cue-list');
+    await act(async () => {
+      cueList.dispatchEvent({ type: 'keydown', key: 'z', ctrlKey: true, shiftKey: false, bubbles: true });
+    });
+    assert.equal(getRow(0).querySelectorAll('.subtitle-timing-input')[0].value, '00:00.0');
+    await act(async () => {
+      cueList.dispatchEvent({ type: 'keydown', key: 'z', ctrlKey: true, shiftKey: true, bubbles: true });
+    });
+    assert.equal(getRow(0).querySelectorAll('.subtitle-timing-input')[0].value, '00:00.2');
+
+    // Delete Cue #1 (which has 2 persisted takes) and Undo -> resurrects Cue #1 with its persisted takes!
+    const deleteCue1Btn = getRow(0).querySelector('.subtitle-cue-delete');
+    await act(async () => { deleteCue1Btn.click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 1);
+
+    await act(async () => {
+      undoBtn().click();
+      await new Promise(r => setTimeout(r, 15));
+    });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 2);
+    assert.ok(getRow(0).querySelector('.subtitle-takes-tray'), 'Undoing cue delete must restore persisted takes');
+    assert.equal(getRow(0).querySelectorAll('.segment-take-chip').length, 2);
+
+    // Delete Take 2 from tray -> returns to 1 take (tray hidden)
+    const delTake2Btn = getRow(0).querySelectorAll('.segment-take-delete-btn')[1];
+    await act(async () => { delTake2Btn.click(); });
+    assert.equal(getRow(0).querySelector('.subtitle-takes-tray'), null);
+    assert.ok(getRow(0).querySelector('.subtitle-cue-audio-controls'), 'Take 1 remains active after deleting Take 2');
+  } finally {
+    globalThis.Audio = origAudio;
+    await act(async () => { root?.unmount(); });
+    await vite.close();
+    dom.restore();
+  }
+});
+
+test('mounted VideoSubtitleWorkspace allows Undoing deletion of the last cue, skips Undo inside find/timing inputs, and hydrates uncached takes across mid-flight edits', async () => {
+  const dom = createDomShim();
+  const React = (await import('react')).default;
+  const { act } = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const vite = await createServer({
+    root: WEB_ROOT,
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+    appType: 'custom',
+    optimizeDeps: { noDiscovery: true },
+  });
+  let root;
+  const origAudio = globalThis.Audio;
+  const playedSources = [];
+  class FakeAudio {
+    constructor() { this.listeners = new Map(); this.currentTime = 0; this.src = ''; }
+    addEventListener(type, fn) { this.listeners.set(type, fn); }
+    pause() {}
+    play() { playedSources.push(this.src); return Promise.resolve(); }
+  }
+  globalThis.Audio = FakeAudio;
+  try {
+    const { StudioProvider } = await vite.ssrLoadModule('/src/presentation/StudioContext.jsx');
+    const { VideoSubtitleWorkspace } = await vite.ssrLoadModule('/src/presentation/components/VideoSubtitleWorkspace.jsx');
+
+    const asset1 = '11111111-1111-4111-8111-111111111111';
+    const asset2 = '22222222-2222-4222-8222-222222222222';
+    const wavBytes1 = new Uint8Array(await createValidTestWavBlob(500).arrayBuffer());
+    const wavBytes2 = new Uint8Array(await createValidTestWavBlob(700).arrayBuffer());
+    let resolveAsset1 = null;
+    const savedProject = {
+      id: 'proj-takes-reload',
+      kind: 'subtitle',
+      type: 'subtitles',
+      title: 'Saved Reload',
+      revision: 1,
+      payload: {
+        videoFileName: 'reload.mp4',
+        detectedLanguage: 'en',
+        hasTranslation: false,
+        segments: [
+          {
+            id: 'seg-only',
+            start: 0,
+            end: 2,
+            speakerId: 'speaker-1',
+            text: 'Saved cue.',
+            takes: [
+              { id: 't1', audioAssetId: asset1, duration: 0.5, isSelected: false, settings: { text: 'Saved cue.', voiceId: BUILT_IN_VOICES[0].id, characterName: BUILT_IN_VOICES[0].name } },
+              { id: 't2', audioAssetId: asset2, duration: 0.7, isSelected: true, settings: { text: 'Saved cue.', voiceId: BUILT_IN_VOICES[0].id, characterName: BUILT_IN_VOICES[0].name } },
+            ],
+          },
+        ],
+        subtitleOptions: { sourceLanguage: 'en', previewMode: 'original' },
+      },
+    };
+    const services = {
+      mediaSubtitleGateway: { checkHealth: async () => ({ online: true, burnInSupported: true }) },
+      projectRepository: {
+        listProjects: async () => ({ items: [savedProject] }),
+        getProject: async () => savedProject,
+        saveProject: async (_id, data) => ({ ...savedProject, ...data, revision: 2 }),
+      },
+      assetRepository: {
+        getAssetBinary: id => {
+          if (id === asset2) return Promise.resolve({ id, bytes: wavBytes2, mimeType: 'audio/wav' });
+          if (id === asset1) return new Promise(resolve => { resolveAsset1 = () => resolve({ id, bytes: wavBytes1, mimeType: 'audio/wav' }); });
+          return Promise.resolve(null);
+        },
+      },
+      logger: { debug() {}, warn() {}, error() {} },
+    };
+
+    const actionsRef = { current: null };
+    root = createRoot(dom.container);
+    await act(async () => {
+      root.render(React.createElement(StudioProvider, { services },
+        React.createElement(VideoSubtitleWorkspace, { notices: null, actionsRef, autoRestoreLatest: false })));
+      await new Promise(r => setTimeout(r, 10));
+    });
+    await act(async () => {
+      actionsRef.current.loadProject(savedProject);
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    // Active Take 2 hydrated immediately on project load
+    assert.ok(dom.container.querySelector('.subtitle-cue-audio-controls'), 'Active Take 2 must hydrate on load');
+
+    // Inner button Enter keydown on Take 1 play button must NOT switch active take
+    const playTake1Btn = dom.container.querySelectorAll('.segment-take-play-btn')[0];
+    await act(async () => {
+      playTake1Btn.dispatchEvent({ type: 'keydown', key: 'Enter', bubbles: true, target: playTake1Btn });
+    });
+    assert.ok(dom.container.querySelectorAll('.segment-take-chip')[1].textContent.includes('Active'));
+
+    // Switching to uncached Take 1 immediately clears stale Take 2 audio bar while Take 1 downloads,
+    // and deleting a take while its preview fetch is pending cancels delayed audio playback!
+    const playTake1ForRace = dom.container.querySelectorAll('.segment-take-play-btn')[0];
+    await act(async () => { playTake1ForRace.click(); });
+    const chip1 = dom.container.querySelectorAll('.segment-take-chip')[0];
+    await act(async () => { chip1.click(); });
+    assert.equal(dom.container.querySelector('.subtitle-cue-audio-controls'), null, 'Uncached take switch must clear stale active clip until hydrated');
+
+    // Editing cue text while Take 1 is still downloading must NOT cancel or drop Take 1 hydration!
+    const ta = dom.container.querySelector('.subtitle-line-input');
+    await act(async () => {
+      ta._value = 'Saved cue edited.';
+      ta.dispatchEvent({ type: 'input', bubbles: true, target: ta });
+      ta.blur();
+    });
+    await act(async () => {
+      resolveAsset1?.();
+      await new Promise(r => setTimeout(r, 20));
+    });
+    assert.equal(playedSources.length, 0, 'Cancelled pending take preview must not auto-play after take switch');
+    assert.ok(dom.container.querySelector('.subtitle-cue-audio-controls'), 'In-flight take hydration must complete even after concurrent cue edit');
+
+    // Ctrl+Z inside Find input or Timing input must NOT trigger subtitle cue Undo (via real .closest())
+    await act(async () => { dom.container.querySelector('#subtitle-find-toggle').click(); });
+    const findInput = dom.container.querySelector('#subtitle-find-input');
+    await act(async () => {
+      findInput.dispatchEvent({ type: 'keydown', key: 'z', ctrlKey: true, bubbles: true, target: findInput });
+    });
+    assert.equal(dom.container.querySelector('.subtitle-line-input').value, 'Saved cue edited.');
+
+    const timeBtn = dom.container.querySelectorAll('.subtitle-cue-btn').find(b => b.textContent.includes('Time'));
+    await act(async () => { timeBtn.click(); });
+    const timingInput = dom.container.querySelector('.subtitle-timing-input');
+    await act(async () => {
+      timingInput.dispatchEvent({ type: 'keydown', key: 'z', ctrlKey: true, bubbles: true, target: timingInput });
+    });
+    assert.equal(dom.container.querySelector('.subtitle-line-input').value, 'Saved cue edited.');
+
+    // Deleting the ONLY cue keeps Undo button and document Ctrl+Z working!
+    await act(async () => { dom.container.querySelector('.subtitle-cue-delete').click(); });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 0);
+    assert.ok(dom.container.querySelector('#subtitle-undo-btn'), 'Undo button must remain visible after deleting the last cue');
+
+    await act(async () => {
+      globalThis.document.dispatchEvent({ type: 'keydown', key: 'z', ctrlKey: true, bubbles: true, target: globalThis.document.body });
+    });
+    assert.equal(dom.container.querySelectorAll('.subtitle-segment-row').length, 1, 'Document Ctrl+Z must resurrect the last deleted cue');
+  } finally {
+    globalThis.Audio = origAudio;
     await act(async () => { root?.unmount(); });
     await vite.close();
     dom.restore();

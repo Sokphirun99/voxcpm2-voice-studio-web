@@ -31,3 +31,19 @@ test('expandKhmerNumbers expands Khmer-context currencies, percentages, time, te
   assert.equal(hasConvertibleKhmerNumbers('តម្លៃ ៥០០៛'), true);
   assert.equal(hasConvertibleKhmerNumbers('សួស្តីអ្នកទាំងអស់គ្នា'), false);
 });
+
+test('expandKhmerNumbers speaks valid DD/MM/YYYY and ISO dates as Khmer calendar dates', () => {
+  assert.equal(
+    expandKhmerNumbers('កិច្ចប្រជុំនៅថ្ងៃទី 23/11/2026'),
+    'កិច្ចប្រជុំនៅថ្ងៃទី ម្ភៃបី ខែវិច្ឆិកា ឆ្នាំពីរពាន់ម្ភៃប្រាំមួយ',
+  );
+  assert.equal(
+    expandKhmerNumbers('ថ្ងៃបង្កើត 2024-02-29'),
+    'ថ្ងៃបង្កើត ថ្ងៃទីម្ភៃប្រាំបួន ខែកុម្ភៈ ឆ្នាំពីរពាន់ម្ភៃបួន',
+  );
+  assert.equal(expandKhmerNumbers('ថ្ងៃ 31/02/2025'), 'ថ្ងៃ 31/02/2025');
+});
+
+test('expandKhmerNumbers separates acronym version digits but preserves mixed-case product names', () => {
+  assert.equal(expandKhmerNumbers('ប្រើ GPT-6.2 និង AI2026 ជាមួយ VoxCPM2'), 'ប្រើ GPT ប្រាំមួយចុចពីរ និង AI ពីរពាន់ម្ភៃប្រាំមួយ ជាមួយ VoxCPM2');
+});

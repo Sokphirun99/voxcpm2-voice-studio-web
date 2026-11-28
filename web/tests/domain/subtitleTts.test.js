@@ -7,6 +7,7 @@ import {
   SUBTITLE_VOICEOVER_GAP_OPTIONS,
   SUBTITLE_VOICEOVER_PAUSE_MS,
   assembleTimelineAlignedVoiceover,
+  attachSubtitleClipTake,
   buildCombinedVoiceoverBlob,
   buildDubDownloadFilename,
   buildDubExportClips,
@@ -14,12 +15,17 @@ import {
   buildSubtitleSynthesisCommand,
   buildTimeAlignedDubDownloadFilename,
   buildVoiceoverDownloadFilename,
+  clearSubtitleSegmentTakes,
+  deleteSubtitleSegmentTake,
+  extractActiveSubtitleTakeSpec,
+  extractSubtitleTakeSpec,
   formatSubtitleVoiceoverGapLabel,
   isKhmerScriptText,
   normalizeDubAudioMode,
   normalizeSubtitleVoiceoverGapMs,
   resolveSubtitleSpeechText,
   selectOrderedSegments,
+  selectSubtitleSegmentTake,
 } from '../../src/domain/subtitleTts.js';
 import { inspectWavBuffer, readWavDurationSeconds } from '../../src/domain/wavCodec.js';
 
@@ -502,4 +508,72 @@ test('assembleTimelineAlignedVoiceover honors spill approvals on real speech WAV
   assert.ok(aligned.blob);
   assert.equal(aligned.mismatches.length, 0, 'Padded WAV must not invalidate spill approval after silence trimming');
   assert.equal(aligned.warnings.length, 0, '3ms rounding excess must not emit spurious clamping warning');
+});
+
+test('attachSubtitleClipTake, selectSubtitleSegmentTake, and deleteSubtitleSegmentTake manage persisted subtitle takes cleanly', () => {
+  const asset1 = '11111111-1111-4111-8111-111111111111';
+  const asset2 = '22222222-2222-4222-8222-222222222222';
+  let segs = [{ id: 'cue-1', start: 0, end: 2, text: 'Hello' }];
+
+  segs = attachSubtitleClipTake(segs, 'cue-1', {
+    takeId: 'take-1',
+    audioAssetId: asset1,
+    text: 'Hello',
+    characterId: 'char-a',
+    characterName: 'Voice A',
+    durationSeconds: 1.1,
+  });
+  segs = attachSubtitleClipTake(segs, 'cue-1', {
+    takeId: 'take-2',
+    audioAssetId: asset2,
+    text: 'Hello',
+    characterId: 'char-b',
+    characterName: 'Voice B',
+    durationSeconds: 1.4,
+  });
+
+  assert.equal(segs[0].takes.length, 2);
+  assert.equal(extractActiveSubtitleTakeSpec(segs[0]).takeId, 'take-2');
+  assert.equal(extractSubtitleTakeSpec(segs[0], 'take-1').audioAssetId, asset1);
+
+  // Switch active take back to take-1
+  segs = selectSubtitleSegmentTake(segs, 'cue-1', 'take-1');
+  assert.equal(extractActiveSubtitleTakeSpec(segs[0]).takeId, 'take-1');
+  assert.equal(segs[0].voiceId, 'char-a');
+  assert.equal(selectSubtitleSegmentTake(segs, 'cue-1', 'take-1'), segs);
+
+  // Deleting active take promotes remaining take-2
+  segs = deleteSubtitleSegmentTake(segs, 'cue-1', 'take-1');
+  assert.equal(segs[0].takes.length, 1);
+  assert.equal(extractActiveSubtitleTakeSpec(segs[0]).takeId, 'take-2');
+  assert.equal(segs[0].voiceId, 'char-b');
+
+  // Deleting last take resets status to draft
+  segs = deleteSubtitleSegmentTake(segs, 'cue-1', 'take-2');
+  assert.equal(segs[0].takes.length, 0);
+  assert.equal(segs[0].status, 'draft');
+
+  // Clear takes helper clears all takes
+  segs = attachSubtitleClipTake(segs, 'cue-1', { takeId: 'take-3', audioAssetId: asset1, text: 'Hello', characterId: 'char-a' });
+  segs = clearSubtitleSegmentTakes(segs, 'cue-1');
+  assert.equal(segs[0].takes.length, 0);
+});
+
+test('attachSubtitleClipTake generates distinct fallback take IDs within the same millisecond', () => {
+  const asset1 = '11111111-1111-4111-8111-111111111111';
+  const asset2 = '22222222-2222-4222-8222-222222222222';
+  const origNow = Date.now;
+  Date.now = () => 1700000000000;
+  try {
+    let segs = [{ id: 'cue-1', start: 0, end: 2, text: 'Hello' }];
+    segs = attachSubtitleClipTake(segs, 'cue-1', { audioAssetId: asset1, text: 'Hello', characterId: 'char-a' });
+    segs = attachSubtitleClipTake(segs, 'cue-1', { audioAssetId: asset2, text: 'Hello', characterId: 'char-b' });
+    assert.equal(segs[0].takes.length, 2);
+    assert.notEqual(segs[0].takes[0].id, segs[0].takes[1].id);
+    segs = deleteSubtitleSegmentTake(segs, 'cue-1', segs[0].takes[0].id);
+    assert.equal(segs[0].takes.length, 1);
+    assert.equal(segs[0].takes[0].audioAssetId, asset2);
+  } finally {
+    Date.now = origNow;
+  }
 });

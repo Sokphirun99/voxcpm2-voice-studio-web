@@ -359,3 +359,82 @@ test('SubtitleCueList renders all segments and highlights problem cues', async (
     assert.ok(html.includes('2 issues'));
   });
 });
+
+test('SubtitleSegmentRow renders stale_translation remedy buttons and SubtitleTakesTray when multiple takes exist', async () => {
+  await withViteSsr(async vite => {
+    const { SubtitleSegmentRow } = await vite.ssrLoadModule('/src/presentation/components/SubtitleSegmentRow.jsx');
+    const { SUBTITLE_ISSUE_TYPES, REMEDY_ACTIONS, SUBTITLE_ISSUE_SEVERITIES } = await vite.ssrLoadModule('/src/domain/subtitles.js');
+
+    const singleTakeSeg = {
+      id: 'seg-single',
+      start: 0,
+      end: 2,
+      speakerId: 'speaker-1',
+      text: 'One take only',
+      takes: [
+        { id: 't1', audioAssetId: '11111111-1111-4111-8111-111111111111', duration: 1.0, isSelected: true, settings: { text: 'One take only', characterName: 'Nisa' } },
+        { id: 't-unpersisted', audioAssetId: null, duration: 1.0, isSelected: false, settings: { text: 'One take only', characterName: 'Nisa' } },
+      ],
+    };
+    const singleHtml = renderToStaticMarkup(
+      React.createElement(SubtitleSegmentRow, {
+        segment: singleTakeSeg,
+        speakers: ['speaker-1'],
+        speakerNames: {},
+        onUpdate() {},
+        onUpdateTiming() {},
+      })
+    );
+    assert.equal(singleHtml.includes('subtitle-takes-tray'), false, 'Single take should not render multi-take tray');
+
+    const multiTakeSeg = {
+      id: 'seg-multi',
+      start: 0,
+      end: 2,
+      speakerId: 'speaker-1',
+      text: 'Updated source text',
+      translatedText: 'អត្ថបទចាស់',
+      translatedFromText: 'Old source text',
+      translationStale: true,
+      takes: [
+        { id: 'take-1', audioAssetId: '11111111-1111-4111-8111-111111111111', duration: 1.1, isSelected: false, settings: { text: 'Old source text', characterName: 'Nisa' } },
+        { id: 'take-2', audioAssetId: '22222222-2222-4222-8222-222222222222', duration: 1.3, isSelected: true, settings: { text: 'Updated source text', characterName: 'Sovath' } },
+      ],
+    };
+    const staleIssues = [{
+      id: 'seg-multi-stale_translation',
+      segmentId: 'seg-multi',
+      type: SUBTITLE_ISSUE_TYPES.STALE_TRANSLATION,
+      severity: SUBTITLE_ISSUE_SEVERITIES.WARNING,
+      message: 'Source text changed since translation.',
+      remedyAction: REMEDY_ACTIONS.RETRANSLATE_SEGMENT,
+    }];
+    const multiHtml = renderToStaticMarkup(
+      React.createElement(SubtitleSegmentRow, {
+        segment: multiTakeSeg,
+        speakers: ['speaker-1'],
+        speakerNames: {},
+        validationIssues: staleIssues,
+        playingTakeId: 'take-1',
+        onUpdate() {},
+        onUpdateTiming() {},
+        onSelectTake() {},
+        onTogglePlayTake() {},
+        onDeleteTake() {},
+      })
+    );
+
+    assert.ok(multiHtml.includes('Source text changed since translation.'));
+    assert.ok(multiHtml.includes('data-remedy-action="retranslate_segment"'));
+    assert.ok(multiHtml.includes('data-remedy-action="dismiss_stale_translation"'));
+    assert.ok(multiHtml.includes('Re-translate'));
+    assert.ok(multiHtml.includes('Keep translation'));
+    assert.ok(multiHtml.includes('subtitle-takes-tray'));
+    assert.ok(multiHtml.includes('Takes (2):'));
+    assert.ok(multiHtml.includes('Take 1'));
+    assert.ok(multiHtml.includes('Take 2'));
+    assert.ok(multiHtml.includes('Active'));
+    assert.ok(multiHtml.includes('Outdated'));
+    assert.ok(multiHtml.includes('Stop Take 1'));
+  });
+});

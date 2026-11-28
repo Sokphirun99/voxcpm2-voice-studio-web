@@ -140,9 +140,9 @@ test('ModelsSetupWorkspace renders Offline (Cached Features Available) hero bann
 
     // Download specs and requirements are displayed
     assert.ok(html.includes('facebook/nllb-200-distilled-600M'));
-    assert.ok(html.includes('Requires Download (~2.4 GB)'));
+    assert.ok(html.includes('Download required (~2.4 GB)'));
     assert.ok(html.includes('seanghay/Qwen3-ASR-0.6B-Khmer'));
-    assert.ok(html.includes('Requires Download (~1.2 GB)'));
+    assert.ok(html.includes('Download required (~1.2 GB)'));
   });
 });
 

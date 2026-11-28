@@ -391,3 +391,32 @@ test('validateSubtitleSegments flags terminology spelling and translation gaps w
   assert.equal(c1Issues[1].remedyAction, REMEDY_ACTIONS.APPLY_TERMINOLOGY_TRANSLATION);
   assert.equal(report.issuesBySegmentId.c2, undefined);
 });
+
+test('validateSubtitleSegments flags stale_translation warnings and clears after dismissal or retranslation', () => {
+  const staleSeg = {
+    id: 'c1',
+    start: 0.0,
+    end: 2.0,
+    text: 'Updated English cue',
+    translatedText: 'អត្ថបទចាស់',
+    translatedFromText: 'Original English cue',
+    translationStale: true,
+  };
+  const cleanSeg = {
+    id: 'c2',
+    start: 2.1,
+    end: 4.0,
+    text: 'Unchanged cue',
+    translatedText: 'ឃ្លាមិនផ្លាស់ប្តូរ',
+    translatedFromText: 'Unchanged cue',
+  };
+
+  const report = validateSubtitleSegments({ segments: [staleSeg, cleanSeg], useTranslation: false });
+  assert.equal(report.isValid, false);
+  assert.equal(report.issuesBySegmentId.c1.length, 1);
+  assert.equal(report.issuesBySegmentId.c1[0].type, SUBTITLE_ISSUE_TYPES.STALE_TRANSLATION);
+  assert.equal(report.issuesBySegmentId.c1[0].severity, 'warning');
+  assert.equal(report.issuesBySegmentId.c1[0].remedyAction, REMEDY_ACTIONS.RETRANSLATE_SEGMENT);
+  assert.equal(report.issuesBySegmentId.c1[0].metadata.previousSourceText, 'Original English cue');
+  assert.equal(report.issuesBySegmentId.c2, undefined);
+});

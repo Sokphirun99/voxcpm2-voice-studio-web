@@ -391,30 +391,27 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
     });
     await act(async () => { subPanel.querySelector('#subtitle-extract-btn').click(); });
 
-    // 1. Generate voiceover clip and configure ducking + mixing sliders + embedded soft subtitles in SubtitleVoiceOutputCard
+    // 1. Generate voiceover clip, then open ExportProjectModal from SubtitleVoiceOutputCard to configure ducking + mixing sliders + embedded soft subtitles
     await act(async () => {
       subPanel.querySelector('.subtitle-cue-voice-btn').click();
       await new Promise(r => setTimeout(r, 20));
     });
     const voiceCard = subPanel.querySelector('#subtitle-voice-output');
     assert.ok(voiceCard);
+    await act(async () => { voiceCard.querySelector('#subtitle-voice-export-btn').click(); });
 
-    const subModeSelect = voiceCard.querySelector('#subtitle-dub-subtitle-mode');
-    const mixToggle = voiceCard.querySelector('#subtitle-dub-mix-toggle');
-    await act(async () => {
-      subModeSelect.value = 'soft';
-      subModeSelect.dispatchEvent({ type: 'change', bubbles: true, target: subModeSelect });
-      mixToggle.click();
-    });
-    assert.equal(voiceCard.querySelector('#subtitle-dub-mix-panel').hidden, false);
-
-    const origSlider = voiceCard.querySelector('#subtitle-mix-orig-volume');
-    const dubSlider = voiceCard.querySelector('#subtitle-mix-dub-volume');
-    const duckSlider = voiceCard.querySelector('#subtitle-mix-duck-volume');
-    const resetMixBtn = voiceCard.querySelector('#subtitle-mix-reset-btn');
+    const dialog = subPanel.querySelector('#export-project-dialog');
+    assert.ok(dialog);
+    const subModeSelect = dialog.querySelector('#export-dub-subtitle-mode');
+    const origSlider = dialog.querySelector('#export-orig-volume');
+    const dubSlider = dialog.querySelector('#export-dub-volume');
+    const duckSlider = dialog.querySelector('#export-duck-volume');
+    const resetMixBtn = dialog.querySelector('#export-reset-mix-btn');
     assert.equal(resetMixBtn.disabled || resetMixBtn.hasAttribute('disabled'), true);
 
     await act(async () => {
+      subModeSelect.value = 'soft';
+      subModeSelect.dispatchEvent({ type: 'change', bubbles: true, target: subModeSelect });
       origSlider._value = '0.8';
       origSlider.dispatchEvent({ type: 'input', bubbles: true, target: origSlider });
       dubSlider._value = '1.25';
@@ -423,10 +420,9 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
       duckSlider.dispatchEvent({ type: 'input', bubbles: true, target: duckSlider });
     });
     assert.equal(resetMixBtn.disabled || resetMixBtn.hasAttribute('disabled'), false);
-    assert.equal(voiceCard.querySelector('#subtitle-dub-audio-mode').options[0].textContent, 'Duck (-10 dB)');
 
     await act(async () => {
-      voiceCard.querySelector('#subtitle-export-dub-btn').click();
+      dialog.querySelector('#export-preset-btn-video_dubbed_mp4').click();
       await new Promise(r => setTimeout(r, 20));
     });
     assert.equal(dubCalls.length, 1);
@@ -436,28 +432,29 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
     assert.equal(dubCalls[0].subtitles.useTranslation, true);
     assert.equal(dubCalls[0].clips.length, 1);
     assert.equal(downloads.at(-1).filename, 'panel_talk-dubbed-captioned.mp4');
+    await act(async () => { dialog.querySelector('#export-project-close-btn').click(); });
 
-    // 2. Open ExportProjectModal: verify synced mix/subtitle draft, then switch to Original audio + Burned ASS
+    // 2. Reopen ExportProjectModal: verify synced mix/subtitle draft, then switch to Original audio + Burned ASS
     await act(async () => { subPanel.querySelector('#subtitle-export-project-btn').click(); });
-    const dialog = subPanel.querySelector('#export-project-dialog');
-    assert.equal(dialog.querySelector('#export-dub-subtitle-mode').value, 'soft');
-    assert.equal(dialog.querySelector('#export-duck-volume').value, '0.3');
+    const secondDialog = subPanel.querySelector('#export-project-dialog');
+    assert.equal(secondDialog.querySelector('#export-dub-subtitle-mode').value, 'soft');
+    assert.equal(secondDialog.querySelector('#export-duck-volume').value, '0.3');
 
-    const modalAudioSelect = dialog.querySelector('#export-dub-audio-mode');
-    const modalSubSelect = dialog.querySelector('#export-dub-subtitle-mode');
+    const modalAudioSelect = secondDialog.querySelector('#export-dub-audio-mode');
+    const modalSubSelect = secondDialog.querySelector('#export-dub-subtitle-mode');
     await act(async () => {
       modalAudioSelect.value = 'original';
       modalAudioSelect.dispatchEvent({ type: 'change', bubbles: true, target: modalAudioSelect });
       modalSubSelect.value = 'burned';
       modalSubSelect.dispatchEvent({ type: 'change', bubbles: true, target: modalSubSelect });
     });
-    assert.equal(dialog.querySelector('#export-dub-volume').disabled || dialog.querySelector('#export-dub-volume').hasAttribute('disabled'), true);
-    assert.equal(dialog.querySelector('#export-duck-volume').disabled || dialog.querySelector('#export-duck-volume').hasAttribute('disabled'), true);
-    assert.match(dialog.textContent, /Original audio \(80%\)/);
-    assert.match(dialog.textContent, /Burned-in ASS/);
+    assert.equal(secondDialog.querySelector('#export-dub-volume').disabled || secondDialog.querySelector('#export-dub-volume').hasAttribute('disabled'), true);
+    assert.equal(secondDialog.querySelector('#export-duck-volume').disabled || secondDialog.querySelector('#export-duck-volume').hasAttribute('disabled'), true);
+    assert.match(secondDialog.textContent, /Original audio \(80%\)/);
+    assert.match(secondDialog.textContent, /Burned-in ASS/);
 
     await act(async () => {
-      dialog.querySelector('#export-preset-btn-video_dubbed_mp4').click();
+      secondDialog.querySelector('#export-preset-btn-video_dubbed_mp4').click();
       await new Promise(r => setTimeout(r, 20));
     });
     assert.equal(dubCalls.length, 2);
@@ -466,8 +463,8 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
     assert.equal(dubCalls[1].audioLanguage, 'en');
     assert.deepEqual(dubCalls[1].clips, []);
     assert.equal(downloads.at(-1).filename, 'panel_talk-subtitled.mp4');
-    assert.match(dialog.querySelector('#export-history-list').textContent, /Audio: original · Subs: burned/);
-    await act(async () => { dialog.querySelector('#export-project-close-btn').click(); });
+    assert.match(secondDialog.querySelector('#export-history-list').textContent, /Audio: original · Subs: burned/);
+    await act(async () => { secondDialog.querySelector('#export-project-close-btn').click(); });
 
     // Wait for autosave and verify reopen preserves dubAudioMode, dubSubtitleMode, dubMixSettings, and exportHistory
     await act(async () => { await new Promise(r => setTimeout(r, 1650)); });
@@ -505,15 +502,16 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
       reopenedPanel.querySelector('.subtitle-cue-voice-btn').click();
       await new Promise(r => setTimeout(r, 20));
     });
-    const silentVoiceCard = reopenedPanel.querySelector('#subtitle-voice-output');
-    const silentAudioSelect = silentVoiceCard.querySelector('#subtitle-dub-audio-mode');
+    await act(async () => { reopenedPanel.querySelector('#subtitle-voice-export-btn').click(); });
+    const silentDialog = reopenedPanel.querySelector('#export-project-dialog');
+    const silentAudioSelect = silentDialog.querySelector('#export-dub-audio-mode');
     await act(async () => {
       silentAudioSelect.value = 'duck';
       silentAudioSelect.dispatchEvent({ type: 'change', bubbles: true, target: silentAudioSelect });
     });
-    const silentExportBtn = silentVoiceCard.querySelector('#subtitle-export-dub-btn');
+    const silentExportBtn = silentDialog.querySelector('#export-preset-btn-video_dubbed_mp4');
     assert.equal(silentExportBtn.disabled || silentExportBtn.hasAttribute('disabled'), true);
-    assert.match(silentExportBtn.getAttribute('title') || '', /no original audio track/i);
+    assert.match(silentDialog.textContent, /no original audio track/i);
 
     await act(async () => {
       silentAudioSelect.value = 'mute';
@@ -526,6 +524,7 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
     });
     assert.equal(dubCalls.length, 3);
     assert.equal(dubCalls[2].originalAudioMode, 'mute');
+    await act(async () => { silentDialog.querySelector('#export-project-close-btn').click(); });
 
     // 4. Rejected file upload (.exe) preserves existing cues + voiceover clips; HTTP 404 session expiry clears stale jobId into non-destructive relink recovery
     await act(async () => {
@@ -534,18 +533,27 @@ test('R3-09 mounted workflow: audio/subtitle modes, mixing/ducking sliders, orig
     });
     assert.ok(reopenedPanel.querySelector('#subtitle-voice-output'), 'rejected upload must not wipe generated voiceover clips');
 
+    await act(async () => { reopenedPanel.querySelector('#subtitle-voice-export-btn').click(); });
+    const expiredDialog = reopenedPanel.querySelector('#export-project-dialog');
     expireNextDub = true;
     await act(async () => {
-      silentExportBtn.click();
+      expiredDialog.querySelector('#export-preset-btn-video_dubbed_mp4').click();
       await new Promise(r => setTimeout(r, 20));
     });
-    assert.equal(silentExportBtn.disabled || silentExportBtn.hasAttribute('disabled'), true);
+    assert.equal(
+      expiredDialog.querySelector('#export-preset-btn-video_dubbed_mp4').disabled || expiredDialog.querySelector('#export-preset-btn-video_dubbed_mp4').hasAttribute('disabled'),
+      true
+    );
+    await act(async () => { expiredDialog.querySelector('#export-project-close-btn').click(); });
     assert.match(reopenedPanel.querySelector('#subtitle-extract-btn').textContent, /Link video for burn-in/);
     hasAudioStreamResponse = true;
     await act(async () => { reopenedPanel.querySelector('#subtitle-extract-btn').click(); });
     assert.equal(reopenedPanel.querySelector('.subtitle-line-input').value, 'Silent narration cue');
     assert.ok(reopenedPanel.querySelector('#subtitle-voice-output'), 'relinking after 404 session expiry must preserve voiceover clips');
-    assert.equal(silentExportBtn.disabled || silentExportBtn.hasAttribute('disabled'), false);
+    await act(async () => { reopenedPanel.querySelector('#subtitle-voice-export-btn').click(); });
+    const relinkedDialog = reopenedPanel.querySelector('#export-project-dialog');
+    const relinkedExportBtn = relinkedDialog.querySelector('#export-preset-btn-video_dubbed_mp4');
+    assert.equal(relinkedExportBtn.disabled || relinkedExportBtn.hasAttribute('disabled'), false);
   } finally {
     await act(async () => { root?.unmount(); });
     await vite.close();

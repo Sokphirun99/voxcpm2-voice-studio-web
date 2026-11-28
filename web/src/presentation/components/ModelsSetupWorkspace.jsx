@@ -39,7 +39,7 @@ function ModelsSetupToolbar({ loading, lastRefreshedAt, onRefresh }) {
           id="refresh-diagnostics-btn"
           className="button subtle-button refresh-diagnostics-btn"
           disabled={loading}
-          onClick={onRefresh}
+          onClick={() => onRefresh()}
           aria-label="Refresh diagnostics"
         >
           <Icon name="refresh" className={loading ? 'spinning' : ''} />
@@ -52,7 +52,6 @@ function ModelsSetupToolbar({ loading, lastRefreshedAt, onRefresh }) {
 
 function resolveHeroPillLabel(overall) {
   if (overall.status === 'offline_cached_available') return 'Offline (Cached Features Available)';
-  if (overall.isOfflineReady) return 'Offline Ready';
   if (overall.status === 'downloads_required') return 'Downloads Required';
   return 'Setup Required';
 }
@@ -79,7 +78,7 @@ function ReadinessHeroBanner({ overall }) {
       <div className="models-hero-body">
         <div className="models-hero-title-row">
           <strong id="readiness-label">{overall.label}</strong>
-          <span className={`status-pill status-${overall.status}`}>{pillLabel}</span>
+          {!isReady && <span className={`status-pill status-${overall.status}`}>{pillLabel}</span>}
         </div>
         <p id="readiness-description" className="models-hero-desc">{overall.description}</p>
       </div>
@@ -113,17 +112,16 @@ function InstructionsPanel({ instructions }) {
 
 function OfflineFeatureRow({ feature }) {
   const isReady = feature.isOfflineReady;
-  const statusLabel = isReady ? 'Cached (Offline Ready)' : `Requires Download (~${feature.approxSize})`;
+  const statusLabel = isReady ? 'Offline Ready' : `Download required (~${feature.approxSize})`;
   const statusClass = isReady ? 'ready' : 'downloads_required';
   return (
     <li className="instruction-item offline-feature-row">
       <div className="models-hero-title-row">
         <strong>{feature.name}</strong>
-        <span className={`status-pill status-${statusClass}`}>{isReady ? 'Offline Ready' : 'Download Required'}</span>
+        <span className={`status-pill status-${statusClass}`}>{statusLabel}</span>
       </div>
       <div className="card-meta">
         <span className="card-repo">{feature.repo}</span>
-        <span>{statusLabel}</span>
       </div>
       {!isReady && <p className="card-detail">{feature.firstUseRequirement}</p>}
     </li>
@@ -134,12 +132,12 @@ function OfflineBreakdownPanel({ offlineReadiness }) {
   const features = offlineReadiness?.features;
   if (!features || features.length === 0) return null;
   return (
-    <section className="diagnostics-instructions-panel offline-breakdown-panel" aria-label="Feature offline readiness">
+    <section className="models-section offline-breakdown-panel" aria-label="Feature offline readiness">
       <h2 className="section-title">
         <Icon name="cpu" />
         <span>Feature Offline Readiness</span>
       </h2>
-      <ul className="instructions-list">
+      <ul className="offline-feature-list">
         {features.map(feat => <OfflineFeatureRow key={feat.id} feature={feat} />)}
       </ul>
     </section>
@@ -243,7 +241,7 @@ function StorageMetricsCard({ storage }) {
 
 function ServicesSection({ services }) {
   return (
-    <section className="models-section" aria-label="Local backend services status">
+    <section className="models-section models-services" aria-label="Local backend services status">
       <h2 className="section-title">Local Backend Services</h2>
       <div className="services-grid">
         {services?.map(service => <ServiceCard key={service.id} service={service} />)}
@@ -277,8 +275,10 @@ function ModelsWorkspaceContent({ diagnostics, error }) {
       {error && <div className="models-error-alert" role="alert">{error}</div>}
       <ReadinessHeroBanner overall={heroOverall} />
       <InstructionsPanel instructions={diagnostics?.instructions} />
-      <OfflineBreakdownPanel offlineReadiness={diagnostics?.offlineReadiness} />
-      <ServicesSection services={diagnostics?.services} />
+      <div className="models-overview">
+        <ServicesSection services={diagnostics?.services} />
+        <OfflineBreakdownPanel offlineReadiness={diagnostics?.offlineReadiness} />
+      </div>
       <ModelsSection models={diagnostics?.models} />
       <StorageMetricsCard storage={diagnostics?.storage} />
     </div>

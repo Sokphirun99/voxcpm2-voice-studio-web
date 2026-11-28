@@ -106,7 +106,7 @@ function EditorContent({ props, effectiveMode }) {
   const isSegments = effectiveMode === 'segments' && props.segments?.length > 0;
   return (
     <>
-      <textarea id="script" ref={props.scriptInput} aria-describedby="character-count"
+      <textarea id="script" ref={props.scriptInput} aria-label="Script" aria-describedby="character-count"
         placeholder="Write or paste the text you want to hear…" spellCheck={false}
         required={!isSegments} style={isSegments ? { display: 'none' } : undefined}
         value={props.script} onChange={event => props.onScriptChange(event.target.value)} onKeyDown={props.onScriptKey} />

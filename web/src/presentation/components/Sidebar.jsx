@@ -53,19 +53,28 @@ export function Sidebar({
   onSelectWorkspace,
   onFocusScript,
   jobsBadgeCount = 0,
-  soundMuted = false,
-  onToggleSoundMuted,
+  onClose,
 }) {
   const handleSelect = id => {
     onSelectWorkspace?.(id);
     if (id === 'tts') onFocusScript?.();
   };
   return (
-    <aside className="studio-sidebar" aria-label="Voice Studio">
-      <div className="brand">
-        <span className="brand-mark"><Icon name="waveform" /></span>
-        <span className="brand-label">Voice Studio</span>
-      </div>
+    <aside
+      id="studio-sidebar"
+      className="studio-sidebar"
+      aria-label="Voice Studio"
+      onKeyDown={event => {
+        if (event.key === 'Escape') onClose?.();
+      }}
+    >
+      <header className="studio-navigation-header">
+        <div className="brand">
+          <span className="brand-mark"><Icon name="waveform" /></span>
+          <span className="brand-label">Voice Studio</span>
+          <button type="button" className="button sidebar-close" aria-label="Close sidebar" title="Close sidebar" onClick={onClose}>×</button>
+        </div>
+      </header>
       <nav className="studio-nav" aria-label="Workspace">
         {workspaces.map(item => (
           <WorkspaceNavButton
@@ -77,21 +86,6 @@ export function Sidebar({
           />
         ))}
       </nav>
-      {onToggleSoundMuted && (
-        <div className="sidebar-footer">
-          <button
-            type="button"
-            id="notification-sound-toggle"
-            className="button sidebar-item sound-toggle-button"
-            aria-pressed={!soundMuted}
-            title={soundMuted ? 'Unmute completion alert sound' : 'Mute completion alert sound'}
-            onClick={onToggleSoundMuted}
-          >
-            <Icon name={soundMuted ? 'volume_off' : 'volume_on'} />
-            <span>{soundMuted ? 'Sound muted' : 'Sound alerts'}</span>
-          </button>
-        </div>
-      )}
     </aside>
   );
 }

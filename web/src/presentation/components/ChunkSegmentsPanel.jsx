@@ -115,7 +115,7 @@ export function ChunkSegmentsPanel({ recording, busy = false, regeneratingIndex 
       </summary>
       <div className="segments-body">
         <p className="segments-note">
-          Fix one mispronounced part and regenerate only that segment. The merged take updates instantly.
+          Fix one mispronounced part and regenerate only that segment. A new merged take is added so you can compare takes.
         </p>
         <ol className="segment-list">
           {chunks.map((chunk, index) => {

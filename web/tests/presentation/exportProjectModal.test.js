@@ -346,6 +346,10 @@ test('ExportProjectModal SSR renders audio, subtitle, and MP4 presets with expec
     assert.ok(subtitleHtml.includes('episode_01-dubbed.mp4'));
     assert.ok(subtitleHtml.includes('Khmer (km)'));
     assert.ok(subtitleHtml.includes('H.264 (yuv420p)'));
+    assert.ok(subtitleHtml.includes('UTF-8 clean text'));
+    assert.ok(subtitleHtml.includes('Browser downloads folder'));
+    assert.ok(subtitleHtml.includes('export-advanced-details'));
+    assert.ok(subtitleHtml.includes('Advanced export options'));
     assert.ok(subtitleHtml.includes('lack translations'));
     assert.ok(subtitleHtml.includes('Non-MP4 source container'));
     assert.ok(subtitleHtml.includes('id="export-history-list"'));
@@ -752,6 +756,27 @@ test('ExportProjectModal preserves draft on context updates, deduplicates close,
       dialog.dispatchEvent({ type: 'keydown', key: 'Escape', bubbles: true });
     });
     assert.equal(closeCalls, 1);
+
+    // Active export progress banner + Cancel button invoke onCancelExport
+    let cancelCount = 0;
+    await act(async () => {
+      root.render(React.createElement(ExportProjectModal, {
+        open: true,
+        workspace: 'subtitle',
+        context: baseContext,
+        exportHistory: [],
+        busy: true,
+        onCancelExport: () => { cancelCount += 1; },
+        onClose: () => {},
+        onExportPreset: async () => {},
+      }));
+    });
+    const banner = dom.container.querySelector('#export-progress-banner');
+    const cancelBtn = dom.container.querySelector('#export-cancel-btn');
+    assert.ok(banner, 'Busy ExportProjectModal must render progress banner');
+    assert.ok(cancelBtn, 'Busy ExportProjectModal must render Cancel export button');
+    await act(async () => { cancelBtn.click(); });
+    assert.equal(cancelCount, 1);
   } finally {
     await actOrNoop(() => root?.unmount());
     await vite.close();
